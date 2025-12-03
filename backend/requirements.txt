@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+mss
+pillow
+pytesseract
+openai
+python-dotenv
+httpx
+dashscope
+pyautogui
+pygetwindow

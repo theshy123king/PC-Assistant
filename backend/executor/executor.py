@@ -1,0 +1,4038 @@
+"""
+Action executor for the action DSL.
+
+Provides:
+- A dispatcher `run_steps` that iterates over an ActionPlan with a safety cap.
+- Handlers for supported actions; some remain stubs and others call helper modules.
+
+Future work: flesh out remaining stubs with OS-specific implementations.
+"""
+
+from datetime import datetime
+from time import perf_counter
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import os
+import difflib
+import base64
+import ctypes
+from ctypes import wintypes
+import json
+import subprocess
+import shutil
+import webbrowser
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+
+from PIL import Image
+import pytesseract
+from pydantic import ValidationError
+
+import pygetwindow as gw
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
+from backend.executor import apps, files, input, mouse
+from backend.executor.actions_schema import ActionPlan, ActionStep, DragAction, ScrollAction
+from backend.vision.ocr import OcrBox
+from backend.vision.ocr import run_ocr, run_ocr_with_boxes
+from backend.llm.action_parser import parse_action_plan
+from backend.llm.planner_prompt import format_prompt
+from backend.llm.deepseek_client import call_deepseek
+from backend.llm.openai_client import call_openai
+from backend.llm.qwen_client import call_qwen
+from backend.vision.screenshot import capture_screen
+from backend.executor.ui_locator import locate_target, locate_text, rank_text_candidates
+from backend.llm.vlm_config import get_vlm_call
+from backend.llm.vlm_config import get_vlm_call
+
+MAX_STEPS = 10
+LAST_WINDOW_TITLE: Optional[str] = None
+LAST_OPEN_APP_CONTEXT: Dict[str, Any] = {}
+MOUSE = mouse.controller
+
+
+def _flag_from_env(var: str, default: bool) -> bool:
+    value = os.getenv(var)
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "none"}
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() not in {"", "0", "false", "off", "no", "none"}
+
+
+def _coerce_nonnegative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return max(0, parsed)
+
+
+DEFAULT_STEP_MAX_RETRIES = _coerce_nonnegative_int(os.getenv("EXECUTOR_MAX_STEP_RETRIES", "1"), 1)
+DEFAULT_CAPTURE_BEFORE = _flag_from_env("EXECUTOR_CAPTURE_BEFORE", True)
+DEFAULT_CAPTURE_AFTER = _flag_from_env("EXECUTOR_CAPTURE_AFTER", True)
+DEFAULT_CAPTURE_OCR = _flag_from_env("EXECUTOR_CAPTURE_OCR", False)
+DEFAULT_UI_OCR = _flag_from_env("EXECUTOR_CAPTURE_UI_OCR", True)
+DEFAULT_MAX_REPLANS = _coerce_nonnegative_int(os.getenv("EXECUTOR_MAX_REPLANS", "1"), 1)
+DEFAULT_REPLAN_CAPTURE = _flag_from_env("EXECUTOR_REPLAN_CAPTURE_SCREENSHOT", True)
+DEFAULT_DISABLE_VLM = _flag_from_env("EXECUTOR_DISABLE_VLM", False)
+ALLOWED_ROOTS = [
+    os.path.abspath(root)
+    for root in (
+        os.getenv("EXECUTOR_ALLOWED_ROOTS", str(Path.cwd()))
+        .split(os.pathsep)
+        if os.getenv("EXECUTOR_ALLOWED_ROOTS") is not None
+        else [str(Path.cwd())]
+    )
+    if str(root).strip()
+]
+UNSAFE_KEYWORDS = [
+    "format c",
+    "rm -rf",
+    "wipe",
+    "destroy data",
+    "delete all",
+    "factory reset",
+    "shutdown system",
+]
+OCR_PREVIEW_LIMIT = 1200
+OCR_CAPTURE_ACTIONS = {
+    "browser_click",
+    "browser_input",
+    "browser_extract_text",
+    "click",
+    "click_text",
+    "double_click",
+    "right_click",
+    "scroll",
+    "drag",
+}
+VLM_DISABLED_FLAG = DEFAULT_DISABLE_VLM
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+try:
+    dwmapi = ctypes.windll.dwmapi
+except Exception:  # pragma: no cover - dwmapi may be missing
+    dwmapi = None  # type: ignore
+
+DWMWA_CLOAKED = 14
+SW_RESTORE = 9
+GW_OWNER = 4
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+HWND_BOTTOM = 1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_SHOWWINDOW = 0x0040
+_WECHAT_CLASS_NAMES = {"WeChatMainWndForPC", "WeChatPreviewWndForPC"}
+
+
+class _WinInfo:
+    __slots__ = ("hwnd", "title", "pid")
+
+    def __init__(self, hwnd: int, title: str, pid: int) -> None:
+        self.hwnd = hwnd
+        self.title = title
+        self.pid = pid
+
+
+class _WinSnapshot:
+    __slots__ = (
+        "hwnd",
+        "title",
+        "pid",
+        "is_visible",
+        "is_cloaked",
+        "has_owner",
+        "is_minimized",
+        "class_name",
+        "rect",
+    )
+
+    def __init__(
+        self,
+        hwnd: int,
+        title: str,
+        pid: int,
+        is_visible: bool,
+        is_cloaked: bool,
+        has_owner: bool,
+        is_minimized: bool,
+        class_name: str,
+        rect: Tuple[int, int, int, int],
+    ) -> None:
+        self.hwnd = hwnd
+        self.title = title
+        self.pid = pid
+        self.is_visible = is_visible
+        self.is_cloaked = is_cloaked
+        self.has_owner = has_owner
+        self.is_minimized = is_minimized
+        self.class_name = class_name
+        self.rect = rect
+
+
+def _run_powershell_json(command: str) -> Optional[Any]:
+    """Run PowerShell and parse JSON output; return None on any failure."""
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _pids_for_process_names(names: List[str]) -> List[int]:
+    target = {n.lower() for n in names if n}
+    pids: List[int] = []
+    if psutil:
+        for proc in psutil.process_iter(["name"]):
+            try:
+                name = proc.info.get("name")
+                if name and name.lower() in target:
+                    pids.append(proc.pid)
+            except Exception:
+                continue
+    if pids:
+        return pids
+
+    # Fallback via PowerShell
+    name_args = ",".join({n for n in names if n})
+    ps_cmd = (
+        f"Get-Process -ErrorAction SilentlyContinue {name_args} "
+        "| Select-Object -ExpandProperty Id | ConvertTo-Json -Compress"
+    )
+    data = _run_powershell_json(ps_cmd)
+    if isinstance(data, list):
+        for item in data:
+            try:
+                pids.append(int(item))
+            except Exception:
+                continue
+    elif isinstance(data, (int, float)):
+        try:
+            pids.append(int(data))
+        except Exception:
+            pass
+    return pids
+
+
+def _get_process_name(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    if psutil:
+        try:
+            proc = psutil.Process(pid)
+            return proc.name() or ""
+        except Exception:
+            pass
+    # Fallback PowerShell for name
+    ps_cmd = (
+        f"(Get-Process -Id {pid} -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1 -ExpandProperty ProcessName) | ConvertTo-Json -Compress"
+    )
+    data = _run_powershell_json(ps_cmd)
+    if isinstance(data, str):
+        return data
+    return ""
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    if not dwmapi:
+        return False
+    cloaked = wintypes.DWORD()
+    try:
+        res = dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd),
+            wintypes.DWORD(DWMWA_CLOAKED),
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        if res == 0:
+            return cloaked.value != 0
+    except Exception:
+        return False
+    return False
+
+
+def _get_window_title(hwnd: int) -> str:
+    length = user32.GetWindowTextLengthW(wintypes.HWND(hwnd))
+    if length == 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(wintypes.HWND(hwnd), buffer, length + 1)
+    return buffer.value.strip()
+
+
+def _get_class_name(hwnd: int) -> str:
+    buffer = ctypes.create_unicode_buffer(256)
+    try:
+        length = user32.GetClassNameW(wintypes.HWND(hwnd), buffer, 255)
+        if length > 0:
+            return buffer.value.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _get_window_rect(hwnd: int) -> Tuple[int, int, int, int]:
+    rect = ctypes.wintypes.RECT()
+    try:
+        if user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception:
+        pass
+    return (0, 0, 0, 0)
+
+
+def _enum_wechat_windows() -> List[_WinSnapshot]:
+    snapshots: List[_WinSnapshot] = []
+    blocked_classes = {"applicationframewindow", "applicationframeinputsinkwindow"}
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def _callback(hwnd, _lparam):
+        title = _get_window_title(hwnd)
+        class_name = _get_class_name(hwnd)
+        title_l = title.lower()
+        class_l = class_name.lower()
+        if "wechat" not in title_l and "微信" not in title_l and "wechat" not in class_l:
+            return True
+        if class_l in blocked_classes:
+            return True
+        pid_out = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_out))
+        is_visible = bool(user32.IsWindowVisible(hwnd))
+        has_owner = bool(user32.GetWindow(hwnd, GW_OWNER))
+        if has_owner:
+            return True
+        is_cloaked = _is_cloaked(hwnd)
+        try:
+            is_minimized = bool(user32.IsIconic(hwnd))
+        except Exception:
+            is_minimized = False
+        rect = _get_window_rect(hwnd)
+        # Reject only if both hidden and minimized (likely non-interactive host).
+        if not is_visible and is_minimized:
+            return True
+        snapshots.append(
+            _WinSnapshot(
+                int(hwnd),
+                title,
+                int(pid_out.value),
+                is_visible,
+                is_cloaked,
+                has_owner,
+                is_minimized,
+                class_name,
+                rect,
+            )
+        )
+        return True
+
+    try:
+        user32.EnumWindows(_callback, 0)
+    except Exception:
+        return snapshots
+    return snapshots
+
+
+def _probe_windows_for_pid(pid: int) -> List[_WinSnapshot]:
+    snapshots: List[_WinSnapshot] = []
+    if pid <= 0:
+        return snapshots
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def _callback(hwnd, _lparam):
+        pid_out = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_out))
+        if pid_out.value != pid:
+            return True
+        title = _get_window_title(hwnd)
+        is_visible = bool(user32.IsWindowVisible(hwnd))
+        has_owner = bool(user32.GetWindow(hwnd, GW_OWNER))
+        is_cloaked = _is_cloaked(hwnd)
+        try:
+            is_minimized = bool(user32.IsIconic(hwnd))
+        except Exception:
+            is_minimized = False
+        class_name = _get_class_name(hwnd)
+        rect = _get_window_rect(hwnd)
+        snapshots.append(
+            _WinSnapshot(
+                int(hwnd),
+                title,
+                int(pid),
+                is_visible,
+                is_cloaked,
+                has_owner,
+                is_minimized,
+                class_name,
+                rect,
+            )
+        )
+        return True
+
+    try:
+        user32.EnumWindows(_callback, 0)
+    except Exception:
+        return snapshots
+    return snapshots
+
+
+def _filter_interactive_windows(snapshots: List[_WinSnapshot]) -> List[_WinInfo]:
+    windows: List[_WinInfo] = []
+    for snap in snapshots:
+        if not snap.title:
+            continue
+        if snap.is_cloaked or snap.has_owner:
+            continue
+        if not snap.is_visible and not snap.is_minimized:
+            continue
+        windows.append(_WinInfo(snap.hwnd, snap.title, snap.pid))
+    return windows
+
+
+def _filter_wechat_windows(snapshots: List[_WinSnapshot]) -> List[_WinInfo]:
+    windows: List[_WinInfo] = []
+    for snap in snapshots:
+        if snap.is_cloaked or snap.has_owner:
+            continue
+        if not snap.title:
+            continue
+        if not snap.class_name:
+            continue
+        class_lower = snap.class_name.lower()
+        if "wechat" not in class_lower:
+            continue
+        left, top, right, bottom = snap.rect
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        min_width = 140 if snap.is_minimized else 200
+        min_height = 120 if snap.is_minimized else 150
+        size_ok = width >= min_width and height >= min_height
+        if width > 2000 or height > 2000:
+            continue
+        class_ok = snap.class_name in _WECHAT_CLASS_NAMES or (
+            snap.class_name and snap.class_name.lower().startswith("wechat")
+        )
+        if not size_ok and not class_ok:
+            continue
+        windows.append(_WinInfo(snap.hwnd, snap.title or snap.class_name or "", snap.pid))
+    return windows
+
+
+def _activate_hwnd(hwnd: int, pid: int) -> bool:
+    try:
+        target_pid = pid if pid and pid > 0 else -1
+        user32.AllowSetForegroundWindow(target_pid)
+    except Exception:
+        pass
+    try:
+        user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+    except Exception:
+        pass
+    try:
+        return bool(user32.SetForegroundWindow(wintypes.HWND(hwnd)))
+    except Exception:
+        return False
+
+
+def _force_foreground_wechat(hwnd: int, pid: int) -> bool:
+    success = False
+    try:
+        user32.AllowSetForegroundWindow(-1)
+    except Exception:
+        pass
+    try:
+        res = user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+        success = success or bool(res)
+    except Exception:
+        pass
+    try:
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+        success = True
+    except Exception:
+        pass
+    try:
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+        success = True
+    except Exception:
+        pass
+    try:
+        res = user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        success = success or bool(res)
+    except Exception:
+        pass
+    try:
+        res = user32.BringWindowToTop(wintypes.HWND(hwnd))
+        success = success or bool(res)
+    except Exception:
+        pass
+    try:
+        res = user32.SetActiveWindow(wintypes.HWND(hwnd))
+        success = success or bool(res)
+    except Exception:
+        pass
+    return success
+
+
+def _best_window_for_terms(terms: List[str], windows: List[_WinInfo]) -> Tuple[Optional[_WinInfo], str, float]:
+    best_win: Optional[_WinInfo] = None
+    best_term = ""
+    best_score = -1.0
+    for term in terms:
+        term_lower = term.lower()
+        for win in windows:
+            win_lower = win.title.lower()
+            score = 1.0 if term_lower in win_lower else difflib.SequenceMatcher(
+                None, term_lower, win_lower
+            ).ratio()
+            if score > best_score:
+                best_score = score
+                best_win = win
+                best_term = term
+    return best_win, best_term, best_score
+
+
+def _enum_top_windows() -> List[_WinSnapshot]:
+    """Enumerate top-level windows with basic metadata for activation."""
+    snapshots: List[_WinSnapshot] = []
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def _callback(hwnd, _lparam):
+        title = _get_window_title(hwnd)
+        class_name = _get_class_name(hwnd)
+        pid_out = wintypes.DWORD()
+        tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_out))
+        is_visible = bool(user32.IsWindowVisible(hwnd))
+        has_owner = bool(user32.GetWindow(hwnd, GW_OWNER))
+        is_cloaked = _is_cloaked(hwnd)
+        try:
+            is_minimized = bool(user32.IsIconic(hwnd))
+        except Exception:
+            is_minimized = False
+        rect = _get_window_rect(hwnd)
+        snapshots.append(
+            _WinSnapshot(
+                int(hwnd),
+                title,
+                int(pid_out.value),
+                is_visible,
+                is_cloaked,
+                has_owner,
+                is_minimized,
+                class_name,
+                rect,
+            )
+        )
+        return True
+
+    try:
+        user32.EnumWindows(_callback, 0)
+    except Exception:
+        return snapshots
+    return snapshots
+
+
+def _filter_windows_by_keywords(
+    snapshots: List[_WinSnapshot],
+    title_keywords: List[str],
+    class_keywords: Optional[List[str]] = None,
+) -> List[_WinSnapshot]:
+    """
+    Filter windows whose title or class contains any keyword (case-insensitive).
+    Skips cloaked/owned windows and ignores fully hidden non-minimized windows.
+    """
+    title_terms = [t.lower() for t in title_keywords if isinstance(t, str) and t.strip()]
+    class_terms = [
+        t.lower() for t in (class_keywords or []) if isinstance(t, str) and t.strip()
+    ]
+    if not title_terms and not class_terms:
+        return []
+
+    matches: List[_WinSnapshot] = []
+    for snap in snapshots:
+        if snap.is_cloaked or snap.has_owner:
+            continue
+        if not snap.is_visible and not snap.is_minimized:
+            continue
+        title_l = (snap.title or "").lower()
+        class_l = (snap.class_name or "").lower()
+        title_hit = any(term in title_l for term in title_terms) if title_terms else False
+        class_hit = any(term in class_l for term in class_terms) if class_terms else False
+        if title_hit or class_hit:
+            matches.append(snap)
+    return matches
+
+
+def _score_window_candidate(snap: _WinSnapshot, terms: List[str]) -> Tuple[float, str]:
+    """
+    Return the best fuzzy score for the window across the provided terms.
+    """
+    best_score = -1.0
+    best_term = ""
+    title_l = (snap.title or "").lower()
+    class_l = (snap.class_name or "").lower()
+
+    for term in terms:
+        score_title = 1.0 if term in title_l else difflib.SequenceMatcher(None, term, title_l).ratio()
+        score_class = 1.0 if term in class_l else difflib.SequenceMatcher(None, term, class_l).ratio()
+        candidate_score = max(score_title, score_class)
+        if candidate_score > best_score:
+            best_score = candidate_score
+            best_term = term
+    return best_score, best_term
+
+
+def _foreground_window(hwnd: int, pid: int, logs: List[str]) -> bool:
+    """
+    Restore and foreground a window using topmost bounce and thread attachment.
+    """
+    success = False
+    try:
+        user32.AllowSetForegroundWindow(pid if pid and pid > 0 else -1)
+        logs.append("AllowSetForegroundWindow:ok")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"AllowSetForegroundWindow:error:{exc}")
+
+    try:
+        res = user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+        success = success or bool(res)
+        logs.append("ShowWindow:SW_RESTORE")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"ShowWindow:error:{exc}")
+
+    try:
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+        logs.append("SetWindowPos:topmost_bounce")
+        success = True
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"SetWindowPos:error:{exc}")
+
+    attached = False
+    target_tid = None
+    try:
+        pid_out = wintypes.DWORD()
+        target_tid = user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid_out))
+        current_tid = kernel32.GetCurrentThreadId()
+        attach_ok = user32.AttachThreadInput(current_tid, target_tid, True)
+        attached = bool(attach_ok)
+        logs.append(f"AttachThreadInput:{attached}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"AttachThreadInput:error:{exc}")
+
+    try:
+        res = user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        success = success or bool(res)
+        logs.append(f"SetForegroundWindow:{bool(res)}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"SetForegroundWindow:error:{exc}")
+
+    try:
+        res = user32.BringWindowToTop(wintypes.HWND(hwnd))
+        success = success or bool(res)
+        logs.append(f"BringWindowToTop:{bool(res)}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"BringWindowToTop:error:{exc}")
+
+    if attached and target_tid is not None:
+        try:
+            user32.AttachThreadInput(kernel32.GetCurrentThreadId(), target_tid, False)
+            logs.append("AttachThreadInput:detached")
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"AttachThreadInput:detach_error:{exc}")
+
+    return success
+
+
+def activate_window(params: Dict[str, Any]) -> dict:
+    """
+    Activate a window by fuzzy-matching title/class keywords and foregrounding it.
+    """
+    logs: List[str] = []
+    raw_title_terms = params.get("title_keywords") or params.get("title") or []
+    raw_class_terms = params.get("class_keywords") or []
+
+    if isinstance(raw_title_terms, str):
+        raw_title_terms = [raw_title_terms]
+    if isinstance(raw_class_terms, str):
+        raw_class_terms = [raw_class_terms]
+
+    title_keywords = [str(t).strip() for t in raw_title_terms if str(t).strip()]
+    class_keywords = [str(t).strip() for t in raw_class_terms if str(t).strip()]
+    logs.append(f"title_keywords:{title_keywords} class_keywords:{class_keywords}")
+
+    if not title_keywords and not class_keywords:
+        return {"success": False, "reason": "title_keywords or class_keywords required", "hwnd": None, "log": logs}
+
+    snapshots = _enum_top_windows()
+    logs.append(f"enum_windows:{len(snapshots)}")
+
+    candidates = _filter_windows_by_keywords(snapshots, title_keywords, class_keywords)
+    logs.append(f"candidates:{len(candidates)}")
+    if not candidates:
+        return {"success": False, "reason": "no matching window", "hwnd": None, "log": logs}
+
+    terms = [t.lower() for t in title_keywords + class_keywords]
+    best_snap: Optional[_WinSnapshot] = None
+    best_score = -1.0
+    matched_term = ""
+    for snap in candidates:
+        score, term = _score_window_candidate(snap, terms)
+        if score > best_score:
+            best_score = score
+            best_snap = snap
+            matched_term = term
+
+    if not best_snap:
+        return {"success": False, "reason": "no best candidate", "hwnd": None, "log": logs}
+
+    logs.append(
+        f"selected_hwnd:{best_snap.hwnd} pid:{best_snap.pid} title:{best_snap.title} class:{best_snap.class_name} score:{best_score} term:{matched_term}"
+    )
+
+    activated = _foreground_window(best_snap.hwnd, best_snap.pid, logs)
+    if activated:
+        global LAST_WINDOW_TITLE
+        LAST_WINDOW_TITLE = best_snap.title
+    return {
+        "success": bool(activated),
+        "reason": "activated" if activated else "foreground_failed",
+        "hwnd": best_snap.hwnd,
+        "pid": best_snap.pid,
+        "matched_title": best_snap.title,
+        "matched_class": best_snap.class_name,
+        "matched_term": matched_term,
+        "score": best_score,
+        "log": logs,
+    }
+
+
+def _activate_wechat_bridge_window(
+    search_terms: List[str],
+    requested: str,
+    prefer_pids: Optional[List[int]] = None,
+    debug: Optional[Dict[str, Any]] = None,
+) -> dict:
+    debug_info: Dict[str, Any] = debug or {}
+    debug_info.setdefault("requested", requested)
+    debug_info.setdefault("search_terms", search_terms)
+
+    prefer_pid_list: List[int] = []
+    for pid in prefer_pids or []:
+        try:
+            pid_int = int(pid)
+        except Exception:
+            continue
+        if pid_int > 0:
+            prefer_pid_list.append(pid_int)
+    debug_info["prefer_pids"] = prefer_pid_list
+
+    detected_pids = _pids_for_process_names(["WeChatAppEx"])
+    combined: List[int] = []
+    seen: set[int] = set()
+    for pid in prefer_pid_list + detected_pids:
+        if pid not in seen and pid > 0:
+            combined.append(pid)
+            seen.add(pid)
+    debug_info["wechat_process_pids"] = combined
+    if not combined:
+        return {
+            "status": "error",
+            "message": "wechat bridge process not found",
+            "requested": requested,
+            "method": "wechat_bridge_pid",
+            "debug": debug_info,
+        }
+
+    all_snapshots: List[_WinSnapshot] = []
+    window_probe: List[dict] = []
+    for pid in combined:
+        snaps = _probe_windows_for_pid(pid)
+        window_probe.append(
+            {
+                "pid": pid,
+                "windows": [
+                    {
+                        "hwnd": snap.hwnd,
+                        "title": snap.title,
+                        "class_name": snap.class_name,
+                        "rect": snap.rect,
+                        "is_visible": snap.is_visible,
+                        "is_cloaked": snap.is_cloaked,
+                        "has_owner": snap.has_owner,
+                        "is_minimized": snap.is_minimized,
+                    }
+                    for snap in snaps
+                ],
+            }
+        )
+        all_snapshots.extend(snaps)
+    debug_info["window_probe"] = window_probe
+
+    snapshot_lookup = {(snap.pid, snap.hwnd): snap for snap in all_snapshots}
+    candidates = _filter_wechat_windows(all_snapshots)
+    candidate_debug: List[Dict[str, Any]] = []
+    for win in candidates:
+        snap = snapshot_lookup.get((win.pid, win.hwnd))
+        candidate_debug.append(
+            {
+                "hwnd": win.hwnd,
+                "title": win.title,
+                "pid": win.pid,
+                "is_visible": snap.is_visible if snap else None,
+                "is_cloaked": snap.is_cloaked if snap else None,
+                "has_owner": snap.has_owner if snap else None,
+                "is_minimized": snap.is_minimized if snap else None,
+                "class_name": snap.class_name if snap else None,
+                "rect": snap.rect if snap else None,
+                "width": (snap.rect[2] - snap.rect[0]) if snap else None,
+                "height": (snap.rect[3] - snap.rect[1]) if snap else None,
+            }
+        )
+    debug_info["candidate_windows"] = candidate_debug
+    if not candidates:
+        return {
+            "status": "error",
+            "message": "wechat bridge windows not found",
+            "requested": requested,
+            "method": "wechat_bridge_pid",
+            "debug": debug_info,
+        }
+
+    best_win, matched_term, score = _best_window_for_terms(search_terms, candidates)
+    if not best_win:
+        return {
+            "status": "error",
+            "message": "wechat bridge window scoring failed",
+            "requested": requested,
+            "method": "wechat_bridge_pid",
+            "debug": debug_info,
+        }
+
+    debug_info["selected_window"] = {
+        "hwnd": best_win.hwnd,
+        "pid": best_win.pid,
+        "title": best_win.title,
+        "matched_term": matched_term,
+        "score": score,
+    }
+
+    activated = _force_foreground_wechat(best_win.hwnd, best_win.pid)
+    debug_info["activation_attempted"] = {
+        "hwnd": best_win.hwnd,
+        "pid": best_win.pid,
+        "activated": activated,
+    }
+    if activated:
+        global LAST_WINDOW_TITLE
+        LAST_WINDOW_TITLE = best_win.title
+    return {
+        "status": "activated" if activated else "found_not_activated",
+        "requested": requested,
+        "matched_title": best_win.title,
+        "matched_term": matched_term,
+        "score": score,
+        "method": "wechat_bridge_pid",
+        "pid": best_win.pid,
+        "hwnd": best_win.hwnd,
+        "debug": debug_info,
+    }
+
+def handle_open_app(step: ActionStep) -> str:
+    result = apps.open_app(step.params)
+    global LAST_WINDOW_TITLE, LAST_OPEN_APP_CONTEXT
+    if isinstance(result, dict):
+        if result.get("window_title"):
+            LAST_WINDOW_TITLE = result.get("window_title")
+        target = (step.params or {}).get("target") or result.get("target")
+        kind = result.get("selected_kind")
+        launched_pid = result.get("pid") or result.get("process_id")
+        LAST_OPEN_APP_CONTEXT = {
+            "target": str(target).lower() if target else None,
+            "selected_kind": kind,
+            "window_title": result.get("window_title"),
+            "pid": launched_pid,
+        }
+    return result
+
+
+def handle_open_url(step: ActionStep) -> Any:
+    """
+    Open an HTTP/HTTPS URL with the system default browser.
+    """
+    params = step.params or {}
+    raw_url = params.get("url") or params.get("target")
+    raw_browser = params.get("browser") or params.get("app")
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 3)
+    if not raw_url or not isinstance(raw_url, str):
+        return "error: 'url' param is required"
+
+    url = raw_url.strip()
+    if not url:
+        return "error: 'url' param is required"
+
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return "error: only http/https URLs are supported"
+
+    def _aliases(name: str) -> List[str]:
+        key = name.lower().strip()
+        aliases = [key]
+        if "edge" in key:
+            aliases.extend(["edge", "msedge", "microsoft edge"])
+        if "chrome" in key or "google" in key:
+            aliases.extend(["chrome", "google chrome", "chrome.exe"])
+        return list(dict.fromkeys(aliases))
+
+    def _find_browser_path(names: List[str]) -> Optional[str]:
+        for name in names:
+            if not name:
+                continue
+            for app_key, path in apps.APP_PATHS.items():
+                if name in app_key or app_key in name:
+                    if os.path.isfile(path):
+                        return path
+            if os.path.isfile(name):
+                return name
+            which = shutil.which(name)
+            if which:
+                return which
+        return None
+
+    explicit_browser = None
+    browser_hints: List[str] = []
+    if isinstance(raw_browser, str) and raw_browser.strip():
+        explicit_browser = raw_browser.strip()
+        browser_hints.extend(_aliases(explicit_browser))
+    elif LAST_OPEN_APP_CONTEXT.get("target"):
+        browser_hints.extend(_aliases(str(LAST_OPEN_APP_CONTEXT["target"])))
+
+    browser_path = _find_browser_path(browser_hints) if browser_hints else None
+    if browser_path:
+        try:
+            subprocess.Popen(
+                [browser_path, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {
+                "status": "opened",
+                "url": url,
+                "opened": True,
+                "browser": browser_path,
+                "method": "direct_exec",
+            }
+        except Exception as exc:  # noqa: BLE001
+            if explicit_browser:
+                return f"error: failed to open url with browser '{explicit_browser}': {exc}"
+            # fall back to default browser below
+
+    if explicit_browser and not browser_path:
+        return f"error: browser '{explicit_browser}' not found"
+
+    result: Dict[str, Any] = {"status": "opened", "url": url, "opened": False, "method": None}
+
+    # If we have a direct browser path, we already returned above. If not, try to find an active browser window to use OCR.
+    try:
+        windows = gw.getAllWindows()
+    except Exception:
+        windows = []
+
+    active_browser_window = None
+    for win in windows:
+        title = (getattr(win, "title", "") or "").lower()
+        if any(term in title for term in ["edge", "chrome", "firefox", "safari", "浏览器"]):
+            active_browser_window = win
+            break
+
+    # If no active browser window, force direct launch via default handler.
+    if not active_browser_window:
+        try:
+            opened = webbrowser.open(url)
+            result.update({"opened": bool(opened), "method": "default"})
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return f"error: failed to open url: {exc}"
+
+    # Browser window is present: use OCR targeting for address bar if verify_text provided.
+    try:
+        active_browser_window.activate()
+    except Exception:
+        pass
+
+    try:
+        opened = webbrowser.open(url)
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to open url: {exc}"
+
+    result.update({"opened": bool(opened), "method": "default_with_active_browser"})
+    if verify_targets:
+        verify = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
+        result["verification"] = verify
+        result["verified"] = bool(verify.get("success"))
+    return result
+
+
+def handle_switch_window(step: ActionStep) -> str:
+    title = (step.params or {}).get("title") or (step.params or {}).get("name")
+    if not title or not isinstance(title, str):
+        return "error: 'title' param is required"
+
+    target = title.strip()
+    target_lower = target.lower()
+    try:
+        windows = gw.getAllWindows()
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to query windows: {exc}"
+
+    # Prefer last launched/activated window if available.
+    global LAST_WINDOW_TITLE
+    if LAST_WINDOW_TITLE:
+        for win in windows:
+            if (getattr(win, "title", "") or "").strip() == LAST_WINDOW_TITLE:
+                try:
+                    if getattr(win, "isMinimized", False):
+                        win.restore()
+                    win.activate()
+                    return {
+                        "status": "activated",
+                        "requested": target,
+                        "matched_title": LAST_WINDOW_TITLE,
+                        "score": 1.0,
+                        "source": "last_window_title",
+                    }
+                except Exception:
+                    break
+
+    best_score = -1.0
+    best_win = None
+    for win in windows:
+        win_title = (getattr(win, "title", "") or "").strip()
+        if not win_title:
+            continue
+        win_lower = win_title.lower()
+        score = 1.0 if target_lower in win_lower else difflib.SequenceMatcher(
+            None, target_lower, win_lower
+        ).ratio()
+        if score > best_score:
+            best_score = score
+            best_win = win
+
+    if not best_win:
+        return f"error: window not found matching '{target}'"
+
+    try:
+        if getattr(best_win, "isMinimized", False):
+            best_win.restore()
+        best_win.activate()
+        LAST_WINDOW_TITLE = (getattr(best_win, "title", "") or "").strip()
+        return {
+            "status": "activated",
+            "requested": target,
+            "matched_title": getattr(best_win, "title", "") or "",
+            "score": best_score,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to activate window: {exc}"
+
+
+def handle_activate_window(step: ActionStep) -> Any:
+    return activate_window(step.params or {})
+
+
+def handle_type_text(step: ActionStep) -> str:
+    return input.type_text(step.params)
+
+
+def handle_key_press(step: ActionStep) -> str:
+    return input.key_press(step.params)
+
+
+def handle_click(step: ActionStep) -> str:
+    params = step.params or {}
+    button = params.get("button", "left")
+    x = params.get("x")
+    y = params.get("y")
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        result = MOUSE.click({"x": x, "y": y, "button": button})
+        return {"status": "success", "method": "absolute", "reason": result}
+
+    query = params.get("text") or params.get("target") or params.get("label") or params.get("visual_description")
+    if not query:
+        return "error: 'x'/'y' or 'text/target/visual_description' is required"
+
+    try:
+        screenshot_path = capture_screen()
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reason": f"screenshot failed: {exc}"}
+    try:
+        _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reason": f"ocr failed: {exc}"}
+
+    locate_result = _locate_from_params(query, params, boxes, Path(screenshot_path))
+    if locate_result.get("status") != "success":
+        return {"status": "error", "reason": "locate_failed", "locator": locate_result}
+    center = locate_result.get("center") or {}
+    cx = center.get("x")
+    cy = center.get("y")
+    if cx is None or cy is None:
+        return {"status": "error", "reason": "locate_missing_center", "locator": locate_result}
+
+    result = MOUSE.click({"x": cx, "y": cy, "button": button})
+    return {
+        "status": "success",
+        "method": locate_result.get("method"),
+        "locator": locate_result,
+        "center": {"x": cx, "y": cy},
+        "reason": result,
+    }
+
+
+def handle_move_file(step: ActionStep) -> Dict[str, Any]:
+    return files.move_file(step.params)
+
+
+def handle_rename_file(step: ActionStep) -> Dict[str, Any]:
+    return files.rename_file(step.params)
+
+
+def handle_wait(step: ActionStep) -> str:
+    seconds = (step.params or {}).get("seconds", 0)
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "error: 'seconds' must be a number"
+    if seconds < 0:
+        return "error: 'seconds' must be non-negative"
+
+    time.sleep(seconds)
+    return f"waited {seconds} seconds"
+
+
+def _require_number(value, name: str) -> Optional[str]:
+    if not isinstance(value, (int, float)):
+        return f"error: '{name}' must be a number"
+    return None
+
+
+def handle_mouse_move(step: ActionStep) -> str:
+    x = (step.params or {}).get("x")
+    y = (step.params or {}).get("y")
+    if (msg := _require_number(x, "x")) or (msg := _require_number(y, "y")):
+        return msg
+    return f"stub: mouse_move to ({x}, {y}) not implemented yet"
+
+
+def _handle_click_variant(step: ActionStep, variant: str) -> str:
+    params = step.params or {}
+    x = params.get("x")
+    y = params.get("y")
+    button = "left"
+    clicks = 1
+    if variant == "right_click":
+        button = "right"
+    elif variant == "double_click":
+        clicks = 2
+    # Resolve coordinates
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        cx, cy = x, y
+        locator_meta = {"method": "absolute"}
+    else:
+        query = params.get("text") or params.get("target") or params.get("label") or params.get("visual_description")
+        if not query:
+            return "error: 'x'/'y' or 'text/target/visual_description' is required"
+        try:
+            screenshot_path = capture_screen()
+            _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+        except Exception as exc:  # noqa: BLE001
+            return f"error: locate failed: {exc}"
+        locate_result = _locate_from_params(query, params, boxes, Path(screenshot_path))
+        if locate_result.get("status") != "success":
+            return {"status": "error", "reason": "locate_failed", "locator": locate_result}
+        center = locate_result.get("center") or {}
+        cx = center.get("x")
+        cy = center.get("y")
+        if cx is None or cy is None:
+            return {"status": "error", "reason": "locate_missing_center", "locator": locate_result}
+        locator_meta = locate_result
+
+    try:
+        import pyautogui  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return f"error: pyautogui unavailable: {exc}"
+
+    try:
+        if clicks == 2:
+            pyautogui.click(x=cx, y=cy, button=button, clicks=2, interval=0.12)
+        else:
+            pyautogui.click(x=cx, y=cy, button=button)
+        return {
+            "status": "success",
+            "method": locator_meta.get("method"),
+            "center": {"x": cx, "y": cy},
+            "locator": locator_meta,
+            "variant": variant,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reason": f"failed to {variant}: {exc}"}
+
+
+def handle_right_click(step: ActionStep) -> str:
+    return _handle_click_variant(step, "right_click")
+
+
+def handle_double_click(step: ActionStep) -> str:
+    return _handle_click_variant(step, "double_click")
+
+
+def handle_scroll(step: ActionStep) -> Dict[str, Any]:
+    """
+    Scroll via MouseController using direction/amount or explicit deltas.
+
+    Returns a metadata-rich dict for feedback loops.
+    """
+    params = step.params or {}
+    try:
+        scroll_action = ScrollAction.model_validate(params)
+    except ValidationError as exc:  # noqa: BLE001
+        return {"status": "error", "reason": f"invalid scroll params: {exc}"}
+
+    dx, dy = scroll_action.to_deltas()
+    controller_result = MOUSE.scroll(dx=dx, dy=dy)
+    controller_result.setdefault("status", "success")
+    controller_result["action"] = "scroll"
+    controller_result["metadata"] = {
+        "direction": scroll_action.direction,
+        "amount": scroll_action.amount if scroll_action.direction else None,
+        "delta": {"dx": dx, "dy": dy},
+    }
+    return controller_result
+
+
+def handle_drag(step: ActionStep) -> Dict[str, Any]:
+    params = step.params or {}
+    try:
+        drag_action = DragAction.model_validate(params)
+    except ValidationError as exc:  # noqa: BLE001
+        return {"status": "error", "reason": f"invalid drag params: {exc}"}
+
+    start = drag_action.start
+    end = drag_action.end
+    start_coords = None
+    end_coords = None
+    locator_meta: Dict[str, Any] = {}
+
+    def _extract_query(point: Dict[str, Any]) -> Optional[str]:
+        return (
+            point.get("text")
+            or point.get("target")
+            or point.get("label")
+            or point.get("visual_description")
+            or drag_action.visual_description
+        )
+
+    needs_locate = not (isinstance(start.get("x"), (int, float)) and isinstance(start.get("y"), (int, float))) or not (
+        isinstance(end.get("x"), (int, float)) and isinstance(end.get("y"), (int, float))
+    )
+
+    boxes: List[OcrBox] = []
+    screenshot_path: Optional[Path] = None
+    if needs_locate:
+        try:
+            screenshot_path = capture_screen()
+            _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "error", "reason": f"locate failed: {exc}"}
+
+    def _resolve_point(point: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
+        if isinstance(point.get("x"), (int, float)) and isinstance(point.get("y"), (int, float)):
+            return float(point["x"]), float(point["y"]), {"method": "absolute"}
+        query = _extract_query(point)
+        if not query or not screenshot_path:
+            return None, None, {"status": "error", "reason": "missing_target"}
+        merged_params = {**params, **point}
+        loc_result = _locate_from_params(query, merged_params, boxes, Path(screenshot_path))
+        if loc_result.get("status") != "success":
+            return None, None, loc_result
+        center = loc_result.get("center") or {}
+        return center.get("x"), center.get("y"), loc_result
+
+    sx, sy, start_meta = _resolve_point(start)
+    ex, ey, end_meta = _resolve_point(end)
+    locator_meta["start"] = start_meta
+    locator_meta["end"] = end_meta
+
+    if sx is None or sy is None or ex is None or ey is None:
+        return {"status": "error", "reason": "locate_failed", "locator": locator_meta}
+
+    result = MOUSE.drag({"x": sx, "y": sy}, {"x": ex, "y": ey}, duration=drag_action.duration)
+    result.setdefault("status", "success")
+    result["action"] = "drag"
+    result["metadata"] = {
+        "start": {"x": sx, "y": sy},
+        "end": {"x": ex, "y": ey},
+        "duration": drag_action.duration,
+        "locator": locator_meta,
+    }
+    return result
+
+
+def handle_hotkey(step: ActionStep) -> str:
+    params = step.params or {}
+    keys = params.get("keys") or params.get("key")
+    normalized = []
+    if isinstance(keys, str):
+        normalized = [k for k in keys.split("+") if k]
+    elif isinstance(keys, (list, tuple)):
+        normalized = [str(k) for k in keys if k]
+    if not normalized:
+        return "error: 'keys' param is required (string or list)"
+    try:
+        import pyautogui  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return f"error: pyautogui unavailable: {exc}"
+
+    try:
+        if len(normalized) == 1:
+            pyautogui.press(normalized[0])
+            return f"pressed hotkey {normalized[0]}"
+        pyautogui.hotkey(*normalized)
+        return f"pressed hotkey {'+'.join(normalized)}"
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to press hotkey: {exc}"
+
+
+def handle_list_windows(step: ActionStep) -> str:
+    try:
+        windows = gw.getAllWindows()
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to list windows: {exc}"
+
+    result: List[dict] = []
+    for win in windows:
+        title = getattr(win, "title", "") or ""
+        result.append(
+            {
+                "title": title,
+                "is_active": bool(getattr(win, "isActive", False)),
+                "is_visible": bool(getattr(win, "isVisible", False)),
+                "is_minimized": bool(getattr(win, "isMinimized", False)),
+            }
+        )
+    return {"windows": result, "count": len(result)}
+
+
+def handle_get_active_window(step: ActionStep) -> str:
+    try:
+        win = gw.getActiveWindow()
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to get active window: {exc}"
+    if not win:
+        return {"active_window": None, "message": "no active window"}
+    return {
+        "active_window": getattr(win, "title", "") or "",
+        "is_visible": bool(getattr(win, "isVisible", False)),
+        "is_minimized": bool(getattr(win, "isMinimized", False)),
+    }
+
+
+def handle_fuzzy_switch_window(step: ActionStep) -> str:
+    title = (step.params or {}).get("title")
+    if not title or not isinstance(title, str):
+        return "error: 'title' param is required"
+    target = title.strip()
+
+    try:
+        windows = gw.getAllWindows()
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to list windows: {exc}"
+
+    candidates: List[Tuple[float, object]] = []
+    target_lower = target.lower()
+    for win in windows:
+        win_title = (getattr(win, "title", "") or "").strip()
+        if not win_title:
+            continue
+        win_lower = win_title.lower()
+        score = 1.0 if target_lower in win_lower else difflib.SequenceMatcher(
+            None, target_lower, win_lower
+        ).ratio()
+        candidates.append((score, win))
+
+    if not candidates:
+        return f"error: window not found matching '{target}'"
+
+    # Pick the best score
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_win = candidates[0]
+
+    try:
+        if getattr(best_win, "isMinimized", False):
+            best_win.restore()
+        best_win.activate()
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to activate '{best_win.title}': {exc}"
+
+    return {
+        "matched_title": getattr(best_win, "title", "") or "",
+        "score": best_score,
+        "requested": target,
+    }
+
+
+def handle_list_files(step: ActionStep) -> Dict[str, Any]:
+    return files.list_files(step.params)
+
+
+def handle_delete_file(step: ActionStep) -> Dict[str, Any]:
+    return files.delete_file(step.params)
+
+
+def handle_copy_file(step: ActionStep) -> Dict[str, Any]:
+    return files.copy_file(step.params)
+
+
+def handle_create_folder(step: ActionStep) -> str:
+    path = (step.params or {}).get("path")
+    if not path or not isinstance(path, str):
+        return "error: 'path' param is required"
+    return f"stub: create_folder at '{path}' not implemented yet"
+
+
+def handle_read_file(step: ActionStep) -> str:
+    path = (step.params or {}).get("path")
+    if not path or not isinstance(path, str):
+        return "error: 'path' param is required"
+    return f"stub: read_file at '{path}' not implemented yet"
+
+
+def handle_write_file(step: ActionStep) -> str:
+    return files.write_file(step.params)
+
+
+def handle_adjust_volume(step: ActionStep) -> str:
+    params = step.params or {}
+    if "level" in params:
+        try:
+            level = float(params.get("level"))
+        except (TypeError, ValueError):
+            return "error: 'level' must be a number"
+        return f"stub: adjust_volume to {level}% not implemented yet"
+    if "delta" in params:
+        try:
+            delta = float(params.get("delta"))
+        except (TypeError, ValueError):
+            return "error: 'delta' must be a number"
+        return f"stub: adjust_volume by {delta} not implemented yet"
+    return "error: 'level' or 'delta' param is required"
+
+
+def _coerce_boxes(raw_boxes: Any) -> List[OcrBox]:
+    boxes: List[OcrBox] = []
+    if not raw_boxes:
+        return boxes
+    if isinstance(raw_boxes, list):
+        for item in raw_boxes:
+            if isinstance(item, OcrBox):
+                boxes.append(item)
+            elif isinstance(item, dict):
+                try:
+                    boxes.append(
+                        OcrBox(
+                            text=str(item.get("text", "")),
+                            x=int(item.get("x", 0)),
+                            y=int(item.get("y", 0)),
+                            width=int(item.get("width", 0)),
+                            height=int(item.get("height", 0)),
+                            conf=float(item.get("conf", -1.0)),
+                        )
+                    )
+                except Exception:
+                    continue
+    return boxes
+
+
+def handle_click_text(step: ActionStep) -> Any:
+    params = step.params or {}
+    query = params.get("query")
+    if not query or not isinstance(query, str):
+        return "error: 'query' param is required"
+
+    boxes = _coerce_boxes(params.get("boxes"))
+    if not boxes:
+        return "error: no OCR boxes provided"
+
+    match = locate_text(query, boxes)
+    if not match:
+        return f"error: text '{query}' not found"
+
+    best_box, center = match
+    click_params = {
+        "x": center[0],
+        "y": center[1],
+        "button": params.get("button", "left"),
+    }
+    click_step = ActionStep(action="click", params=click_params)
+    click_result = handle_click(click_step)
+
+    box_payload = (
+        best_box.to_dict()
+        if isinstance(best_box, OcrBox)
+        else best_box
+        if isinstance(best_box, dict)
+        else getattr(best_box, "__dict__", {})
+    )
+    matched_text = (
+        best_box.text
+        if isinstance(best_box, OcrBox)
+        else best_box.get("text")
+        if isinstance(best_box, dict)
+        else getattr(best_box, "text", None)
+    )
+
+    return {
+        "matched_text": matched_text,
+        "box": box_payload,
+        "center": {"x": center[0], "y": center[1]},
+        "click_result": click_result,
+        "status": "clicked",
+    }
+
+
+def _normalize_target_list(raw: Any) -> List[str]:
+    targets: List[str] = []
+    if isinstance(raw, str) and raw.strip():
+        targets.append(raw.strip())
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                targets.append(item.strip())
+    return targets
+
+
+def _extract_targets(params: Dict[str, Any]) -> List[str]:
+    targets: List[str] = []
+    primary = params.get("text") or params.get("query") or params.get("label")
+    targets.extend(_normalize_target_list(primary))
+    targets.extend(_normalize_target_list(params.get("variants") or []))
+    deduped: List[str] = []
+    seen = set()
+    for term in targets:
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(term)
+    return deduped
+
+
+def _wait_for_ocr_targets(targets: List[str], attempts: int = 2, delay: float = 0.8) -> Dict[str, Any]:
+    """
+    Capture + OCR loop to find any of the target strings. Returns success flag and match details.
+    """
+    logs: List[str] = []
+    candidates: List[Dict[str, Any]] = []
+    attempts = max(1, min(5, int(attempts or 1)))
+    for attempt in range(1, attempts + 1):
+        logs.append(f"attempt:{attempt}")
+        try:
+            screenshot_path = capture_screen()
+            logs.append(f"screenshot:{screenshot_path}")
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "reason": f"screenshot failed: {exc}", "log": logs}
+
+        try:
+            full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            logs.append(f"ocr_boxes:{len(boxes)}")
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "reason": f"ocr failed: {exc}", "log": logs}
+
+        best = None
+        best_term = None
+        for term in targets:
+            ranked = rank_text_candidates(term, boxes)
+            if ranked:
+                candidates.extend(ranked[:5])
+            if not ranked:
+                continue
+            top = ranked[0]
+            if not best or top.get("high_enough") and not best.get("high_enough"):
+                best = top
+                best_term = term
+            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
+                best = top
+                best_term = term
+            if top.get("high_enough"):
+                break
+
+        if best and (best.get("high_enough") or best.get("medium_enough")):
+            center = best.get("center") or {}
+            return {
+                "success": True,
+                "matched_text": best.get("text"),
+                "matched_term": best_term,
+                "center": {"x": center.get("x"), "y": center.get("y")},
+                "bounds": best.get("bounds"),
+                "log": logs,
+                "candidates": candidates[:10],
+                "full_text": full_text,
+            }
+
+        if attempt < attempts and delay > 0:
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+
+    return {
+        "success": False,
+        "reason": "text_not_found",
+        "targets": targets,
+        "log": logs,
+        "candidates": candidates[:10],
+    }
+
+
+def handle_browser_click(step: ActionStep) -> Any:
+    """
+    OCR-driven click helper for browser UI elements.
+
+    Captures a screenshot, OCRs it, ranks candidates for the target label
+    (including optional variants), and clicks the best match.
+    """
+    params = step.params or {}
+    targets = _extract_targets(params)
+    if not targets:
+        return "error: 'text' param is required"
+
+    button = params.get("button", "left")
+    attempts = params.get("attempts", 2)
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 2
+    attempts = max(1, min(5, attempts))
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 2)
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 2)
+
+    logs: List[str] = []
+    provider_name, provider_call = get_vlm_call()
+    for attempt in range(1, attempts + 1):
+        logs.append(f"attempt:{attempt}")
+        try:
+            screenshot_path = capture_screen()
+            logs.append(f"screenshot:{screenshot_path}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: screenshot failed: {exc}"
+
+        try:
+            _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            logs.append(f"ocr_boxes:{len(boxes)}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: ocr failed: {exc}"
+
+        image_b64 = _encode_image_base64(Path(screenshot_path))
+        icon_templates = _icon_templates_from_params(params)
+        use_vlm = _use_vlm(params)
+        for term in targets:
+            locate_result = locate_target(
+                query=term,
+                boxes=boxes,
+                image_path=str(screenshot_path),
+                image_base64=image_b64 if (icon_templates or use_vlm) else None,
+                icon_templates=icon_templates if icon_templates else None,
+                vlm_call=provider_call if use_vlm else None,
+                vlm_provider=provider_name,
+            )
+            if locate_result.get("status") != "success":
+                continue
+            center = locate_result.get("center") or {}
+            cx = float(center.get("x", 0))
+            cy = float(center.get("y", 0))
+            try:
+                with Image.open(screenshot_path) as img:
+                    cx, cy = _clamp_point(cx, cy, img.width, img.height)
+            except Exception:
+                cx, cy = _clamp_point(cx, cy, 10_000, 10_000)
+            click_step = ActionStep(action="click", params={"x": cx, "y": cy, "button": button})
+            click_result = handle_click(click_step)
+            result: Dict[str, Any] = {
+                "status": "clicked",
+                "matched_text": locate_result.get("candidate", {}).get("text"),
+                "matched_term": term,
+                "center": {"x": cx, "y": cy},
+                "bounds": locate_result.get("bounds"),
+                "reason": click_result,
+                "locator": locate_result,
+                "method": locate_result.get("method"),
+                "log": logs,
+            }
+            if verify_targets:
+                verification = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
+                result["verification"] = verification
+                result["verified"] = bool(verification.get("success"))
+            return result
+
+        logs.append("no_match_found")
+
+    return {
+        "status": "error",
+        "reason": "text_not_found",
+        "targets": targets,
+        "log": logs,
+    }
+
+
+def handle_browser_input(step: ActionStep) -> Any:
+    """
+    OCR-driven field focus + typing helper for browser forms.
+    """
+    params = step.params or {}
+    targets = _extract_targets(params)
+    if not targets:
+        return "error: 'text' param is required"
+    value = params.get("value")
+    if not isinstance(value, str):
+        return "error: 'value' param is required and must be string"
+
+    button = params.get("button", "left")
+    attempts = params.get("attempts", 2)
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 2
+    attempts = max(1, min(5, attempts))
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 2)
+
+    logs: List[str] = []
+    last_candidates: List[Dict[str, Any]] = []
+
+    for attempt in range(1, attempts + 1):
+        logs.append(f"attempt:{attempt}")
+        try:
+            screenshot_path = capture_screen()
+            logs.append(f"screenshot:{screenshot_path}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: screenshot failed: {exc}"
+
+        try:
+            _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            logs.append(f"ocr_boxes:{len(boxes)}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: ocr failed: {exc}"
+
+        best = None
+        best_term = None
+        for term in targets:
+            ranked = rank_text_candidates(term, boxes)
+            if ranked:
+                last_candidates.extend(ranked[:3])
+            if not ranked:
+                continue
+            top = ranked[0]
+            if not best or top.get("high_enough") and not best.get("high_enough"):
+                best = top
+                best_term = term
+            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
+                best = top
+                best_term = term
+            if top.get("high_enough"):
+                break
+
+        if best and (best.get("high_enough") or best.get("medium_enough")):
+            center = best.get("center") or {}
+            cx = float(center.get("x", 0))
+            cy = float(center.get("y", 0))
+            try:
+                with Image.open(screenshot_path) as img:
+                    cx, cy = _clamp_point(cx, cy, img.width, img.height)
+            except Exception:
+                cx, cy = _clamp_point(cx, cy, 10_000, 10_000)
+            click_step = ActionStep(action="click", params={"x": cx, "y": cy, "button": button})
+            click_result = handle_click(click_step)
+            if isinstance(click_result, str) and click_result.startswith("error"):
+                return {
+                    "status": "error",
+                    "reason": click_result,
+                    "matched_text": best.get("text"),
+                    "matched_term": best_term,
+                    "log": logs,
+                }
+            type_result = input.type_text({"text": value})
+            result: Dict[str, Any] = {
+                "status": "typed",
+                "matched_text": best.get("text"),
+                "matched_term": best_term,
+                "center": {"x": cx, "y": cy},
+                "bounds": best.get("bounds"),
+                "click_result": click_result,
+                "type_result": type_result,
+                "log": logs,
+            }
+            if verify_targets:
+                verification = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
+                result["verification"] = verification
+                result["verified"] = bool(verification.get("success"))
+            return result
+
+        logs.append("no_match_found")
+
+    return {
+        "status": "error",
+        "reason": "text_not_found",
+        "targets": targets,
+        "log": logs,
+        "candidates": last_candidates,
+    }
+
+
+def handle_browser_extract_text(step: ActionStep) -> Any:
+    """
+    OCR-driven extractor for browser UI labels; returns the best-matching text and bounds.
+    """
+    params = step.params or {}
+    targets = _extract_targets(params)
+    if not targets:
+        return "error: 'text' param is required"
+
+    attempts = params.get("attempts", 2)
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 2
+    attempts = max(1, min(5, attempts))
+
+    logs: List[str] = []
+    last_candidates: List[Dict[str, Any]] = []
+
+    for attempt in range(1, attempts + 1):
+        logs.append(f"attempt:{attempt}")
+        try:
+            screenshot_path = capture_screen()
+            logs.append(f"screenshot:{screenshot_path}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: screenshot failed: {exc}"
+
+        try:
+            full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            logs.append(f"ocr_boxes:{len(boxes)}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: ocr failed: {exc}"
+
+        best = None
+        best_term = None
+        for term in targets:
+            ranked = rank_text_candidates(term, boxes)
+            if ranked:
+                last_candidates.extend(ranked[:5])
+            if not ranked:
+                continue
+            top = ranked[0]
+            if not best or top.get("high_enough") and not best.get("high_enough"):
+                best = top
+                best_term = term
+            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
+                best = top
+                best_term = term
+            if top.get("high_enough"):
+                break
+
+        if best and (best.get("high_enough") or best.get("medium_enough")):
+            center = best.get("center") or {}
+            bounds = best.get("bounds") or {}
+            result = {
+                "status": "ok",
+                "matched_text": best.get("text"),
+                "matched_term": best_term,
+                "center": {"x": center.get("x"), "y": center.get("y")},
+                "bounds": bounds,
+                "full_text": full_text,
+                "log": logs,
+            }
+            if last_candidates:
+                result["candidates"] = last_candidates[:10]
+            return result
+
+        logs.append("no_match_found")
+
+    return {
+        "status": "error",
+        "reason": "text_not_found",
+        "targets": targets,
+        "log": logs,
+        "candidates": last_candidates,
+    }
+
+
+def _clamp_point(x: float, y: float, width: int, height: int) -> Tuple[float, float]:
+    return max(0.0, min(x, float(width - 1))), max(0.0, min(y, float(height - 1)))
+
+
+def _encode_image_base64(path: Path) -> Optional[str]:
+    try:
+        return base64.b64encode(path.read_bytes()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _icon_templates_from_params(params: Dict[str, Any]) -> Dict[str, str]:
+    templates: Dict[str, str] = {}
+    icon = params.get("target_icon")
+    if isinstance(icon, str):
+        templates["target_icon"] = icon
+    elif isinstance(icon, dict):
+        for k, v in icon.items():
+            if isinstance(v, str):
+                templates[str(k)] = v
+    elif isinstance(icon, (list, tuple)):
+        for idx, v in enumerate(icon):
+            if isinstance(v, str):
+                templates[f"icon_{idx}"] = v
+    return templates
+
+
+def _use_vlm(params: Dict[str, Any]) -> bool:
+    if VLM_DISABLED_FLAG:
+        return False
+    hint = str(params.get("strategy_hint", "")).lower()
+    if hint in {"vlm", "vision", "image", "color", "icon"}:
+        return True
+    return bool(params.get("visual_description"))
+
+
+def _locate_from_params(
+    query: str,
+    params: Dict[str, Any],
+    boxes: List[OcrBox],
+    screenshot_path: Path,
+) -> Dict[str, Any]:
+    icon_templates = _icon_templates_from_params(params)
+    image_b64 = _encode_image_base64(screenshot_path) if (icon_templates or _use_vlm(params)) else None
+    provider_name, provider_call = get_vlm_call()
+    vlm_call = provider_call if _use_vlm(params) else None
+    return locate_target(
+        query=query,
+        boxes=boxes,
+        image_path=str(screenshot_path),
+        image_base64=image_b64,
+        icon_templates=icon_templates if icon_templates else None,
+        vlm_call=vlm_call,
+        vlm_provider=provider_name,
+    )
+
+
+def _run_region_ocr(image_path: Path, bounds: Dict[str, float], padding: int = 40) -> List[OcrBox]:
+    """
+    Run OCR on a padded region around the given bounds and return boxes in global coordinates.
+    """
+    boxes: List[OcrBox] = []
+    with Image.open(image_path) as img:
+        width, height = img.size
+        left = max(0, int(bounds["x"] - padding))
+        top = max(0, int(bounds["y"] - padding))
+        right = min(width, int(bounds["x"] + bounds["width"] + padding))
+        bottom = min(height, int(bounds["y"] + bounds["height"] + padding))
+        region = img.crop((left, top, right, bottom))
+        data = pytesseract.image_to_data(region, output_type=pytesseract.Output.DICT)
+        n = len(data.get("text", []))
+        for i in range(n):
+            text = (data["text"][i] or "").strip()
+            if not text:
+                continue
+            try:
+                conf = float(data.get("conf", [])[i])
+            except Exception:
+                conf = -1.0
+            try:
+                box = OcrBox(
+                    text=text,
+                    x=int(data.get("left", [])[i]) + left,
+                    y=int(data.get("top", [])[i]) + top,
+                    width=int(data.get("width", [])[i]),
+                    height=int(data.get("height", [])[i]),
+                    conf=conf,
+                )
+                boxes.append(box)
+            except Exception:
+                continue
+    return boxes
+
+
+def _select_best_candidate(target: str, boxes: List[OcrBox], logs: List[str]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    candidates = rank_text_candidates(target, boxes)
+    summary = [
+        {"text": c["text"], "score": round(c["score"], 3), "match": c["match_type"]} for c in candidates[:5]
+    ]
+    logs.append(f"candidates:{summary}")
+    best: Optional[Dict[str, Any]] = candidates[0] if candidates else None
+    # Prioritize by tiers: exact > high fuzzy > medium fuzzy.
+    for cand in candidates:
+        if cand["match_type"] == "exact":
+            best = cand
+            break
+    if not best:
+        for cand in candidates:
+            if cand["score"] >= 0.9:
+                best = cand
+                break
+    if not best:
+        for cand in candidates:
+            if cand["score"] >= 0.75:
+                best = cand
+                break
+    if best and not best.get("high_enough") and not best.get("medium_enough"):
+        logs.append(
+            f"best_below_threshold:score:{round(best.get('score', 0.0),3)} match:{best.get('match_type')}"
+        )
+        best = None
+    return best, candidates
+
+
+def _maximize_active_window(logs: List[str]) -> None:
+    try:
+        import pygetwindow as gw  # type: ignore
+
+        win = gw.getActiveWindow()
+        if win:
+            try:
+                win.maximize()
+                logs.append("active_window_maximized")
+                return
+            except Exception as exc:  # noqa: BLE001
+                logs.append(f"active_window_maximize:error:{exc}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"active_window_fetch:error:{exc}")
+
+    # Fallback hotkey maximize (Win+Up on Windows).
+    try:
+        import pyautogui  # type: ignore
+
+        pyautogui.hotkey("win", "up")
+        logs.append("active_window_maximized_fallback")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"active_window_maximize_fallback:error:{exc}")
+
+
+async def click_text(target: str) -> dict:
+    """
+    Capture the screen, OCR it (with regional refinement), locate target text, and click its center.
+
+    Returns a structured dict with success flag, reason, selected box, candidates, retries, and logs.
+    """
+    logs: List[str] = []
+    screenshot_paths: List[str] = []
+    retries = 0
+    if not target or not isinstance(target, str) or not target.strip():
+        return {"success": False, "reason": "target is required", "chosen_box": None, "candidates": [], "retries": retries, "screenshot_paths": screenshot_paths, "log": logs}
+
+    target_norm = target.strip()
+    max_attempts = 3
+    scroll_attempts = 2
+    scroll_pixels = 240
+    chosen = None
+    all_candidates: List[Dict[str, Any]] = []
+
+    prev_failsafe = None
+    try:
+        import pyautogui  # type: ignore
+
+        prev_failsafe = getattr(pyautogui, "FAILSAFE", None)
+        pyautogui.FAILSAFE = False
+    except Exception:
+        pyautogui = None  # type: ignore
+
+    try:
+        for attempt in range(1, max_attempts + 1):
+            retries = attempt - 1
+            logs.append(f"attempt:{attempt}")
+            try:
+                screenshot_path = capture_screen()
+                screenshot_paths.append(str(screenshot_path))
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "success": False,
+                    "reason": f"screenshot failed: {exc}",
+                    "chosen_box": None,
+                    "candidates": all_candidates,
+                    "retries": retries,
+                    "screenshot_paths": screenshot_paths,
+                    "log": logs,
+                }
+
+            try:
+                _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+                logs.append(f"ocr_boxes:{len(boxes)}")
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "success": False,
+                    "reason": f"ocr failed: {exc}",
+                    "chosen_box": None,
+                    "candidates": all_candidates,
+                    "retries": retries,
+                    "screenshot_paths": screenshot_paths,
+                    "log": logs,
+                }
+
+            best, ranked = _select_best_candidate(target_norm, boxes, logs)
+            all_candidates.extend(ranked)
+
+            # Region-focused refinement around the top candidates when confidence is low.
+            if (not best or best["score"] < 0.9) and ranked:
+                top_regions = ranked[:3]
+                refined_boxes: List[OcrBox] = []
+                for cand in top_regions:
+                    refined_boxes.extend(_run_region_ocr(Path(screenshot_path), cand["bounds"], padding=60))
+                if refined_boxes:
+                    best_refined, ranked_refined = _select_best_candidate(target_norm, boxes + refined_boxes, logs)
+                    all_candidates.extend(ranked_refined)
+                    if best_refined:
+                        best = best_refined
+
+            if best:
+                chosen = best
+                bounds = best["bounds"]
+                with Image.open(screenshot_path) as img:
+                    width, height = img.size
+                cx, cy = _clamp_point(bounds["x"] + bounds["width"] / 2.0, bounds["y"] + bounds["height"] / 2.0, width, height)
+                logs.append(f"selected:{best['text']} score:{round(best['score'],3)} match:{best['match_type']} center:({cx},{cy})")
+                try:
+                    if pyautogui:
+                        pyautogui.moveTo(cx, cy)
+                        logs.append("mouse_move:done")
+                except Exception as exc:  # noqa: BLE001
+                    logs.append(f"mouse_move:error:{exc}")
+                click_result = mouse.click({"x": cx, "y": cy, "button": "left"})
+                if isinstance(click_result, str) and click_result.startswith("error"):
+                    return {
+                        "success": False,
+                        "reason": click_result,
+                        "chosen_box": best,
+                        "candidates": all_candidates,
+                        "retries": retries,
+                        "screenshot_paths": screenshot_paths,
+                        "log": logs,
+                    }
+                return {
+                    "success": True,
+                    "reason": click_result if isinstance(click_result, str) else "clicked",
+                    "chosen_box": best,
+                    "candidates": all_candidates,
+                    "retries": retries,
+                    "screenshot_paths": screenshot_paths,
+                    "log": logs,
+                }
+
+            # Auto-scroll and retry when allowed.
+            if scroll_attempts > 0 and pyautogui:
+                try:
+                    pyautogui.scroll(-scroll_pixels)
+                    scroll_attempts -= 1
+                    logs.append(f"auto_scroll:-{scroll_pixels}")
+                    time.sleep(0.4)
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logs.append(f"auto_scroll:error:{exc}")
+                    scroll_attempts = 0
+
+        return {
+            "success": False,
+            "reason": "text_not_found",
+            "chosen_box": None,
+            "candidates": all_candidates,
+            "retries": retries,
+            "screenshot_paths": screenshot_paths,
+            "log": logs,
+        }
+    finally:
+        try:
+            if pyautogui and prev_failsafe is not None:
+                pyautogui.FAILSAFE = prev_failsafe
+        except Exception:
+            pass
+
+
+def _safe_filename_from_query(query: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in query.strip()) or "image"
+    return cleaned.strip("_") or "image"
+
+
+async def demo_search_image_and_save(query: str, target_folder: str) -> dict:
+    """
+    Demo helper to search an image in Edge and save it to a target folder.
+    Uses only generic actions (open_app, activate_window, hotkey, type_text, key_press,
+    wait, click_text, right_click) plus OCR and screenshot utilities.
+    Not exposed to the planner; intended for manual/demo use.
+    """
+    logs: List[str] = []
+    saved_path: Optional[str] = None
+    target_folder = str(target_folder or "").strip()
+    if not query or not isinstance(query, str):
+        return {"success": False, "reason": "query_required", "saved_path": None, "log": logs}
+    if not target_folder:
+        return {"success": False, "reason": "target_folder_required", "saved_path": None, "log": logs}
+
+    # Ensure folder exists.
+    try:
+        os.makedirs(target_folder, exist_ok=True)
+        logs.append(f"ensure_dir:{target_folder}")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"ensure_dir_failed:{exc}", "saved_path": None, "log": logs}
+
+    # 1) Launch/foreground Chrome.
+    try:
+        open_result = handle_open_app(ActionStep(action="open_app", params={"target": "chrome"}))
+        logs.append(f"open_chrome:{open_result}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"open_chrome:error:{exc}")
+    try:
+        activate_result = activate_window({"title_keywords": ["chrome", "google chrome"]})
+        logs.append(f"activate_chrome:{activate_result}")
+        if isinstance(activate_result, dict) and not activate_result.get("success"):
+            logs.append("activate_chrome:failed")
+        _maximize_active_window(logs)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"activate_chrome:error:{exc}")
+
+    # 2) Focus address bar, type query, hit enter.
+    try:
+        hotkey_result = handle_hotkey(ActionStep(action="hotkey", params={"keys": ["ctrl", "l"]}))
+        logs.append(f"hotkey_ctrl_l:{hotkey_result}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"hotkey_ctrl_l:error:{exc}")
+    try:
+        type_result = input.type_text({"text": query})
+        logs.append(f"type_query:{type_result}")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"type_query_failed:{exc}", "saved_path": None, "log": logs}
+    try:
+        enter_result = input.key_press({"keys": ["enter"]})
+        logs.append(f"press_enter:{enter_result}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"press_enter:error:{exc}")
+    time.sleep(3)
+    logs.append("wait_after_search:3s")
+    try:
+        recheck_activate = activate_window({"title_keywords": ["chrome", "google chrome"]})
+        logs.append(f"recheck_activate_chrome:{recheck_activate}")
+        _maximize_active_window(logs)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"recheck_activate_chrome:error:{exc}")
+    time.sleep(0.6)
+    logs.append("wait_after_reactivate:0.6s")
+
+    # 2b) Force navigate directly to Bing Images to avoid mis-OCR on the Images tab.
+    images_nav_done = False
+    images_url = f"https://www.bing.com/images/search?q={quote_plus(query)}"
+    # Prefer launching navigation via shell to avoid keyboard focus issues.
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", images_url],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        logs.append("open_url_via_start:ok")
+        images_nav_done = True
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"open_url_via_start:error:{exc}")
+
+    if not images_nav_done:
+        try:
+            nav_hotkey = handle_hotkey(ActionStep(action="hotkey", params={"keys": ["ctrl", "l"]}))
+            logs.append(f"hotkey_ctrl_l_images:{nav_hotkey}")
+            nav_type = input.type_text({"text": images_url})
+            logs.append(f"type_images_url:{images_url}:{nav_type}")
+            nav_enter = input.key_press({"keys": ["enter"]})
+            logs.append(f"confirm_images_url:{nav_enter}")
+            images_nav_done = True
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"navigate_images_url:error:{exc}")
+
+    time.sleep(3)
+    logs.append("wait_after_images_nav:3s")
+    try:
+        recheck_activate2 = activate_window({"title_keywords": ["chrome", "google chrome"]})
+        logs.append(f"recheck_activate_chrome_after_nav:{recheck_activate2}")
+        _maximize_active_window(logs)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"recheck_activate_chrome_after_nav:error:{exc}")
+    time.sleep(0.6)
+    logs.append("wait_after_reactivate_images:0.6s")
+
+    # 3) Ensure we are on the images results page; if the direct nav worked, skip OCR tab click.
+    images_label_used = None
+    if images_nav_done:
+        logs.append("images_tab_skip:direct_nav")
+    else:
+        for label in ["图片", "Images"]:
+            try:
+                click_res = await click_text(label)
+                logs.append(f"click_images_tab:{label}:{click_res}")
+                if click_res.get("success"):
+                    images_label_used = label
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logs.append(f"click_images_tab:{label}:error:{exc}")
+        if not images_label_used:
+            return {"success": False, "reason": "images_tab_not_found", "saved_path": None, "log": logs}
+        time.sleep(2)
+        logs.append("wait_after_images_tab:2s")
+
+    # 4) Heuristic first-image click point: screen center offset slightly up/left.
+    active_rect = None
+    try:
+        import pygetwindow as gw  # type: ignore
+
+        win = gw.getActiveWindow()
+        if win:
+            active_rect = (
+                getattr(win, "left", 0),
+                getattr(win, "top", 0),
+                getattr(win, "width", 0),
+                getattr(win, "height", 0),
+            )
+            logs.append(f"active_window_rect:{getattr(win, 'title', '')}:{active_rect}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"active_window_rect:error:{exc}")
+
+    try:
+        screenshot_path = capture_screen()
+        logs.append(f"screenshot_for_heuristic:{screenshot_path}")
+        with Image.open(screenshot_path) as img:
+            width, height = img.size
+        if active_rect:
+            left, top, w, h = active_rect
+            # Aim near the upper-left grid area of the image results.
+            click_x = left + w * 0.30
+            click_y = top + h * 0.35
+            center_x, center_y = left + w / 2.0, top + h / 2.0
+            logs.append(f"use_active_center:{center_x},{center_y}")
+            logs.append(f"heuristic_from_window:({click_x},{click_y}) window:{active_rect}")
+        else:
+            center_x, center_y = width / 2.0, height / 2.0
+            dx, dy = 220, -140
+            click_x, click_y = _clamp_point(center_x - dx, center_y + dy, int(width), int(height))
+            logs.append(
+                f"heuristic_click_point:({click_x},{click_y}) center:({center_x},{center_y}) offset:({-dx},{dy})"
+            )
+        rc_result = handle_right_click(ActionStep(action="right_click", params={"x": click_x, "y": click_y}))
+        logs.append(f"right_click_result:{rc_result}")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"right_click_failed:{exc}", "saved_path": None, "log": logs}
+
+    def _click_menu_label(label: str) -> dict:
+        region_size = 640
+        half = region_size / 2.0
+        region_bounds = {
+            "x": max(0.0, click_x - half),
+            "y": max(0.0, click_y - half),
+            "width": region_size,
+            "height": region_size,
+        }
+        try:
+            screenshot_path_local = capture_screen()
+            boxes_local = _run_region_ocr(Path(screenshot_path_local), region_bounds, padding=10)
+            logs.append(f"menu_region_boxes:{len(boxes_local)} label:{label} bounds:{region_bounds}")
+            best_local, ranked_local = _select_best_candidate(label, boxes_local, logs)
+            if best_local:
+                bounds_local = best_local["bounds"]
+                with Image.open(screenshot_path_local) as img_local:
+                    w_local, h_local = img_local.size
+                cx_local, cy_local = _clamp_point(
+                    bounds_local["x"] + bounds_local["width"] / 2.0,
+                    bounds_local["y"] + bounds_local["height"] / 2.0,
+                    w_local,
+                    h_local,
+                )
+                click_outcome = mouse.click({"x": cx_local, "y": cy_local, "button": "left"})
+                return {
+                    "success": not (isinstance(click_outcome, str) and click_outcome.startswith("error")),
+                    "reason": click_outcome,
+                    "chosen_box": best_local,
+                    "candidates": ranked_local,
+                }
+            return {"success": False, "reason": "menu_label_not_found", "candidates": ranked_local}
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "reason": f"menu_click_error:{exc}", "candidates": []}
+
+    # 5) Context menu: choose "Save image as".
+    menu_labels = ["图片另存为", "Save image as"]
+    menu_clicked = False
+    for label in menu_labels:
+        try:
+            save_click = _click_menu_label(label)
+            logs.append(f"click_save_menu:{label}:{save_click}")
+            if save_click.get("success"):
+                menu_clicked = True
+                break
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"click_save_menu:{label}:error:{exc}")
+    if not menu_clicked:
+        # Fallback: use keyboard to choose the first "Save image as" entry in the context menu.
+        try:
+            kb_try = input.key_press({"keys": ["v"]})
+            logs.append(f"fallback_menu_key_v:{kb_try}")
+            time.sleep(0.3)
+            kb_enter = input.key_press({"keys": ["enter"]})
+            logs.append(f"fallback_menu_enter:{kb_enter}")
+            menu_clicked = True  # best effort; continue to save dialog
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"fallback_menu_key:error:{exc}")
+            # Final fallback: down-arrow a few times then enter.
+            try:
+                _ = input.key_press({"keys": ["down"]})
+                _ = input.key_press({"keys": ["down"]})
+                _ = input.key_press({"keys": ["enter"]})
+                logs.append("fallback_menu_down_enter:sent")
+                menu_clicked = True
+            except Exception as exc2:  # noqa: BLE001
+                logs.append(f"fallback_menu_down_enter:error:{exc2}")
+                return {"success": False, "reason": "save_menu_not_found", "saved_path": None, "log": logs}
+
+    # 6) Save dialog: type path and confirm.
+    time.sleep(1.2)
+    logs.append("wait_before_save:1.2s")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{_safe_filename_from_query(query)}_{timestamp}.png"
+    full_path = str(Path(target_folder) / filename)
+    try:
+        select_name = input.key_press({"keys": ["ctrl", "a"]})
+        logs.append(f"select_filename_box:{select_name}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"select_filename_box:error:{exc}")
+    try:
+        type_path_res = input.type_text({"text": full_path})
+        logs.append(f"type_save_path:{full_path}:{type_path_res}")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"type_save_path_failed:{exc}", "saved_path": None, "log": logs}
+    try:
+        enter_save = input.key_press({"keys": ["enter"]})
+        logs.append(f"confirm_save_enter1:{enter_save}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"confirm_save_enter1:error:{exc}")
+    time.sleep(1.2)
+    try:
+        enter_save2 = input.key_press({"keys": ["enter"]})
+        logs.append(f"confirm_save_enter2:{enter_save2}")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"confirm_save_enter2:error:{exc}")
+    time.sleep(2.5)
+    logs.append("wait_after_save:2.5s")
+
+    # 7) Optional verification.
+    exists = os.path.exists(full_path)
+    if not exists:
+        try:
+            alt_save = input.key_press({"keys": ["alt", "s"]})
+            logs.append(f"fallback_alt_s:{alt_save}")
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"fallback_alt_s:error:{exc}")
+        time.sleep(2.0)
+        exists = os.path.exists(full_path)
+
+    if exists:
+        saved_path = full_path
+        logs.append(f"file_exists:{full_path}")
+    else:
+        logs.append(f"file_not_found:{full_path}")
+
+    return {
+        "success": bool(saved_path),
+        "reason": "saved" if saved_path else "save_unconfirmed",
+        "saved_path": saved_path,
+        "log": logs,
+    }
+
+
+async def search_and_open_contact(contact_name: str) -> dict:
+    """
+    Open a contact in WeChat by searching and clicking the contact entry.
+
+    Steps:
+    1) Click search box ("搜索" or "Search").
+    2) Type contact name.
+    3) Wait briefly for results.
+    4) OCR screen and locate the contact name.
+    5) Move mouse and click the contact entry.
+    """
+    logs: List[str] = []
+    if not contact_name or not isinstance(contact_name, str) or not contact_name.strip():
+        return {"success": False, "reason": "contact_name is required", "boxes": None, "log": logs}
+
+    # Step 1: click search box (Chinese first, fallback to English).
+    search_attempt = await click_text("搜索")
+    logs.append(f"click_search_zh:{search_attempt}")
+    if not search_attempt.get("success"):
+        search_attempt_en = await click_text("Search")
+        logs.append(f"click_search_en:{search_attempt_en}")
+        if not search_attempt_en.get("success"):
+            return {
+                "success": False,
+                "reason": "search box not found",
+                "boxes": None,
+                "log": logs,
+            }
+
+    # Step 2: type contact name.
+    try:
+        input.type_text({"text": contact_name})
+        logs.append("typed_contact")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "reason": f"failed to type contact: {exc}",
+            "boxes": None,
+            "log": logs,
+        }
+
+    # Step 3: wait for results.
+    time.sleep(0.8)
+    logs.append("waited:0.8s")
+
+    # Step 4: OCR the screen.
+    try:
+        screenshot_path = capture_screen()
+        logs.append(f"screenshot:{screenshot_path}")
+        _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+        logs.append(f"ocr_boxes:{len(boxes)}")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"ocr failed: {exc}", "boxes": None, "log": logs}
+
+    # Step 5: locate contact name.
+    match = locate_text(contact_name.strip(), boxes)
+    if not match:
+        return {
+            "success": False,
+            "reason": f"contact '{contact_name}' not found",
+            "boxes": [b.to_dict() for b in boxes],
+            "log": logs,
+        }
+
+    best_box, center = match
+    x, y = center
+    logs.append(f"match:{best_box} center:({x},{y})")
+
+    # Step 6: click contact entry.
+    try:
+        import pyautogui  # type: ignore
+
+        pyautogui.moveTo(x, y)
+        logs.append("mouse_move:done")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"mouse_move:error:{exc}")
+
+    click_result = mouse.click({"x": x, "y": y, "button": "left"})
+    if isinstance(click_result, str) and click_result.startswith("error"):
+        return {
+            "success": False,
+            "reason": click_result,
+            "boxes": [b.to_dict() for b in boxes],
+            "log": logs,
+        }
+
+    return {
+        "success": True,
+        "reason": click_result if isinstance(click_result, str) else "contact opened",
+        "boxes": [b.to_dict() for b in boxes],
+        "log": logs,
+    }
+
+
+async def locate_message_input_box() -> dict:
+    """
+    Capture screen and heuristically locate the message input box using hint text.
+    """
+    logs: List[str] = []
+    hints = ["发送", "Send", "输入", "Aa"]
+    try:
+        screenshot_path = capture_screen()
+        logs.append(f"screenshot:{screenshot_path}")
+        _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+        logs.append(f"ocr_boxes:{len(boxes)}")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"ocr failed: {exc}", "box": None, "log": logs}
+
+    best_match = None
+    for hint in hints:
+        match = locate_text(hint, boxes)
+        logs.append(f"locate_hint:{hint}:{'hit' if match else 'miss'}")
+        if match:
+            best_match = match
+            break
+
+    if not best_match:
+        return {"success": False, "reason": "input box not found", "box": None, "log": logs}
+
+    box, center = best_match
+    try:
+        bx = box.x if isinstance(box, OcrBox) else float(getattr(box, "x", box.get("x", 0)))
+        by = box.y if isinstance(box, OcrBox) else float(getattr(box, "y", box.get("y", 0)))
+        bw = box.width if isinstance(box, OcrBox) else float(getattr(box, "width", box.get("width", 0)))
+        bh = box.height if isinstance(box, OcrBox) else float(getattr(box, "height", box.get("height", 0)))
+    except Exception:
+        bx = by = bw = bh = 0.0
+
+    # Expand downward to cover the text entry region.
+    margin_x = 30
+    margin_y = 80
+    inferred_box = {
+        "x": bx - margin_x,
+        "y": by,
+        "width": bw + margin_x * 2,
+        "height": bh + margin_y,
+        "center": {"x": center[0], "y": center[1] + bh / 2 + margin_y / 2},
+        "hint": getattr(box, "text", None) if hasattr(box, "text") else getattr(box, "get", lambda k, default=None: None)("text", None),
+    }
+    logs.append(f"inferred_box:{inferred_box}")
+
+    return {"success": True, "reason": "input box inferred", "box": inferred_box, "log": logs}
+
+
+async def send_message(message: str) -> dict:
+    """
+    Locate the message input box, click it, type the message, and press Enter.
+    """
+    logs: List[str] = []
+    if not message or not isinstance(message, str):
+        return {"success": False, "reason": "message is required", "box": None, "log": logs}
+
+    locate_result = await locate_message_input_box()
+    logs.append(f"locate_input:{locate_result}")
+    if not locate_result.get("success"):
+        return {"success": False, "reason": locate_result.get("reason"), "box": None, "log": logs}
+
+    box = locate_result.get("box") or {}
+    center = box.get("center") or {}
+    cx = center.get("x")
+    cy = center.get("y")
+    if cx is None or cy is None:
+        return {"success": False, "reason": "invalid input center", "box": box, "log": logs}
+
+    try:
+        import pyautogui  # type: ignore
+
+        pyautogui.moveTo(cx, cy)
+        logs.append("mouse_move:done")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"mouse_move:error:{exc}")
+
+    click_result = mouse.click({"x": cx, "y": cy, "button": "left"})
+    logs.append(f"click_input:{click_result}")
+    if isinstance(click_result, str) and click_result.startswith("error"):
+        return {"success": False, "reason": click_result, "box": box, "log": logs}
+
+    try:
+        input.type_text({"text": message})
+        logs.append("typed_message")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"failed to type message: {exc}", "box": box, "log": logs}
+
+    try:
+        input.key_press({"keys": ["enter"]})
+        logs.append("pressed_enter")
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "reason": f"failed to press enter: {exc}", "box": box, "log": logs}
+
+    return {"success": True, "reason": "message sent", "box": box, "log": logs}
+
+
+async def send_wechat_message(contact: str, message: str) -> dict:
+    """
+    Activate WeChat, open a contact, and send a message.
+    """
+    logs: List[str] = []
+    if not contact or not isinstance(contact, str):
+        return {
+            "success": False,
+            "reason": "contact is required",
+            "contact_result": None,
+            "message_result": None,
+            "log": logs,
+        }
+    if not message or not isinstance(message, str):
+        return {
+            "success": False,
+            "reason": "message is required",
+            "contact_result": None,
+            "message_result": None,
+            "log": logs,
+        }
+
+    # Step 1: activate WeChat window.
+    try:
+        activation = activate_wechat_window()
+        logs.append(f"activate_wechat:{activation}")
+        activation_log = activation.get("log") if isinstance(activation, dict) else None
+        if isinstance(activation_log, list):
+            logs.extend([f"activation_log:{entry}" for entry in activation_log])
+        elif activation_log:
+            logs.append(f"activation_log:{activation_log}")
+        if isinstance(activation, dict) and not activation.get("success"):
+            return {
+                "success": False,
+                "reason": activation.get("reason") or "failed to activate wechat",
+                "contact_result": None,
+                "message_result": None,
+                "log": logs,
+            }
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"activate_wechat:error:{exc}")
+        try:
+            activation = handle_switch_window(ActionStep(action="switch_window", params={"title": "wechat"}))
+            logs.append(f"activate:{activation}")
+            if isinstance(activation, str) and activation.startswith("error"):
+                return {
+                    "success": False,
+                    "reason": activation,
+                    "contact_result": None,
+                    "message_result": None,
+                    "log": logs,
+                }
+            if isinstance(activation, dict) and activation.get("status") == "error":
+                return {
+                    "success": False,
+                    "reason": activation.get("message") or "failed to activate wechat",
+                    "contact_result": None,
+                    "message_result": None,
+                    "log": logs,
+                }
+        except Exception as switch_exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "reason": f"activation failed: {switch_exc}",
+                "contact_result": None,
+                "message_result": None,
+                "log": logs,
+            }
+
+    # Step 2: open contact.
+    contact_result = await search_and_open_contact(contact)
+    logs.append(f"contact:{contact_result}")
+    if not contact_result.get("success"):
+        return {
+            "success": False,
+            "reason": contact_result.get("reason") or "failed to open contact",
+            "contact_result": contact_result,
+            "message_result": None,
+            "log": logs,
+        }
+
+    # Step 3: send message.
+    message_result = await send_message(message)
+    logs.append(f"message:{message_result}")
+    if not message_result.get("success"):
+        return {
+            "success": False,
+            "reason": message_result.get("reason") or "failed to send message",
+            "contact_result": contact_result,
+            "message_result": message_result,
+            "log": logs,
+        }
+
+    return {
+        "success": True,
+        "reason": "message sent",
+        "contact_result": contact_result,
+        "message_result": message_result,
+        "log": logs,
+    }
+
+
+def _pick_best_wechat_window(candidates: List[_WinSnapshot]) -> Optional[_WinSnapshot]:
+    best: Optional[_WinSnapshot] = None
+    best_score: Optional[float] = None
+    blocked_classes = {"applicationframewindow", "applicationframeinputsinkwindow"}
+    preferred_classes = {"wechatmainwndforpc", "chrome_widgetwin_0"}
+    for snap in candidates:
+        left, top, right, bottom = snap.rect
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        if width > 2000 or height > 2000:
+            continue
+        if snap.is_cloaked or snap.has_owner:
+            continue
+        title = snap.title or ""
+        class_name = snap.class_name or ""
+        class_l = class_name.lower()
+        title_l = title.lower()
+        if class_l in blocked_classes:
+            continue
+        # Reject if fully hidden and minimized (likely non-interactive host container).
+        if not snap.is_visible and snap.is_minimized:
+            continue
+        base_class_score = 0
+        if class_name in _WECHAT_CLASS_NAMES:
+            base_class_score = 3
+        elif class_l == "chrome_widgetwin_0":
+            base_class_score = 2
+        elif "wechat" in class_l:
+            base_class_score = 1
+        title_score = 1.0 if ("wechat" in title_l or "微信" in title_l) else 0.0
+        preferred_flag = 1 if class_l in preferred_classes else 0
+        area = width * height
+        score = (
+            preferred_flag * 1_000_000_000
+            + base_class_score * 10_000_000
+            + (1 if snap.is_visible else 0) * 5_000_000
+            + area
+            + title_score * 10_000
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best = snap
+    return best
+
+
+def _foreground_snapshot() -> Dict[str, Any]:
+    """Collect foreground window details for diagnostics."""
+    info: Dict[str, Any] = {
+        "hwnd": None,
+        "title": "",
+        "class_name": "",
+        "pid": None,
+        "is_wechat_ui": False,
+    }
+    try:
+        hwnd = user32.GetForegroundWindow()
+        info["hwnd"] = int(hwnd)
+        info["title"] = _get_window_title(hwnd)
+        info["class_name"] = _get_class_name(hwnd)
+        pid_out = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid_out))
+        info["pid"] = int(pid_out.value)
+        class_l = info["class_name"].lower()
+        title_l = info["title"].lower()
+        info["is_wechat_ui"] = bool(
+            "wechat" in class_l or "wechat" in title_l or "微信" in info["title"]
+        )
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = str(exc)
+    return info
+
+
+def _collect_wechat_candidates_debug(relax_hidden: bool, extra_terms: Optional[List[str]] = None) -> List[_WinSnapshot]:
+    """Enumerate WeChat-like windows with adjustable filters for debugging."""
+    snapshots: List[_WinSnapshot] = []
+    search_terms = ["wechat", "微信", "weixin"]
+    for term in extra_terms or []:
+        if term and term not in search_terms:
+            search_terms.append(term)
+    blocked_classes = {"applicationframewindow", "applicationframeinputsinkwindow"}
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def _callback(hwnd, _lparam):
+        title = _get_window_title(hwnd)
+        class_name = _get_class_name(hwnd)
+        title_l = title.lower()
+        class_l = class_name.lower()
+        hit = any(term in title_l or term in class_l for term in search_terms)
+        if not hit:
+            return True
+        if class_l in blocked_classes:
+            return True
+        pid_out = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_out))
+        is_visible = bool(user32.IsWindowVisible(hwnd))
+        has_owner = bool(user32.GetWindow(hwnd, GW_OWNER))
+        if has_owner:
+            return True
+        is_cloaked = _is_cloaked(hwnd)
+        try:
+            is_minimized = bool(user32.IsIconic(hwnd))
+        except Exception:
+            is_minimized = False
+        rect = _get_window_rect(hwnd)
+        if not relax_hidden and not is_visible and is_minimized:
+            return True
+        snapshots.append(
+            _WinSnapshot(
+                int(hwnd),
+                title,
+                int(pid_out.value),
+                is_visible,
+                is_cloaked,
+                has_owner,
+                is_minimized,
+                class_name,
+                rect,
+            )
+        )
+        return True
+
+    try:
+        user32.EnumWindows(_callback, 0)
+    except Exception:
+        return snapshots
+    return snapshots
+
+
+def _analyze_window_white(rect: Tuple[int, int, int, int]) -> Dict[str, Any]:
+    """Heuristic to detect if a window region is mostly white/blank."""
+    result: Dict[str, Any] = {"is_white": False}
+    try:
+        from PIL import Image, ImageStat  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        result["reason"] = f"pil_missing:{exc}"
+        return result
+
+    try:
+        screenshot_path = capture_screen()
+        with Image.open(Path(screenshot_path)) as im:
+            left, top, right, bottom = rect
+            width = max(0, right - left)
+            height = max(0, bottom - top)
+            if width <= 0 or height <= 0:
+                result["reason"] = "invalid_rect"
+                return result
+            # Clamp to image bounds.
+            clamped_left = max(0, min(left, im.width))
+            clamped_top = max(0, min(top, im.height))
+            clamped_right = max(clamped_left + 1, min(right, im.width))
+            clamped_bottom = max(clamped_top + 1, min(bottom, im.height))
+            crop = im.crop((clamped_left, clamped_top, clamped_right, clamped_bottom))
+            gray = crop.convert("L")
+            hist = gray.histogram()
+            total = sum(hist)
+            if total <= 0:
+                result["reason"] = "empty_hist"
+                return result
+            white_pixels = sum(hist[245:])
+            white_ratio = white_pixels / float(total)
+            stat = ImageStat.Stat(crop)
+            mean = sum(stat.mean) / len(stat.mean)
+            stddev = max(stat.stddev)
+            result.update(
+                {
+                    "white_ratio": white_ratio,
+                    "mean": mean,
+                    "stddev": stddev,
+                    "reason": "ok",
+                    "is_white": bool(
+                        white_ratio >= 0.97
+                        or (white_ratio >= 0.95 and mean >= 240 and stddev <= 20)
+                    ),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        result["reason"] = f"analysis_error:{exc}"
+    return result
+
+
+def _debug_activation_attempt(
+    strategy: str,
+    relax_hidden: bool,
+    force_foreground: bool,
+    extra_terms: Optional[List[str]],
+) -> dict:
+    """
+    Run a configurable activation attempt by enumerating windows, picking the best
+    candidate, and foregrounding it with optional force.
+    """
+    logs: List[str] = [f"strategy:{strategy}", f"relax_hidden:{relax_hidden}", f"force_foreground:{force_foreground}"]
+    snapshots = _collect_wechat_candidates_debug(relax_hidden=relax_hidden, extra_terms=extra_terms)
+    logs.append(f"candidates:{len(snapshots)}")
+    if not snapshots:
+        return {"success": False, "reason": "no candidates", "hwnd": None, "log": logs}
+
+    best = _pick_best_wechat_window(snapshots)
+    if not best:
+        return {"success": False, "reason": "no best candidate", "hwnd": None, "log": logs}
+
+    hwnd = best.hwnd
+    pid = best.pid
+    logs.append(f"selected_hwnd:{hwnd} pid:{pid} title:{best.title} class:{best.class_name}")
+
+    activated = False
+    try:
+        if force_foreground:
+            activated = _force_foreground_wechat(hwnd, pid)
+            logs.append("foreground_logic:force")
+        else:
+            activated = _activate_hwnd(hwnd, pid)
+            logs.append("foreground_logic:standard")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"activation_error:{exc}")
+
+    if activated:
+        try:
+            global LAST_WINDOW_TITLE
+            LAST_WINDOW_TITLE = best.title
+        except Exception:
+            pass
+    return {
+        "success": bool(activated),
+        "reason": "activated" if activated else "foreground_failed",
+        "hwnd": hwnd,
+        "pid": pid,
+        "log": logs,
+    }
+
+
+def debug_wechat_activation() -> dict:
+    """
+    Automated self-test-and-repair for WeChat activation with up to 3 attempts.
+
+    Each cycle runs activation, inspects results, captures a screenshot, and applies
+    progressively relaxed filters and foregrounding logic when necessary.
+    Prints a diagnostic report and returns structured results.
+    """
+    strategies = [
+        {"name": "default_activate", "mode": "activate", "relax_hidden": False, "force_foreground": False, "extra_terms": ["wechat", "微信", "weixin"]},
+        {"name": "relaxed_filters_force", "mode": "manual", "relax_hidden": True, "force_foreground": True, "extra_terms": ["wechat", "微信", "weixin"]},
+        {"name": "manual_force_broad_terms", "mode": "manual", "relax_hidden": True, "force_foreground": True, "extra_terms": ["wechat", "微信", "weixin", "wx"]},
+    ]
+
+    attempts: List[Dict[str, Any]] = []
+
+    for idx, strat in enumerate(strategies, start=1):
+        attempt_info: Dict[str, Any] = {"attempt": idx, "strategy": strat["name"]}
+        try:
+            if strat["mode"] == "activate":
+                activation = activate_wechat_window()
+            else:
+                activation = _debug_activation_attempt(
+                    strategy=strat["name"],
+                    relax_hidden=strat["relax_hidden"],
+                    force_foreground=strat["force_foreground"],
+                    extra_terms=strat["extra_terms"],
+                )
+        except Exception as exc:  # noqa: BLE001
+            activation = {"success": False, "reason": f"exception:{exc}", "hwnd": None, "log": []}
+
+        attempt_info["activation"] = activation
+        attempt_info["activation_success"] = bool(activation.get("success") if isinstance(activation, dict) else False)
+        attempt_info["activation_hwnd"] = activation.get("hwnd") if isinstance(activation, dict) else None
+        attempt_info["activation_reason"] = activation.get("reason") if isinstance(activation, dict) else None
+        attempt_info["activation_log"] = activation.get("log") if isinstance(activation, dict) else None
+
+        fg_snapshot = _foreground_snapshot()
+        attempt_info["foreground"] = fg_snapshot
+        attempt_info["wechat_ui_detected"] = bool(fg_snapshot.get("is_wechat_ui"))
+        attempt_info["foreground_matches_activation"] = (
+            bool(fg_snapshot.get("hwnd")) and fg_snapshot.get("hwnd") == attempt_info["activation_hwnd"]
+        )
+
+        try:
+            screenshot_path = capture_screen()
+            attempt_info["screenshot"] = str(screenshot_path)
+        except Exception as exc:  # noqa: BLE001
+            attempt_info["screenshot_error"] = f"screenshot failed: {exc}"
+
+        attempts.append(attempt_info)
+        if attempt_info["wechat_ui_detected"]:
+            break
+
+    final_detected = bool(attempts and attempts[-1].get("wechat_ui_detected"))
+    summary = {"attempts": attempts, "final_wechat_ui_foreground": final_detected}
+
+    # Human-readable diagnostic report.
+    print("=== WeChat Activation Debug Report ===")
+    for att in attempts:
+        print(
+            f"[Attempt {att['attempt']} - {att['strategy']}] "
+            f"activation_success={att.get('activation_success')} "
+            f"wechat_ui_detected={att.get('wechat_ui_detected')} "
+            f"foreground_matches_activation={att.get('foreground_matches_activation')}"
+        )
+        fg = att.get("foreground", {}) or {}
+        print(
+            f"  Foreground hwnd={fg.get('hwnd')} "
+            f"title='{fg.get('title')}' class='{fg.get('class_name')}' visible_wechat={fg.get('is_wechat_ui')}"
+        )
+        if att.get("activation_reason"):
+            print(f"  Activation reason: {att.get('activation_reason')}")
+        if att.get("screenshot"):
+            print(f"  Screenshot: {att.get('screenshot')}")
+        if att.get("screenshot_error"):
+            print(f"  Screenshot error: {att.get('screenshot_error')}")
+    print(f"Final visible WeChat UI: {final_detected}")
+
+    return summary
+
+
+def activate_wechat_window() -> dict:
+    """
+    Deprecated WeChat-specific helper kept for compatibility.
+    Routes to the generic activate_window using WeChat keywords.
+    """
+    return activate_window(
+        {"title_keywords": ["wechat", "微信", "weixin"], "class_keywords": ["wechat"]}
+    )
+
+
+def _capture_observation(capture_screenshot: bool, capture_ocr: bool) -> Dict[str, Any]:
+    """
+    Capture an observation snapshot (screenshot + optional OCR) for feedback loops.
+    """
+    observation: Dict[str, Any] = {"captured": False, "timestamp": datetime.now().isoformat()}
+    if not capture_screenshot:
+        observation["capture_enabled"] = False
+        return observation
+
+    try:
+        screenshot_path = capture_screen()
+        observation.update({"captured": True, "screenshot_path": str(screenshot_path), "capture_enabled": True})
+        if capture_ocr:
+            try:
+                full_text = run_ocr(str(screenshot_path))
+                observation["ocr_excerpt"] = full_text[:OCR_PREVIEW_LIMIT]
+                observation["ocr_char_count"] = len(full_text)
+            except Exception as exc:  # noqa: BLE001
+                observation["ocr_error"] = f"ocr failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        observation["error"] = f"screenshot failed: {exc}"
+    return observation
+
+
+def _normalize_handler_status(message: Any, default_status: str = "success") -> Tuple[str, Optional[str]]:
+    status = default_status
+    reason = None
+    if isinstance(message, dict):
+        msg_status = message.get("status")
+        if isinstance(msg_status, str):
+            status = msg_status.lower()
+        reason = message.get("reason") or message.get("message")
+    elif isinstance(message, str):
+        lowered = message.lower()
+        if lowered.startswith("error"):
+            status = "error"
+        elif lowered.startswith("stub"):
+            status = "noop"
+        reason = message
+    return status, reason
+
+
+def _verify_step_outcome(
+    action: str, status: str, message: Any, attempt: int, max_attempts: int, verify_mode: str = "auto"
+) -> Dict[str, Any]:
+    """
+    Normalize the outcome of a handler call into a retry/complete/failed decision.
+    """
+    verify_mode = (verify_mode or "auto").lower()
+    if verify_mode not in {"auto", "never", "always"}:
+        verify_mode = "auto"
+
+    # If verification is disabled, honor handler status only.
+    if verify_mode == "never":
+        decision = "success" if status not in {"error", "failed"} else ("retry" if attempt < max_attempts else "failed")
+        return {
+            "decision": decision,
+            "reason": "verification_skipped",
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verified": None,
+            "action": action,
+            "should_retry": decision == "retry",
+        }
+
+    decision = "success"
+    reason = "handler_success"
+    verified_flag = None
+
+    if isinstance(message, dict):
+        verified_flag = message.get("verified")
+
+    if status in {"error", "failed"}:
+        decision = "retry" if attempt < max_attempts else "failed"
+        reason = "handler_error"
+    elif verified_flag is False:
+        decision = "retry" if attempt < max_attempts else "failed"
+        reason = "verification_failed"
+    elif verified_flag is True:
+        reason = "verified"
+    elif status == "noop":
+        reason = "noop"
+
+    return {
+        "decision": decision,
+        "reason": reason,
+        "status": status,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "verified": verified_flag,
+        "action": action,
+        "should_retry": decision == "retry",
+    }
+
+
+def _build_step_feedback_config(step: ActionStep, base_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge base feedback settings with per-step overrides embedded in params.
+    """
+    params = step.params if isinstance(step.params, dict) else {}
+    feedback_overrides = params.get("_feedback") or params.get("feedback") or {}
+    if not isinstance(feedback_overrides, dict):
+        feedback_overrides = {}
+
+    capture_before = _coerce_bool(
+        params.get("capture_before", feedback_overrides.get("capture_before")), base_config["capture_before"]
+    )
+    capture_after = _coerce_bool(
+        params.get("capture_after", feedback_overrides.get("capture_after")), base_config["capture_after"]
+    )
+    capture_ocr_default = base_config["capture_ocr"]
+    if not capture_ocr_default and DEFAULT_UI_OCR and step.action in OCR_CAPTURE_ACTIONS:
+        capture_ocr_default = True
+    capture_ocr = _coerce_bool(
+        params.get("capture_ocr", feedback_overrides.get("capture_ocr")), capture_ocr_default
+    )
+    capture_ocr = bool(capture_ocr and (capture_before or capture_after))
+    run_ocr_after = _coerce_bool(
+        params.get("run_ocr_after", feedback_overrides.get("run_ocr_after")), base_config.get("run_ocr_after", capture_ocr)
+    )
+    max_retries = _coerce_nonnegative_int(
+        params.get("max_retries", feedback_overrides.get("max_retries", base_config["max_retries"])),
+        base_config["max_retries"],
+    )
+    verify_mode = str(
+        params.get("verify_mode", feedback_overrides.get("verify_mode", base_config.get("verify_mode", "auto")))
+    ).lower()
+    if verify_mode not in {"auto", "never", "always"}:
+        verify_mode = "auto"
+    allow_vlm = _coerce_bool(
+        params.get("allow_vlm", feedback_overrides.get("allow_vlm", base_config.get("allow_vlm", True))),
+        base_config.get("allow_vlm", True),
+    )
+
+    return {
+        "capture_before": capture_before,
+        "capture_after": capture_after,
+        "capture_ocr": capture_ocr,
+        "run_ocr_after": run_ocr_after,
+        "max_retries": max_retries,
+        "verify_mode": verify_mode,
+        "allow_vlm": allow_vlm,
+        "max_attempts": 1 + max_retries,
+    }
+
+
+def _summarize_steps_for_prompt(step_results: List[Dict[str, Any]], limit: int = 5) -> str:
+    """Condense recent step outcomes for planner prompts."""
+    if not step_results:
+        return ""
+    lines: List[str] = []
+    for entry in step_results[-limit:]:
+        action = entry.get("action", "unknown")
+        status = entry.get("status", "unknown")
+        idx = entry.get("step_index", "?")
+        msg = entry.get("message")
+        reason = None
+        if isinstance(msg, dict):
+            reason = msg.get("reason") or msg.get("message") or msg.get("status")
+        elif isinstance(msg, str):
+            reason = msg
+        verification = entry.get("verification") or {}
+        if isinstance(verification, dict) and verification.get("reason"):
+            reason = f"{verification.get('reason')} | {reason}" if reason else verification.get("reason")
+        reason = (str(reason or "no details")).strip()
+        if len(reason) > 220:
+            reason = reason[:217] + "..."
+        lines.append(f"[{idx}] {action} -> {status}: {reason}")
+    return "\n".join(lines)
+
+
+def _select_planner_call(provider: Optional[str]):
+    mapping = {
+        "deepseek": call_deepseek,
+        "openai": call_openai,
+        "qwen": call_qwen,
+    }
+    normalized = (provider or "deepseek").lower()
+    return normalized, mapping.get(normalized)
+
+
+def _maybe_capture_replan_image(enable: bool) -> Dict[str, Any]:
+    if not enable:
+        return {"enabled": False}
+    payload: Dict[str, Any] = {"enabled": True}
+    try:
+        path = capture_screen()
+        payload["path"] = str(path)
+        payload["image_base64"] = _encode_image_base64(path)
+    except Exception as exc:  # noqa: BLE001
+        payload["error"] = f"screenshot failed: {exc}"
+    return payload
+
+
+def _build_failure_summary(step_entry: Dict[str, Any], replan_count: int, max_replans: int) -> str:
+    """
+    Produce a concise failure string for planner context.
+    """
+    action = step_entry.get("action", "unknown")
+    status = step_entry.get("status", "error")
+    msg = step_entry.get("message")
+    reason = None
+    if isinstance(msg, dict):
+        reason = msg.get("reason") or msg.get("message") or msg.get("status")
+    elif isinstance(msg, str):
+        reason = msg
+    verification = step_entry.get("verification") or {}
+    if isinstance(verification, dict) and verification.get("reason"):
+        reason = f"{verification.get('reason')} | {reason}" if reason else verification.get("reason")
+    reason = (str(reason or "no details")).strip()
+    if len(reason) > 240:
+        reason = reason[:237] + "..."
+    return (
+        f"Step '{action}' ended with status '{status}' after retries. "
+        f"Reason: {reason}. Replan attempt {replan_count}/{max_replans}."
+    )
+
+
+def _rewrite_save_pattern(
+    steps: List[ActionStep], base_dir: Optional[str] = None
+) -> Tuple[List[ActionStep], Optional[Dict[str, Any]]]:
+    """
+    Detect a UI-based save sequence (type content -> ctrl+s -> type filename) and
+    replace it with a direct write_file action to avoid IME/shortcut issues.
+    """
+    rewritten: List[ActionStep] = []
+    rewrite_log: Optional[Dict[str, Any]] = None
+    idx = 0
+    cwd = Path(base_dir).expanduser() if base_dir else Path.cwd()
+    if not cwd.exists() or not cwd.is_dir():
+        cwd = Path.cwd()
+
+    def _is_ctrl_s(step: ActionStep) -> bool:
+        if step.action not in {"key_press", "hotkey"}:
+            return False
+        keys = step.params.get("keys") or step.params.get("key")
+        if isinstance(keys, str):
+            keys = [k.strip().lower() for k in keys.split("+") if k]
+        elif isinstance(keys, (list, tuple)):
+            keys = [str(k).strip().lower() for k in keys if str(k).strip()]
+        else:
+            return False
+        return set(keys) == {"ctrl", "s"} or keys == ["ctrl", "s"]
+
+    while idx < len(steps):
+        # Look ahead for pattern: type_text -> ctrl+s -> type_text (filename)
+        if (
+            idx + 2 < len(steps)
+            and steps[idx].action == "type_text"
+            and _is_ctrl_s(steps[idx + 1])
+            and steps[idx + 2].action == "type_text"
+        ):
+            content_step = steps[idx]
+            filename_step = steps[idx + 2]
+            content = (content_step.params or {}).get("text")
+            filename = (filename_step.params or {}).get("text")
+            if isinstance(content, str) and isinstance(filename, str) and content and filename:
+                path = Path(filename)
+                if not path.is_absolute():
+                    path = cwd / filename
+                write_params = {"path": str(path), "content": content}
+                try:
+                    new_step = ActionStep(action="write_file", params=write_params)
+                    rewritten.append(new_step)
+                    rewrite_log = {
+                        "pattern": "type_text+ctrl+s+type_text",
+                        "replacement": "write_file",
+                        "path": str(path),
+                    }
+                    idx += 3
+                    continue
+                except Exception:
+                    # fall back to original steps on validation failure
+                    pass
+        # Drop preceding notepad open/activate if we already rewrote?
+        rewritten.append(steps[idx])
+        idx += 1
+
+    # If we rewrote, optionally strip trailing notepad open/activate that became redundant.
+    if rewrite_log:
+        cleaned: List[ActionStep] = []
+        for step in rewritten:
+            if step.action in {"open_app", "activate_window"}:
+                params = step.params or {}
+                target = str(params.get("target") or "").lower()
+                title_kw = params.get("title_keywords") or []
+                title_kw = [str(t).lower() for t in title_kw] if isinstance(title_kw, list) else []
+                if "notepad" in target or "记事本" in target or any("notepad" in t or "记事本" in t for t in title_kw):
+                    continue
+            cleaned.append(step)
+        rewritten = cleaned
+    return rewritten, rewrite_log
+
+
+def _build_execution_summary(logs: List[Dict[str, Any]], context) -> Dict[str, Any]:
+    """
+    Aggregate execution metrics for analytics/debugging.
+    """
+    total_steps = len(logs)
+    successes = sum(1 for log in logs if log.get("status") == "success")
+    failures = sum(1 for log in logs if log.get("status") in {"error", "unsafe"})
+    retries = 0
+    ocr_steps = 0
+    icon_steps = 0
+    vlm_steps = 0
+    unsafe_steps = sum(1 for log in logs if log.get("status") == "unsafe")
+    replan_count = getattr(context, "replan_count", 0) if context else 0
+    failure_messages: List[str] = []
+
+    for log in logs:
+        attempts = log.get("attempts") or []
+        if attempts:
+            retries += max(0, len(attempts) - 1)
+        feedback = log.get("feedback") or {}
+        if feedback.get("capture_ocr") or feedback.get("run_ocr_after"):
+            ocr_steps += 1
+        params = log.get("params") or {}
+        if isinstance(params, dict) and params.get("target_icon"):
+            icon_steps += 1
+        if feedback.get("allow_vlm"):
+            vlm_steps += 1
+        if log.get("status") in {"error", "unsafe"}:
+            reason = log.get("message")
+            if isinstance(reason, dict):
+                reason = reason.get("reason") or reason.get("message")
+            failure_messages.append(str(reason or "unknown"))
+
+    summary_text = (
+        f"Executed {total_steps} steps: {successes} succeeded, {failures} failed/unsafe, "
+        f"{retries} retries, {replan_count} replans. Modalities -> OCR:{ocr_steps}, icons:{icon_steps}, VLM:{vlm_steps}."
+    )
+
+    return {
+        "steps": {
+            "total": total_steps,
+            "success": successes,
+            "failed": failures,
+            "unsafe": unsafe_steps,
+            "retries": retries,
+        },
+        "replans": {
+            "count": replan_count,
+            "history": getattr(context, "replan_history", []) if context else [],
+        },
+        "modalities": {
+            "ocr_steps": ocr_steps,
+            "icon_steps": icon_steps,
+            "vlm_steps": vlm_steps,
+        },
+        "failures": failure_messages,
+        "summary_text": summary_text,
+    }
+
+
+def _is_path_within_allowed_roots(path: str) -> bool:
+    normalized = os.path.abspath(path)
+    for root in ALLOWED_ROOTS:
+        try:
+            common = os.path.commonpath([normalized, root])
+        except Exception:
+            continue
+        if common == root:
+            return True
+    return False
+
+
+def _detect_dangerous_request(user_instruction: Optional[str]) -> Optional[str]:
+    if not user_instruction:
+        return None
+    lowered = user_instruction.lower()
+    for term in UNSAFE_KEYWORDS:
+        if term in lowered:
+            return term
+    return None
+
+
+def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
+    """
+    Enforce safety gates before executing a step.
+
+    Returns dict with safe flag and metadata.
+    """
+    action = step.action
+    params = step.params or {}
+
+    def _unsafe(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"safe": False, "code": code, "message": message}
+        if details:
+            payload["details"] = details
+        return payload
+
+    if action == "delete_file":
+        confirmed = params.get("confirm") is True
+        if not confirmed:
+            return _unsafe("confirm_required", "delete_file requires confirm=True", {"action": action})
+
+    file_paths: List[str] = []
+    if action in {"list_files", "delete_file", "read_file", "write_file"}:
+        path = params.get("path")
+        if isinstance(path, str):
+            file_paths.append(path)
+    if action in {"move_file", "copy_file"}:
+        src = params.get("source")
+        dest = params.get("destination_dir") or params.get("destination")
+        if isinstance(src, str):
+            file_paths.append(src)
+        if isinstance(dest, str):
+            file_paths.append(dest)
+    if action == "rename_file":
+        src = params.get("source")
+        if isinstance(src, str):
+            file_paths.append(src)
+
+    for path in file_paths:
+        if not _is_path_within_allowed_roots(path):
+            return _unsafe("path_outside_workspace", f"path not allowed: {path}", {"path": path})
+        if not files._is_path_safe(path):
+            return _unsafe("path_blocked", f"path blocked by safety rules: {path}", {"path": path})
+
+    return {"safe": True}
+
+
+def _invoke_replan(
+    user_text: str,
+    context,
+    recent_steps: str,
+    failure_info: str,
+    screenshot_meta: Optional[dict],
+    provider: Optional[str],
+    replan_image: Dict[str, Any],
+    planner_override=None,
+) -> Dict[str, Any]:
+    """
+    Call the planner to generate a follow-up ActionPlan after a failure.
+    """
+    image_b64 = replan_image.get("image_base64")
+    prompt_bundle = format_prompt(
+        user_text=user_text,
+        ocr_text=getattr(context, "ocr_text", "") if context else "",
+        manual_click=None,
+        screenshot_meta=screenshot_meta or {},
+        image_base64=image_b64,
+        recent_steps=recent_steps,
+        failure_info=failure_info,
+    )
+
+    if planner_override:
+        try:
+            override_result = planner_override(prompt_bundle)
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"planner override failed: {exc}", "prompt": prompt_bundle}
+        if isinstance(override_result, ActionPlan):
+            return {"success": True, "plan": override_result, "prompt": prompt_bundle, "raw": override_result}
+        if isinstance(override_result, dict):
+            try:
+                validated = ActionPlan.model_validate(override_result)
+                return {"success": True, "plan": validated, "prompt": prompt_bundle, "raw": override_result}
+            except Exception as exc:  # noqa: BLE001
+                return {"success": False, "error": f"invalid override plan: {exc}", "prompt": prompt_bundle}
+        if isinstance(override_result, str):
+            parsed = parse_action_plan(override_result)
+            if isinstance(parsed, ActionPlan):
+                return {"success": True, "plan": parsed, "prompt": prompt_bundle, "raw": override_result}
+            return {"success": False, "error": parsed, "prompt": prompt_bundle}
+        return {"success": False, "error": "planner override returned unsupported type", "prompt": prompt_bundle}
+
+    provider_name, planner_call = _select_planner_call(provider)
+    if not planner_call:
+        return {"success": False, "error": f"unsupported planner provider '{provider_name}'", "prompt": prompt_bundle}
+
+    try:
+        raw_reply = planner_call(prompt_bundle.prompt_text, prompt_bundle.vision_messages or prompt_bundle.messages)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"planner call failed: {exc}", "prompt": prompt_bundle}
+
+    parsed = parse_action_plan(raw_reply)
+    if isinstance(parsed, str):
+        return {"success": False, "error": parsed, "prompt": prompt_bundle, "raw": raw_reply}
+    return {"success": True, "plan": parsed, "prompt": prompt_bundle, "raw": raw_reply}
+
+
+ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
+    "open_app": handle_open_app,
+    "open_url": handle_open_url,
+    "switch_window": handle_switch_window,
+    "activate_window": handle_activate_window,
+    "type_text": handle_type_text,
+    "key_press": handle_key_press,
+    "click": handle_click,
+    "move_file": handle_move_file,
+    "copy_file": handle_copy_file,
+    "rename_file": handle_rename_file,
+    "mouse_move": handle_mouse_move,
+    "right_click": handle_right_click,
+    "double_click": handle_double_click,
+    "scroll": handle_scroll,
+    "drag": handle_drag,
+    "hotkey": handle_hotkey,
+    "list_windows": handle_list_windows,
+    "get_active_window": handle_get_active_window,
+    "fuzzy_switch_window": handle_fuzzy_switch_window,
+    "list_files": handle_list_files,
+    "delete_file": handle_delete_file,
+    "create_folder": handle_create_folder,
+    "read_file": handle_read_file,
+    "write_file": handle_write_file,
+    "wait": handle_wait,
+    "adjust_volume": handle_adjust_volume,
+    "click_text": handle_click_text,
+    "browser_click": handle_browser_click,
+    "browser_input": handle_browser_input,
+    "browser_extract_text": handle_browser_extract_text,
+}
+
+FILE_PATH_ACTIONS = {
+    "move_file",
+    "copy_file",
+    "rename_file",
+    "list_files",
+    "delete_file",
+    "create_folder",
+    "read_file",
+    "write_file",
+}
+
+
+def run_steps(
+    action_plan: ActionPlan,
+    context=None,
+    max_retries: Optional[int] = None,
+    capture_observations: bool = True,
+    capture_ocr: Optional[bool] = None,
+    allow_replan: bool = True,
+    planner_provider: Optional[str] = None,
+    planner_override=None,
+    max_replans: Optional[int] = None,
+    capture_replan_screenshot: Optional[bool] = None,
+    debug_capture_all: bool = False,
+    disable_vlm: bool = False,
+    force_capture: Optional[bool] = None,
+    force_ocr: Optional[bool] = None,
+    allow_vlm_override: Optional[bool] = None,
+    verify_mode_override: Optional[str] = None,
+    work_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Execute an ActionPlan with a global observe-execute-observe-verify loop and optional replanning.
+
+    Behavior:
+    - Enforces a maximum number of steps (MAX_STEPS, scaled when replanning is enabled).
+    - Wraps each step with optional before/after screenshots (and OCR summaries) recorded in the context.
+    - Uses a generic verifier to decide success, retry (up to max_retries), or failure.
+    - When a step exhausts retries and replanning is allowed, call the planner with recent history to
+      generate additional follow-up steps appended to the remaining plan, up to max_replans.
+    """
+    logs: List[dict] = []
+    if context is None:
+        try:
+            from backend.executor.task_context import TaskContext
+
+            context = TaskContext(work_dir=work_dir)
+        except Exception:
+            context = None
+    elif work_dir and getattr(context, "work_dir", None) is None:
+        try:
+            context.work_dir = work_dir
+        except Exception:
+            pass
+
+    base_max_retries = (
+        DEFAULT_STEP_MAX_RETRIES
+        if max_retries is None
+        else _coerce_nonnegative_int(max_retries, DEFAULT_STEP_MAX_RETRIES)
+    )
+    capture_observations = True if debug_capture_all else capture_observations
+    base_capture_before = True if debug_capture_all else (DEFAULT_CAPTURE_BEFORE if capture_observations else False)
+    base_capture_after = True if debug_capture_all else (DEFAULT_CAPTURE_AFTER if capture_observations else False)
+    base_capture_ocr = True if debug_capture_all else (_coerce_bool(capture_ocr, DEFAULT_CAPTURE_OCR) if capture_observations else False)
+    if force_capture is not None:
+        base_capture_before = bool(force_capture)
+        base_capture_after = bool(force_capture)
+    if force_ocr is not None:
+        base_capture_ocr = bool(force_ocr)
+    base_max_replans = DEFAULT_MAX_REPLANS if max_replans is None else _coerce_nonnegative_int(max_replans, DEFAULT_MAX_REPLANS)
+    base_replan_capture = DEFAULT_REPLAN_CAPTURE if capture_replan_screenshot is None else _coerce_bool(
+        capture_replan_screenshot, DEFAULT_REPLAN_CAPTURE
+    )
+    base_allow_vlm = not (disable_vlm or DEFAULT_DISABLE_VLM)
+    if allow_vlm_override is not None:
+        base_allow_vlm = bool(allow_vlm_override)
+    base_verify_mode = (verify_mode_override or "auto").lower()
+    if base_verify_mode not in {"auto", "never", "always"}:
+        base_verify_mode = "auto"
+
+    base_feedback_config = {
+        "capture_before": base_capture_before,
+        "capture_after": base_capture_after,
+        "capture_ocr": base_capture_ocr,
+        "run_ocr_after": base_capture_ocr,
+        "max_retries": base_max_retries,
+        "verify_mode": base_verify_mode,
+        "allow_vlm": base_allow_vlm,
+    }
+    if context and hasattr(context, "set_feedback_config"):
+        try:
+            context.set_feedback_config(base_feedback_config)
+        except Exception:
+            pass
+    if context and getattr(context, "max_replans", None) is None:
+        try:
+            context.set_max_replans(base_max_replans)
+        except Exception:
+            pass
+    if context and getattr(context, "max_replans", None) is not None:
+        try:
+            base_max_replans = int(context.max_replans)
+        except Exception:
+            pass
+
+    # Per-run toggle for VLM usage; restore after run to avoid affecting other calls.
+    global VLM_DISABLED_FLAG
+    previous_vlm_state = VLM_DISABLED_FLAG
+    VLM_DISABLED_FLAG = not base_allow_vlm
+
+    steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
+    # Rewrite UI save patterns to direct write_file when possible.
+    steps, rewrite_log = _rewrite_save_pattern(steps, base_dir=work_dir)
+    plan_rewrites: List[Dict[str, Any]] = []
+    if rewrite_log:
+        plan_rewrites.append(rewrite_log)
+    # Allow additional steps when replanning to avoid premature truncation.
+    max_total_steps = max(len(steps), MAX_STEPS * (1 + max(0, base_max_replans)))
+    overall_status = "success"
+    idx = 0
+    executed_steps = 0
+
+    # Plan-level safety checks before executing anything.
+    dangerous_term = _detect_dangerous_request(getattr(context, "user_instruction", None) if context else None)
+    if dangerous_term:
+        entry = {
+            "step_index": -1,
+            "action": "safety_check",
+            "params": {},
+            "status": "unsafe",
+            "message": f"user request flagged as dangerous ('{dangerous_term}')",
+            "timestamp": datetime.now().isoformat(),
+            "duration_ms": 0.0,
+            "safety": {"code": "dangerous_request", "term": dangerous_term},
+        }
+        logs.append(entry)
+        if context:
+            try:
+                context.record_step_result(entry)
+                context.add_error(entry["message"], {"code": "dangerous_request", "term": dangerous_term})
+            except Exception:
+                pass
+        return {"overall_status": "unsafe", "logs": logs, "context": context.to_dict() if context else None}
+
+    # Pre-validate all planned steps for safety before execution starts.
+    for pre_idx, pre_step in enumerate(steps):
+        safety_check = _evaluate_step_safety(pre_step)
+        if not safety_check.get("safe"):
+            entry = {
+                "step_index": pre_idx,
+                "action": pre_step.action,
+                "params": pre_step.params,
+                "status": "unsafe",
+                "message": safety_check.get("message"),
+                "timestamp": datetime.now().isoformat(),
+                "duration_ms": 0.0,
+                "safety": safety_check,
+            }
+            logs.append(entry)
+            if context:
+                try:
+                    context.record_step_result(entry)
+                    context.add_error(entry["message"], safety_check)
+                except Exception:
+                    pass
+            return {"overall_status": "unsafe", "logs": logs, "context": context.to_dict() if context else None}
+
+    try:
+        while idx < len(steps) and executed_steps < max_total_steps:
+            step = steps[idx]
+            if work_dir and step.action in FILE_PATH_ACTIONS:
+                step.params = dict(step.params or {})
+                step.params.setdefault("base_dir", work_dir)
+            executed_steps += 1
+            handler = ACTION_HANDLERS.get(step.action)
+            if not handler:
+                entry = {
+                    "step_index": idx,
+                    "action": step.action,
+                    "params": step.params,
+                    "status": "error",
+                    "message": f"No handler for action '{step.action}'",
+                    "timestamp": datetime.now().isoformat(),
+                    "duration_ms": 0.0,
+                }
+                logs.append(entry)
+                if context:
+                    try:
+                        context.record_step_result(entry)
+                    except Exception:
+                        pass
+                overall_status = "error"
+                break
+
+            # Safety gate for newly appended steps (e.g., via replanning).
+            step_safety = _evaluate_step_safety(step)
+            if not step_safety.get("safe"):
+                entry = {
+                    "step_index": idx,
+                    "action": step.action,
+                    "params": step.params,
+                    "status": "unsafe",
+                    "message": step_safety.get("message"),
+                    "timestamp": datetime.now().isoformat(),
+                    "duration_ms": 0.0,
+                    "safety": step_safety,
+                }
+                logs.append(entry)
+                if context:
+                    try:
+                        context.record_step_result(entry)
+                        context.add_error(entry["message"], step_safety)
+                    except Exception:
+                        pass
+                overall_status = "unsafe"
+                break
+
+            step_feedback = _build_step_feedback_config(step, base_feedback_config)
+            attempt_logs: List[Dict[str, Any]] = []
+            combined_duration_ms = 0.0
+            step_status = "error"
+            last_message: Any = None
+            last_verification: Dict[str, Any] = {}
+            # Per-step VLM toggle (cannot override global disable).
+            step_allow_vlm = base_allow_vlm and bool(step_feedback.get("allow_vlm", True))
+            prev_step_vlm_flag = VLM_DISABLED_FLAG
+            VLM_DISABLED_FLAG = not step_allow_vlm
+
+            try:
+                for attempt in range(1, step_feedback["max_attempts"] + 1):
+                    before_obs = _capture_observation(
+                        step_feedback["capture_before"],
+                        step_feedback["capture_before"] and step_feedback["capture_ocr"],
+                    )
+                    start = perf_counter()
+                    try:
+                        message = handler(step)
+                        handler_status = "success"
+                    except Exception as exc:  # noqa: BLE001
+                        message = f"Handler failed: {exc}"
+                        handler_status = "error"
+                    duration_ms = (perf_counter() - start) * 1000.0
+                    combined_duration_ms += duration_ms
+                    after_obs = _capture_observation(
+                        step_feedback["capture_after"],
+                        step_feedback["capture_after"] and step_feedback.get("run_ocr_after", step_feedback["capture_ocr"]),
+                    )
+                    normalized_status, normalized_reason = _normalize_handler_status(message, handler_status)
+                    verification = _verify_step_outcome(
+                        step.action,
+                        normalized_status,
+                        message,
+                        attempt,
+                        step_feedback["max_attempts"],
+                        verify_mode=step_feedback.get("verify_mode", "auto"),
+                    )
+
+                    attempt_logs.append(
+                        {
+                            "attempt": attempt,
+                            "status": normalized_status,
+                            "reason": normalized_reason,
+                            "message": message,
+                            "duration_ms": duration_ms,
+                            "observation": {
+                                "before": before_obs if step_feedback["capture_before"] else {"capture_enabled": False},
+                                "after": after_obs if step_feedback["capture_after"] else {"capture_enabled": False},
+                            },
+                            "verification": verification,
+                        }
+                    )
+                    last_message = message
+                    last_verification = verification
+
+                    if verification["decision"] == "success":
+                        step_status = "success"
+                        break
+                    if verification["decision"] == "retry":
+                        continue
+
+                    step_status = "error"
+                    break
+            finally:
+                VLM_DISABLED_FLAG = prev_step_vlm_flag
+
+            entry = {
+                "step_index": idx,
+                "action": step.action,
+                "params": step.params,
+                "status": step_status,
+                "message": last_message,
+                "timestamp": datetime.now().isoformat(),
+                "duration_ms": combined_duration_ms,
+                "attempts": attempt_logs,
+                "verification": last_verification,
+                "feedback": step_feedback,
+            }
+            if attempt_logs:
+                entry["observations"] = attempt_logs[-1].get("observation")
+
+            replan_successful = False
+            replan_log: Dict[str, Any] = {}
+            should_replan = (
+                allow_replan
+                and step_status == "error"
+                and base_max_replans > 0
+                and (getattr(context, "replan_count", 0) < base_max_replans if context else True)
+            )
+
+            if should_replan:
+                next_replan_attempt = 1 + (getattr(context, "replan_count", 0) if context else 0)
+                failure_info = _build_failure_summary(entry, next_replan_attempt, base_max_replans)
+                recent_steps = _summarize_steps_for_prompt(logs + [entry], limit=6)
+                replan_image = _maybe_capture_replan_image(base_replan_capture)
+                replan_result = _invoke_replan(
+                    user_text=getattr(context, "user_instruction", ""),
+                    context=context,
+                    recent_steps=recent_steps,
+                    failure_info=failure_info,
+                    screenshot_meta=getattr(context, "screenshot_meta", {}) if context else {},
+                    provider=planner_provider,
+                    replan_image=replan_image,
+                    planner_override=planner_override,
+                )
+                replan_log = {
+                    "attempt": next_replan_attempt,
+                    "provider": (planner_provider or "deepseek"),
+                    "success": bool(replan_result.get("success")),
+                    "error": replan_result.get("error"),
+                    "screenshot_path": replan_image.get("path"),
+                    "used_screenshot": bool(replan_image.get("image_base64")),
+                }
+                if replan_result.get("success"):
+                    try:
+                        plan_obj = replan_result.get("plan")
+                        new_steps = list(plan_obj.steps) if plan_obj else []
+                        added = 0
+                        for new_step in new_steps:
+                            if len(steps) >= max_total_steps:
+                                break
+                            steps.append(new_step)
+                            added += 1
+                        replan_log["appended_steps"] = added
+                        replan_log["total_steps_now"] = len(steps)
+                        replan_log["replan_prompt"] = getattr(replan_result.get("prompt"), "prompt_text", None)
+                        replan_successful = added > 0
+                        if not replan_successful:
+                            replan_log["error"] = replan_log.get("error") or "no new steps appended"
+                    except Exception as exc:  # noqa: BLE001
+                        replan_log["error"] = f"failed to append replan steps: {exc}"
+                        replan_successful = False
+                if context and hasattr(context, "record_replan"):
+                    try:
+                        context.record_replan(replan_log)
+                    except Exception:
+                        pass
+                entry["replan"] = replan_log
+
+            # Record step result after any replan adjustments.
+            logs.append(entry)
+            if context:
+                try:
+                    context.record_step_result(entry)
+                except Exception:
+                    pass
+
+            if step_status == "error" and not replan_successful:
+                overall_status = "error"
+                break
+            if replan_successful and overall_status == "success":
+                overall_status = "replanned"
+
+            idx += 1
+    finally:
+        VLM_DISABLED_FLAG = previous_vlm_state
+
+    result = {"overall_status": overall_status, "logs": logs}
+    if context:
+        result["context"] = context.to_dict()
+    if plan_rewrites:
+        result["plan_rewrites"] = plan_rewrites
+    summary = _build_execution_summary(logs, context)
+    result["summary"] = summary
+    if context and hasattr(context, "set_summary"):
+        try:
+            context.set_summary(summary)
+        except Exception:
+            pass
+    return result
+
+
+__all__ = ["run_steps", "ACTION_HANDLERS", "debug_wechat_activation"]

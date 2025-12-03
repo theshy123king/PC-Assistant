@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+.cache/
+venv/
+
+# Node / Electron
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+package-lock.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Env / Secrets
+.env
+.env.*.local
+
+# Build / Bundle Outputs
+frontend_bundle/
+demo_output/
+dist/
+build/
