@@ -238,6 +238,39 @@
       box-shadow: 0 0 0 2px var(--accent-glow);
       border-color: var(--accent-color);
     }
+    .pill-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .pill-btn {
+      padding: 11px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--glass-border);
+      background: rgba(255,255,255,0.7);
+      color: var(--text-main);
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+      box-shadow: var(--shadow-sm);
+    }
+    .pill-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(0, 122, 255, 0.15);
+    }
+    .pill-btn.active {
+      background: var(--accent-color);
+      color: white;
+      border-color: var(--accent-color);
+      box-shadow: 0 8px 22px var(--accent-glow);
+    }
+    .setting-hint {
+      font-size: 12px;
+      color: var(--text-sub);
+      margin-left: 4px;
+      line-height: 1.4;
+    }
 
     .danger-btn {
       margin-top: auto;
@@ -417,6 +450,17 @@
 
       <!-- Settings View -->
       <div id="settings-view">
+        <div class="setting-group">
+          <label class="setting-label">Model</label>
+          <div class="pill-row" id="model-options">
+            <button class="pill-btn" data-provider="deepseek">DeepSeek</button>
+            <button class="pill-btn" data-provider="openai">OpenAI</button>
+            <button class="pill-btn" data-provider="qwen">Qwen</button>
+          </div>
+          <div class="setting-hint">
+            Switch planner provider; OpenAI/Qwen enable vision, DeepSeek is fast text-only.
+          </div>
+        </div>
         <div class="setting-group">
           <label class="setting-label">Working Directory</label>
           <input id="work-dir-input" class="setting-input" type="text" placeholder="Loading...">

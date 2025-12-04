@@ -13,7 +13,8 @@ const os = require("os");
       screenshotMeta = null,
       dryRun = false,
       workDir = null,
-      screenshotBase64 = null
+      screenshotBase64 = null,
+      provider = "deepseek"
     ) {
       if (!text || typeof text !== "string") {
         return { error: "user_text is required" };
@@ -31,6 +32,7 @@ const os = require("os");
             dry_run: dryRun,
             work_dir: workDir || defaultWorkDir,
             screenshot_base64: screenshotBase64,
+            provider: provider || "deepseek",
           }),
         });
         const data = await res.json();

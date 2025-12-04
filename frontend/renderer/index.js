@@ -11,6 +11,10 @@ const workDirInput = document.getElementById("work-dir-input");
 const statusDot = document.getElementById("statusDot");
 const statusText = document.getElementById("clickPickerStatus");
 const panelTitle = document.getElementById("panel-title");
+const modelOptions = document.getElementById("model-options");
+const modelButtons = modelOptions ? Array.from(modelOptions.querySelectorAll(".pill-btn")) : [];
+const PROVIDER_LABELS = { deepseek: "DeepSeek", openai: "OpenAI", qwen: "Qwen" };
+const PROVIDER_STORAGE_KEY = "pc_assistant_provider";
 
 // Hidden but necessary elements for backend logic compatibility
 const screenshotMain = document.getElementById("screenshotMain");
@@ -22,13 +26,15 @@ const ocrBtn = document.getElementById("ocr-btn");
 let screenshotMeta = null;
 let screenshotBase64 = null;
 let isSettingsOpen = false;
+let currentProvider = "deepseek";
+let currentStatusState = "idle";
 
 function getApi() {
     if (window.api) return window.api;
     // Fallback: minimal bridge to keep UI usable if preload failed.
     return {
         defaultWorkDir: "",
-        run: async (text, ocrText = "", manualClick = null, screenshotMeta = null, dryRun = false, workDir = null, screenshotBase64 = null) => {
+        run: async (text, ocrText = "", manualClick = null, screenshotMeta = null, dryRun = false, workDir = null, screenshotBase64 = null, provider = currentProvider) => {
             try {
                 const res = await fetch("http://127.0.0.1:8000/api/ai/run", {
                     method: "POST",
@@ -41,6 +47,7 @@ function getApi() {
                         dry_run: dryRun,
                         work_dir: workDir,
                         screenshot_base64: screenshotBase64,
+                        provider: provider || currentProvider,
                     }),
                 });
                 return await res.json();
@@ -52,12 +59,69 @@ function getApi() {
     };
 }
 
+function getProviderLabel(provider = currentProvider) {
+    const normalized = (provider || "").toLowerCase();
+    return PROVIDER_LABELS[normalized] || normalized || "Unknown";
+}
+
+function normalizeProvider(value) {
+    return (value || "").toLowerCase();
+}
+
+function loadStoredProvider() {
+    try {
+        const stored = window.localStorage?.getItem(PROVIDER_STORAGE_KEY);
+        const normalized = normalizeProvider(stored);
+        if (normalized && PROVIDER_LABELS[normalized]) return normalized;
+    } catch (err) {
+        // Ignore storage errors (e.g., disabled storage)
+    }
+    return null;
+}
+
+function persistProvider(provider) {
+    const normalized = normalizeProvider(provider);
+    if (!normalized || !PROVIDER_LABELS[normalized]) return;
+    try {
+        window.localStorage?.setItem(PROVIDER_STORAGE_KEY, normalized);
+    } catch (err) {
+        // Ignore storage write failures
+    }
+}
+
+function syncProviderButtons(provider) {
+    if (!modelButtons || modelButtons.length === 0) return;
+    const normalized = normalizeProvider(provider);
+    modelButtons.forEach((btn) => {
+        const btnProvider = normalizeProvider(btn.dataset.provider);
+        if (btnProvider === normalized) btn.classList.add("active");
+        else btn.classList.remove("active");
+    });
+}
+
+function applyProvider(provider) {
+    const normalized = normalizeProvider(provider);
+    if (!normalized || !PROVIDER_LABELS[normalized]) return;
+    currentProvider = normalized;
+    persistProvider(normalized);
+    syncProviderButtons(normalized);
+    setStatus(currentStatusState);
+}
+
 // Initialize Settings
 (function initWorkDir() {
     const api = getApi();
     if (api && api.defaultWorkDir) {
         workDirInput.value = api.defaultWorkDir;
     }
+})();
+
+(function initProviderSelection() {
+    const stored = loadStoredProvider();
+    if (stored && PROVIDER_LABELS[stored]) {
+        currentProvider = stored;
+    }
+    syncProviderButtons(currentProvider);
 })();
 
 // --- UI State Management ---
@@ -89,22 +153,27 @@ function toggleSettings() {
     }
 }
 
+function formatStatusLabel(text) {
+    return `${text} | ${getProviderLabel()}`;
+}
+
 function setStatus(state) {
+    currentStatusState = state || "idle";
     statusDot.className = "status-indicator"; // reset
-    if (state === "busy") {
+    if (currentStatusState === "busy") {
         statusDot.classList.add("busy");
-        statusText.textContent = "THINKING...";
+        statusText.textContent = formatStatusLabel("THINKING...");
         statusText.style.color = "var(--accent-color)";
-    } else if (state === "success") {
+    } else if (currentStatusState === "success") {
         statusDot.classList.add("active");
-        statusText.textContent = "DONE";
+        statusText.textContent = formatStatusLabel("DONE");
         statusText.style.color = "var(--success-color)";
-    } else if (state === "error") {
+    } else if (currentStatusState === "error") {
         statusDot.classList.add("error");
-        statusText.textContent = "FAILED";
+        statusText.textContent = formatStatusLabel("FAILED");
         statusText.style.color = "var(--error-color)";
     } else {
-        statusText.textContent = "IDLE";
+        statusText.textContent = formatStatusLabel("IDLE");
         statusText.style.color = "var(--text-sub)";
     }
 }
@@ -236,7 +305,8 @@ async function handleRun() {
             screenshotMeta,
             dryRunToggle?.checked ?? false,
             workDirInput.value, // Pass Work Directory
-            screenshotBase64
+            screenshotBase64,
+            currentProvider
         );
 
         // 4. Update UI
@@ -341,6 +411,10 @@ expandBtn.addEventListener("click", () => {
 
 settingsBtn.addEventListener("click", toggleSettings);
 
+modelButtons.forEach((btn) => {
+    btn.addEventListener("click", () => applyProvider(btn.dataset.provider));
+});
+
 quitBtn.addEventListener("click", () => {
     if (!confirm("Are you sure you want to exit?")) return;
     const api = getApi();
@@ -360,3 +434,5 @@ clearBtn.addEventListener("click", () => {
     chatScroll.innerHTML = '<div class="bubble">System ready.</div>';
     setStatus("idle");
 });
+
+setStatus(currentStatusState);
