@@ -106,6 +106,7 @@ async def ai_plan(payload: AIQueryRequest):
     as an action plan, and return it without executing any actions.
     """
     context = TaskContext(user_instruction=payload.text)
+    provider = (payload.provider or "deepseek").lower()
     prompt: PromptBundle = format_prompt(
         payload.text, ocr_text="", image_base64=payload.screenshot_base64
     )
@@ -114,8 +115,6 @@ async def ai_plan(payload: AIQueryRequest):
         llm_messages = prompt.vision_messages or prompt.messages
     prompt_text = prompt.prompt_text
     context.set_prompt_text(prompt_text)
-
-    provider = payload.provider.lower()
     try:
         if provider == "openai":
             reply = await asyncio.to_thread(call_openai, prompt_text, llm_messages)

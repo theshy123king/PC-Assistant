@@ -15,6 +15,10 @@ const modelOptions = document.getElementById("model-options");
 const modelButtons = modelOptions ? Array.from(modelOptions.querySelectorAll(".pill-btn")) : [];
 const PROVIDER_LABELS = { deepseek: "DeepSeek", openai: "OpenAI", qwen: "Qwen" };
 const PROVIDER_STORAGE_KEY = "pc_assistant_provider";
+const modeOptions = document.getElementById("mode-options");
+const modeButtons = modeOptions ? Array.from(modeOptions.querySelectorAll(".pill-btn")) : [];
+const MODE_STORAGE_KEY = "pc_assistant_mode";
+const MODE_LABELS = { execute: "Execute", chat: "Chat" };
 
 // Hidden but necessary elements for backend logic compatibility
 const screenshotMain = document.getElementById("screenshotMain");
@@ -27,6 +31,7 @@ let screenshotMeta = null;
 let screenshotBase64 = null;
 let isSettingsOpen = false;
 let currentProvider = "deepseek";
+let currentMode = "execute";
 let currentStatusState = "idle";
 
 function getApi() {
@@ -64,6 +69,11 @@ function getProviderLabel(provider = currentProvider) {
     return PROVIDER_LABELS[normalized] || normalized || "Unknown";
 }
 
+function getModeLabel(mode = currentMode) {
+    const normalized = (mode || "").toLowerCase();
+    return MODE_LABELS[normalized] || normalized || "Unknown";
+}
+
 function normalizeProvider(value) {
     return (value || "").toLowerCase();
 }
@@ -89,6 +99,31 @@ function persistProvider(provider) {
     }
 }
 
+function normalizeMode(value) {
+    return (value || "").toLowerCase();
+}
+
+function loadStoredMode() {
+    try {
+        const stored = window.localStorage?.getItem(MODE_STORAGE_KEY);
+        const normalized = normalizeMode(stored);
+        if (normalized && MODE_LABELS[normalized]) return normalized;
+    } catch (err) {
+        // Ignore storage errors
+    }
+    return null;
+}
+
+function persistMode(mode) {
+    const normalized = normalizeMode(mode);
+    if (!normalized || !MODE_LABELS[normalized]) return;
+    try {
+        window.localStorage?.setItem(MODE_STORAGE_KEY, normalized);
+    } catch (err) {
+        // Ignore storage write failures
+    }
+}
+
 function syncProviderButtons(provider) {
     if (!modelButtons || modelButtons.length === 0) return;
     const normalized = normalizeProvider(provider);
@@ -99,12 +134,31 @@ function syncProviderButtons(provider) {
     });
 }
 
+function syncModeButtons(mode) {
+    if (!modeButtons || modeButtons.length === 0) return;
+    const normalized = normalizeMode(mode);
+    modeButtons.forEach((btn) => {
+        const btnMode = normalizeMode(btn.dataset.mode);
+        if (btnMode === normalized) btn.classList.add("active");
+        else btn.classList.remove("active");
+    });
+}
+
 function applyProvider(provider) {
     const normalized = normalizeProvider(provider);
     if (!normalized || !PROVIDER_LABELS[normalized]) return;
     currentProvider = normalized;
     persistProvider(normalized);
     syncProviderButtons(normalized);
+    setStatus(currentStatusState);
+}
+
+function applyMode(mode) {
+    const normalized = normalizeMode(mode);
+    if (!normalized || !MODE_LABELS[normalized]) return;
+    currentMode = normalized;
+    persistMode(normalized);
+    syncModeButtons(normalized);
     setStatus(currentStatusState);
 }
 
@@ -122,6 +176,14 @@ function applyProvider(provider) {
         currentProvider = stored;
     }
     syncProviderButtons(currentProvider);
+})();
+
+(function initModeSelection() {
+    const stored = loadStoredMode();
+    if (stored && MODE_LABELS[stored]) {
+        currentMode = stored;
+    }
+    syncModeButtons(currentMode);
 })();
 
 // --- UI State Management ---
@@ -154,7 +216,7 @@ function toggleSettings() {
 }
 
 function formatStatusLabel(text) {
-    return `${text} | ${getProviderLabel()}`;
+    return `${text} | ${getProviderLabel()} | ${getModeLabel()}`;
 }
 
 function setStatus(state) {
@@ -274,6 +336,7 @@ async function handleRun() {
 
     const api = getApi();
     const runFn = api.run;
+    const chatMode = currentMode === "chat";
     if (!runFn || typeof runFn !== "function") {
         appendAgentHTML('<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">Backend bridge unavailable. Please restart the app.</div>');
         setStatus("error");
@@ -298,44 +361,84 @@ async function handleRun() {
         }
 
         // 3. Call Backend with Work Dir
-        const result = await runFn(
-            text,
-            "", // ocrText
-            null, // manualClick
-            screenshotMeta,
-            dryRunToggle?.checked ?? false,
-            workDirInput.value, // Pass Work Directory
-            screenshotBase64,
-            currentProvider
-        );
+        let result;
+        if (chatMode) {
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000);
+                const payload = {
+                    provider: currentProvider,
+                    text,
+                    screenshot_base64: screenshotBase64,
+                };
+                const res = await fetch("http://127.0.0.1:8000/api/ai/query", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal,
+                });
+                clearTimeout(timeout);
+                if (!res.ok) {
+                    result = { error: `chat_call_failed: http ${res.status}` };
+                } else {
+                    result = await res.json();
+                }
+            } catch (err) { // AbortError or network failure
+                result = { error: `chat_call_failed: ${err?.name === "AbortError" ? "request timed out" : err}` };
+            }
+        } else {
+            result = await runFn(
+                text,
+                "", // ocrText
+                null, // manualClick
+                screenshotMeta,
+                dryRunToggle?.checked ?? false,
+                workDirInput.value, // Pass Work Directory
+                screenshotBase64,
+                currentProvider
+            );
+        }
 
         // 4. Update UI
         const loadingEl = document.getElementById(loadingId);
         if (loadingEl) loadingEl.remove();
 
-        if (result.error) {
-            appendAgentHTML(`<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">${result.error}</div>`);
-            setStatus("error");
-            return;
-        }
-        
-        // Show Plan
-        appendAgentHTML(createPlanCardWrapper(result));
-
-        const summaryCard = createExecutionSummaryCard(result);
-        if (summaryCard) {
-            appendAgentHTML(summaryCard);
-        }
-        
-        // Show Summary / Execution Status
-        if (result.execution) {
-            const logs = Array.isArray(result.execution.logs) ? result.execution.logs : [];
-            const fails = logs.filter(l => l.status === 'error' || l.status === 'unsafe').length;
-            if (fails > 0) setStatus("error");
-            else setStatus("success");
-        } else {
-            // Dry run successful
+        if (chatMode) {
+            if (!result || result.error || result.status === "error") {
+                appendAgentHTML(
+                    `<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">${result?.error || result?.message || "chat call failed"}</div>`
+                );
+                setStatus("error");
+                return;
+            }
+            const reply =
+                (typeof result === "string" && result) ||
+                result.response ||
+                result.raw ||
+                result.message ||
+                (result.plan ? JSON.stringify(result.plan) : "") ||
+                JSON.stringify(result);
+            appendAgentHTML(`<div class="bubble">${reply}</div>`);
             setStatus("success");
+        } else {
+            // Show Plan
+            appendAgentHTML(createPlanCardWrapper(result));
+
+            const summaryCard = createExecutionSummaryCard(result);
+            if (summaryCard) {
+                appendAgentHTML(summaryCard);
+            }
+            
+            // Show Summary / Execution Status
+            if (result.execution) {
+                const logs = Array.isArray(result.execution.logs) ? result.execution.logs : [];
+                const fails = logs.filter(l => l.status === 'error' || l.status === 'unsafe').length;
+                if (fails > 0) setStatus("error");
+                else setStatus("success");
+            } else {
+                // Dry run successful
+                setStatus("success");
+            }
         }
 
     } catch (err) {
@@ -349,45 +452,50 @@ async function handleRun() {
 // --- Vision Logic ---
 
 async function captureScreenshot(showCard = true) {
+    setStatus("busy");
     try {
-        setStatus("busy");
         // Try raw capture first (faster)
         let res = await fetch("http://127.0.0.1:8000/api/screenshot/raw", { method: "POST" });
         if (!res.ok) {
             // Fallback to vision screenshot
             res = await fetch("http://127.0.0.1:8000/api/vision/screenshot", { method: "POST" });
         }
-        
+        if (!res.ok) {
+            throw new Error(`screenshot request failed (${res.status})`);
+        }
+
         const data = await res.json();
         const base64 = data.image_base64 || data.image;
-        
-        if (base64) {
-            screenshotBase64 = base64;
-            screenshotMeta = { 
-                width: data.width, 
-                height: data.height 
-            };
-            screenshotMain.onload = () => {
-                if (!screenshotMeta.width || !screenshotMeta.height) {
-                    screenshotMeta = {
-                        width: screenshotMain.naturalWidth,
-                        height: screenshotMain.naturalHeight
-                    };
-                }
-            };
-            screenshotMain.src = `data:image/png;base64,${base64}`; // Keep hidden img updated for legacy logic
-            
-            if (showCard) {
-                toggleExpand(true);
-                appendAgentHTML(createScreenshotCard(base64));
-            }
-            setStatus("idle");
+        if (!base64) {
+            throw new Error("screenshot missing image data");
         }
+
+        screenshotBase64 = base64;
+        screenshotMeta = {
+            width: data.width,
+            height: data.height
+        };
+        screenshotMain.onload = () => {
+            if (!screenshotMeta.width || !screenshotMeta.height) {
+                screenshotMeta = {
+                    width: screenshotMain.naturalWidth,
+                    height: screenshotMain.naturalHeight
+                };
+            }
+        };
+        screenshotMain.src = `data:image/png;base64,${base64}`; // Keep hidden img updated for legacy logic
+
+        if (showCard) {
+            toggleExpand(true);
+            appendAgentHTML(createScreenshotCard(base64));
+        }
+        setStatus("idle");
     } catch (err) {
         setStatus("error");
         console.error("Screenshot failed:", err);
         if (showCard) {
-            appendAgentHTML(`<div class="bubble" style="color:var(--error-color)">Screenshot failed</div>`);
+            const msg = (err && err.message) ? err.message : "Screenshot failed";
+            appendAgentHTML(`<div class="bubble" style="color:var(--error-color)">${msg}</div>`);
         }
     }
 }
@@ -413,6 +521,10 @@ settingsBtn.addEventListener("click", toggleSettings);
 
 modelButtons.forEach((btn) => {
     btn.addEventListener("click", () => applyProvider(btn.dataset.provider));
+});
+
+modeButtons.forEach((btn) => {
+    btn.addEventListener("click", () => applyMode(btn.dataset.mode));
 });
 
 quitBtn.addEventListener("click", () => {

@@ -8,20 +8,21 @@ Provides:
 Future work: flesh out remaining stubs with OS-specific implementations.
 """
 
-from datetime import datetime
-from time import perf_counter
-import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
-import os
-import difflib
 import base64
 import ctypes
-from ctypes import wintypes
+import difflib
 import json
-import subprocess
+import os
 import shutil
+import subprocess
+import time
 import webbrowser
+from ctypes import wintypes
+from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
+from time import perf_counter
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse
 
 from PIL import Image
@@ -45,7 +46,6 @@ from backend.llm.openai_client import call_openai
 from backend.llm.qwen_client import call_qwen
 from backend.vision.screenshot import capture_screen
 from backend.executor.ui_locator import locate_target, locate_text, rank_text_candidates
-from backend.llm.vlm_config import get_vlm_call
 from backend.llm.vlm_config import get_vlm_call
 
 MAX_STEPS = 10
@@ -118,7 +118,7 @@ OCR_CAPTURE_ACTIONS = {
     "scroll",
     "drag",
 }
-VLM_DISABLED_FLAG = DEFAULT_DISABLE_VLM
+VLM_DISABLED: ContextVar[bool] = ContextVar("VLM_DISABLED", default=DEFAULT_DISABLE_VLM)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -1962,7 +1962,7 @@ def _icon_templates_from_params(params: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _use_vlm(params: Dict[str, Any]) -> bool:
-    if VLM_DISABLED_FLAG:
+    if VLM_DISABLED.get():
         return False
     hint = str(params.get("strategy_hint", "")).lower()
     if hint in {"vlm", "vision", "image", "color", "icon"}:
@@ -3750,9 +3750,7 @@ def run_steps(
             pass
 
     # Per-run toggle for VLM usage; restore after run to avoid affecting other calls.
-    global VLM_DISABLED_FLAG
-    previous_vlm_state = VLM_DISABLED_FLAG
-    VLM_DISABLED_FLAG = not base_allow_vlm
+    base_vlm_token = VLM_DISABLED.set(not base_allow_vlm)
 
     steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
     # Rewrite UI save patterns to direct write_file when possible.
@@ -3869,8 +3867,7 @@ def run_steps(
             last_verification: Dict[str, Any] = {}
             # Per-step VLM toggle (cannot override global disable).
             step_allow_vlm = base_allow_vlm and bool(step_feedback.get("allow_vlm", True))
-            prev_step_vlm_flag = VLM_DISABLED_FLAG
-            VLM_DISABLED_FLAG = not step_allow_vlm
+            step_vlm_token = VLM_DISABLED.set(not step_allow_vlm)
 
             try:
                 for attempt in range(1, step_feedback["max_attempts"] + 1):
@@ -3927,7 +3924,7 @@ def run_steps(
                     step_status = "error"
                     break
             finally:
-                VLM_DISABLED_FLAG = prev_step_vlm_flag
+                VLM_DISABLED.reset(step_vlm_token)
 
             entry = {
                 "step_index": idx,
@@ -4018,7 +4015,7 @@ def run_steps(
 
             idx += 1
     finally:
-        VLM_DISABLED_FLAG = previous_vlm_state
+        VLM_DISABLED.reset(base_vlm_token)
 
     result = {"overall_status": overall_status, "logs": logs}
     if context:

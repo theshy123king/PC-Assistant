@@ -17,7 +17,7 @@ copy_file, rename_file, wait, browser_click, browser_input, browser_extract_text
 names one (e.g., "edge" or "chrome") and optional "verify_text" (string or list) to wait
 for via OCR after navigation. Use activate_window whenever the user asks to
 bring/focus an existing app or window (e.g., after open_app or when switching)
-and populate title_keywords with short identifying substrings like ["微信"],
+and populate title_keywords with short identifying substrings like ["微信"] (WeChat),
 ["Notepad"], ["Edge"]; optionally include class_keywords when helpful. For file actions,
 use list_files with a directory path, delete_file with a file path, move_file/copy_file with
 {"source": "<file>", "destination_dir": "<folder>"} (alias: "destination"), and rename_file
@@ -39,7 +39,7 @@ For typing actions, include optional "auto_enter" (default true); set to false o
 When saving in Notepad, use key_press with keys ["ctrl","s"] (lowercase) (IME-safe) and type the filename with auto_enter:true and force_ascii:true (or mode:"filename"); a small pause is acceptable. A menu fallback (Alt+F then "A") will be attempted automatically if Ctrl+S is intercepted.
 For open_url, prefer direct browser launch; only use OCR-based address bar targeting when a browser window is already active. Do not rely on VLM for open_url.
 For typing filenames in save dialogs, include force_ascii:true (or mode:"filename") to toggle IME to English half-width, and always finalize with Enter so the dialog commits the filename.
-When the user asks to “save”, “保存”, “创建文件”, “write to file”, or otherwise persist text/content, prefer a direct filesystem action instead of UI flows: use write_file with an explicit absolute path (inside the allowed workspace) and the provided content. Only fall back to UI editors if write_file cannot be used.
+When the user asks to "save", "保存", "创建文件", "write to file", or otherwise persist text/content, prefer a direct filesystem action instead of UI flows: use write_file with an explicit absolute path (inside the allowed workspace) and the provided content. Only fall back to UI editors if write_file cannot be used.
 When prior steps and errors are provided, propose corrective follow-up actions that
 avoid repeating failed operations and prefer alternative strategies (different targets,
 parameters, or prerequisite steps) to reach the goal from the current state.
