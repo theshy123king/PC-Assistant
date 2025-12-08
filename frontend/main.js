@@ -105,6 +105,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
     },
   });
 
@@ -116,6 +117,17 @@ function createWindow() {
     app.quit();
   });
 }
+
+ipcMain.handle("select-work-dir", async () => {
+  const result = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow() || undefined, {
+    properties: ["openDirectory"],
+    defaultPath: path.join(app.getPath("home"), "Desktop"),
+  });
+  if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
+    return null;
+  }
+  return result.filePaths[0];
+});
 
 // Listen for renderer exit requests (quit button)
 ipcMain.on("exit-app", () => {

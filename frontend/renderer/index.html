@@ -271,6 +271,41 @@
       margin-left: 4px;
       line-height: 1.4;
     }
+    .workdir-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      -webkit-app-region: no-drag;
+    }
+    .workdir-display {
+      flex: 1;
+      cursor: pointer;
+    }
+    .workdir-display[readonly] {
+      background: rgba(255,255,255,0.6);
+    }
+    .workdir-btn {
+      padding: 11px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--accent-color);
+      background: rgba(0, 122, 255, 0.08);
+      color: var(--accent-color);
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      box-shadow: var(--shadow-sm);
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .workdir-btn:hover {
+      background: var(--accent-color);
+      color: white;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(0, 122, 255, 0.15);
+    }
+    .workdir-btn:active {
+      transform: scale(0.98);
+    }
 
     .danger-btn {
       margin-top: auto;
@@ -473,7 +508,11 @@
         </div>
         <div class="setting-group">
           <label class="setting-label">Working Directory</label>
-          <input id="work-dir-input" class="setting-input" type="text" placeholder="Loading...">
+          <div class="workdir-row">
+            <input id="work-dir-input" class="setting-input workdir-display" type="text" placeholder="Loading..." readonly>
+            <button id="work-dir-choose" class="workdir-btn" type="button">Choose</button>
+          </div>
+          <div class="setting-hint">Select a folder to run automation from.</div>
         </div>
         
         <button id="quit-btn" class="danger-btn">

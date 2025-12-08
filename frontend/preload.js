@@ -42,10 +42,20 @@ const os = require("os");
       }
     }
 
+    async function selectWorkDir() {
+      try {
+        const selected = await ipcRenderer.invoke("select-work-dir");
+        return selected || null;
+      } catch (err) {
+        return null;
+      }
+    }
+
     contextBridge.exposeInMainWorld("api", {
       run,
       exitApp: () => ipcRenderer.send("exit-app"),
       defaultWorkDir,
+      selectWorkDir,
     });
   } catch (err) {
     // Fallback exposure to avoid undefined bridge
@@ -53,6 +63,7 @@ const os = require("os");
       run: async () => ({ error: "bridge_init_failed: " + err }),
       exitApp: () => ipcRenderer.send("exit-app"),
       defaultWorkDir: null,
+      selectWorkDir: async () => null,
     });
   }
 })();

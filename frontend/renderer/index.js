@@ -8,6 +8,7 @@ const settingsBtn = document.getElementById("settings-btn");
 const clearBtn = document.getElementById("clear-btn");
 const quitBtn = document.getElementById("quit-btn");
 const workDirInput = document.getElementById("work-dir-input");
+const workDirChooseBtn = document.getElementById("work-dir-choose");
 const statusDot = document.getElementById("statusDot");
 const statusText = document.getElementById("clickPickerStatus");
 const panelTitle = document.getElementById("panel-title");
@@ -33,6 +34,7 @@ let isSettingsOpen = false;
 let currentProvider = "deepseek";
 let currentMode = "execute";
 let currentStatusState = "idle";
+let currentWorkDir = "";
 
 function getApi() {
     if (window.api) return window.api;
@@ -166,7 +168,10 @@ function applyMode(mode) {
 (function initWorkDir() {
     const api = getApi();
     if (api && api.defaultWorkDir) {
+        currentWorkDir = api.defaultWorkDir;
         workDirInput.value = api.defaultWorkDir;
+    } else {
+        workDirInput.value = "";
     }
 })();
 
@@ -195,6 +200,21 @@ function toggleExpand(forceState = null) {
     } else {
         widgetShell.classList.toggle("expanded");
     }
+}
+
+async function chooseWorkDir() {
+    const api = getApi();
+    if (!api || typeof api.selectWorkDir !== "function") {
+        appendAgentHTML('<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">Folder picker unavailable. Please restart the app.</div>');
+        return;
+    }
+    const previousStatus = currentStatusState;
+    const selected = await api.selectWorkDir();
+    if (selected) {
+        currentWorkDir = selected;
+        workDirInput.value = selected;
+    }
+    setStatus(previousStatus);
 }
 
 function toggleSettings() {
@@ -393,7 +413,7 @@ async function handleRun() {
                 null, // manualClick
                 screenshotMeta,
                 dryRunToggle?.checked ?? false,
-                workDirInput.value, // Pass Work Directory
+                currentWorkDir || workDirInput.value, // Pass Work Directory
                 screenshotBase64,
                 currentProvider
             );
@@ -541,6 +561,9 @@ screenshotBtn.addEventListener("click", () => captureScreenshot(true));
 
 // Hidden OCR button support
 if (ocrBtn) ocrBtn.addEventListener("click", runOCR);
+
+if (workDirChooseBtn) workDirChooseBtn.addEventListener("click", () => { void chooseWorkDir(); });
+if (workDirInput) workDirInput.addEventListener("click", () => { void chooseWorkDir(); });
 
 clearBtn.addEventListener("click", () => {
     chatScroll.innerHTML = '<div class="bubble">System ready.</div>';
