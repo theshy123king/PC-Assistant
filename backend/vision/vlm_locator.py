@@ -61,7 +61,7 @@ def locate_with_vlm(
     query: str,
     image_base64: str,
     provider_call: Callable[[str, Optional[List[dict]]], str],
-    provider_name: str = "openai",
+    provider_name: str = "deepseek",
 ) -> Dict[str, Any]:
     """
     Use a multimodal LLM to locate a visually described target.

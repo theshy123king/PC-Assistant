@@ -41,8 +41,10 @@ from backend.vision.ocr import OcrBox
 from backend.vision.ocr import run_ocr, run_ocr_with_boxes
 from backend.llm.action_parser import parse_action_plan
 from backend.llm.planner_prompt import format_prompt
+import os
+
 from backend.llm.deepseek_client import call_deepseek
-from backend.llm.openai_client import call_openai
+from backend.llm.doubao_client import call_doubao
 from backend.llm.qwen_client import call_qwen
 from backend.vision.screenshot import capture_screen
 from backend.executor.ui_locator import locate_target, locate_text, rank_text_candidates
@@ -3301,14 +3303,47 @@ def _summarize_steps_for_prompt(step_results: List[Dict[str, Any]], limit: int =
     return "\n".join(lines)
 
 
-def _select_planner_call(provider: Optional[str]):
+def _provider_available(name: str) -> bool:
+    name = (name or "").lower()
+    if name == "deepseek":
+        return bool(os.getenv("DEEPSEEK_API_KEY"))
+    if name == "doubao":
+        return bool(os.getenv("DOUBAO_API_KEY"))
+    if name == "qwen":
+        return bool(os.getenv("QWEN_API_KEY"))
+    return False
+
+
+def _call_planner_with_fallback(
+    provider: Optional[str], prompt_bundle: "PromptBundle"
+) -> Tuple[str, str]:
     mapping = {
         "deepseek": call_deepseek,
-        "openai": call_openai,
+        "doubao": call_doubao,
         "qwen": call_qwen,
     }
     normalized = (provider or "deepseek").lower()
-    return normalized, mapping.get(normalized)
+    if _provider_available(normalized):
+        order = [normalized]
+    else:
+        order = [normalized, "deepseek", "doubao", "qwen"]
+    seen = set()
+    last_exc: Exception | None = None
+    messages = prompt_bundle.vision_messages or prompt_bundle.messages
+    for name in order:
+        if name in seen:
+            continue
+        seen.add(name)
+        if name not in mapping:
+            continue
+        if not _provider_available(name):
+            continue
+        try:
+            return name, mapping[name](prompt_bundle.prompt_text, messages)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    raise RuntimeError(f"planner call failed: {last_exc or 'no providers available'}")
 
 
 def _maybe_capture_replan_image(enable: bool) -> Dict[str, Any]:
@@ -3596,12 +3631,8 @@ def _invoke_replan(
             return {"success": False, "error": parsed, "prompt": prompt_bundle}
         return {"success": False, "error": "planner override returned unsupported type", "prompt": prompt_bundle}
 
-    provider_name, planner_call = _select_planner_call(provider)
-    if not planner_call:
-        return {"success": False, "error": f"unsupported planner provider '{provider_name}'", "prompt": prompt_bundle}
-
     try:
-        raw_reply = planner_call(prompt_bundle.prompt_text, prompt_bundle.vision_messages or prompt_bundle.messages)
+        provider_name, raw_reply = _call_planner_with_fallback(provider, prompt_bundle)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"planner call failed: {exc}", "prompt": prompt_bundle}
 
@@ -3655,6 +3686,43 @@ FILE_PATH_ACTIONS = {
     "write_file",
 }
 
+STUB_UI_ACTIONS = {
+    "open_app",
+    "open_url",
+    "switch_window",
+    "activate_window",
+    "type_text",
+    "key_press",
+    "click",
+    "mouse_move",
+    "right_click",
+    "double_click",
+    "scroll",
+    "drag",
+    "hotkey",
+    "list_windows",
+    "get_active_window",
+    "fuzzy_switch_window",
+    "click_text",
+    "browser_click",
+    "browser_input",
+    "browser_extract_text",
+    "adjust_volume",
+}
+
+
+def _stub_handler(step: ActionStep) -> Dict[str, Any]:
+    """Return a success result without touching the real UI."""
+    return {
+        "status": "success",
+        "method": "stub",
+        "action": step.action,
+        "params": dict(step.params or {}),
+    }
+
+
+TEST_MODE_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {name: _stub_handler for name in STUB_UI_ACTIONS}
+
 
 def run_steps(
     action_plan: ActionPlan,
@@ -3699,6 +3767,7 @@ def run_steps(
         except Exception:
             pass
 
+    use_stub_handlers = _flag_from_env("EXECUTOR_TEST_MODE", False)
     base_max_retries = (
         DEFAULT_STEP_MAX_RETRIES
         if max_retries is None
@@ -3713,6 +3782,11 @@ def run_steps(
         base_capture_after = bool(force_capture)
     if force_ocr is not None:
         base_capture_ocr = bool(force_ocr)
+    if use_stub_handlers:
+        capture_observations = False
+        base_capture_before = False
+        base_capture_after = False
+        base_capture_ocr = False
     base_max_replans = DEFAULT_MAX_REPLANS if max_replans is None else _coerce_nonnegative_int(max_replans, DEFAULT_MAX_REPLANS)
     base_replan_capture = DEFAULT_REPLAN_CAPTURE if capture_replan_screenshot is None else _coerce_bool(
         capture_replan_screenshot, DEFAULT_REPLAN_CAPTURE
@@ -3816,7 +3890,9 @@ def run_steps(
                 step.params = dict(step.params or {})
                 step.params.setdefault("base_dir", work_dir)
             executed_steps += 1
-            handler = ACTION_HANDLERS.get(step.action)
+            handler = TEST_MODE_HANDLERS.get(step.action) if use_stub_handlers else None
+            if handler is None:
+                handler = ACTION_HANDLERS.get(step.action)
             if not handler:
                 entry = {
                     "step_index": idx,

@@ -1,6 +1,7 @@
 import base64
 import json
 import asyncio
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,15 +11,18 @@ from PIL import Image
 
 from backend.executor import executor
 from backend.executor.actions_schema import validate_action_plan
+from backend.executor.task_context import TaskContext
 from backend.llm.action_parser import parse_action_plan
 from backend.llm.deepseek_client import call_deepseek
-from backend.llm.openai_client import call_openai
+from backend.llm.doubao_client import call_doubao
 from backend.llm.planner_prompt import PromptBundle, format_prompt
 from backend.llm.qwen_client import call_qwen
-from backend.executor.task_context import TaskContext
+from backend.llm.test_planner import build_test_plan
 from backend.vision.ocr import run_ocr, run_ocr_with_boxes
 from backend.vision.screenshot import capture_screen
+from backend.logging_setup import setup_logging
 
+setup_logging()
 load_dotenv()
 
 
@@ -33,6 +37,51 @@ class AIQueryRequest(BaseModel):
 
 
 app = FastAPI()
+
+
+def _provider_available(name: str) -> bool:
+    name = (name or "").lower()
+    if name == "deepseek":
+        return bool(os.getenv("DEEPSEEK_API_KEY"))
+    if name == "doubao":
+        return bool(os.getenv("DOUBAO_API_KEY"))
+    if name == "qwen":
+        return bool(os.getenv("QWEN_API_KEY"))
+    return False
+
+
+def _call_llm_provider(provider: str, prompt_text: str, messages: list[dict] | None = None) -> tuple[str, str]:
+    """Call the chosen provider; on failure, fall back to other available providers."""
+    provider = (provider or "deepseek").lower()
+    last_exc: Exception | None = None
+
+    def _try_call(name: str) -> str:
+        if name == "deepseek":
+            return call_deepseek(prompt_text, messages)
+        if name == "doubao":
+            return call_doubao(prompt_text, messages)
+        if name == "qwen":
+            return call_qwen(prompt_text, messages)
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+
+    # If requested provider is available, try only that; otherwise fall back.
+    if _provider_available(provider):
+        order = [provider]
+    else:
+        order = [p for p in [provider, "deepseek", "doubao", "qwen"] if p]
+    seen = set()
+    for name in order:
+        if name in seen:
+            continue
+        seen.add(name)
+        if not _provider_available(name):
+            continue
+        try:
+            return name, _try_call(name)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    raise RuntimeError(f"LLM call failed ({provider}): {last_exc or 'no providers available'}")
 
 
 def _resolve_work_dir(raw: str | None) -> str | None:
@@ -86,17 +135,12 @@ async def screenshot_raw():
 async def ai_query(payload: AIQueryRequest):
     provider = payload.provider.lower()
     try:
-        if provider == "openai":
-            reply = await asyncio.to_thread(call_openai, payload.text)
-        elif provider == "deepseek":
-            reply = await asyncio.to_thread(call_deepseek, payload.text)
-        elif provider == "qwen":
-            reply = await asyncio.to_thread(call_qwen, payload.text)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported provider")
+        resolved_provider, reply = await asyncio.to_thread(
+            _call_llm_provider, provider, payload.text, None
+        )
     except Exception as exc:  # noqa: BLE001
         return {"provider": provider, "error": f"LLM call failed: {exc}"}
-    return {"provider": provider, "response": reply}
+    return {"provider": resolved_provider, "response": reply}
 
 
 @app.post("/api/ai/plan")
@@ -107,6 +151,44 @@ async def ai_plan(payload: AIQueryRequest):
     """
     context = TaskContext(user_instruction=payload.text)
     provider = (payload.provider or "deepseek").lower()
+
+    dangerous = executor._detect_dangerous_request(payload.text)
+    if dangerous:
+        return {
+            "provider": provider,
+            "status": "error",
+            "message": f"dangerous_request:{dangerous}",
+            "context": context.to_dict(),
+        }
+
+    if provider == "test":
+        plan_data = build_test_plan(payload.text, payload.screenshot_base64)
+        if isinstance(plan_data, dict) and plan_data.get("error_type") == "dangerous_request":
+            return {
+                "provider": provider,
+                "status": "error",
+                "message": "dangerous_request:block",
+                "context": context.to_dict(),
+            }
+        try:
+            plan = validate_action_plan(plan_data)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "provider": provider,
+                "status": "error",
+                "message": f"invalid action plan: {exc}",
+                "raw": plan_data,
+                "context": context.to_dict(),
+            }
+        context.record_plan(plan.model_dump())
+        return {
+            "provider": provider,
+            "status": "success",
+            "plan": plan.model_dump(),
+            "raw": "test_planner",
+            "context": context.to_dict(),
+        }
+
     prompt: PromptBundle = format_prompt(
         payload.text, ocr_text="", image_base64=payload.screenshot_base64
     )
@@ -116,14 +198,9 @@ async def ai_plan(payload: AIQueryRequest):
     prompt_text = prompt.prompt_text
     context.set_prompt_text(prompt_text)
     try:
-        if provider == "openai":
-            reply = await asyncio.to_thread(call_openai, prompt_text, llm_messages)
-        elif provider == "deepseek":
-            reply = await asyncio.to_thread(call_deepseek, prompt_text, llm_messages)
-        elif provider == "qwen":
-            reply = await asyncio.to_thread(call_qwen, prompt_text, llm_messages)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported provider")
+        resolved_provider, reply = await asyncio.to_thread(
+            _call_llm_provider, provider, prompt_text, llm_messages
+        )
     except Exception as exc:  # noqa: BLE001
         return {
             "provider": provider,
@@ -143,7 +220,7 @@ async def ai_plan(payload: AIQueryRequest):
         }
     context.record_plan(parsed)
     return {
-        "provider": provider,
+        "provider": resolved_provider,
         "status": "success",
         "plan": parsed.model_dump(),
         "raw": reply,
@@ -163,8 +240,14 @@ async def ai_execute_plan(payload: dict):
     except Exception as exc:  # noqa: BLE001
         return {"error": f"invalid action plan: {exc}"}
 
-    result = executor.run_steps(plan, work_dir=work_dir)
+    result = await asyncio.to_thread(executor.run_steps, plan, work_dir=work_dir)
     return result
+
+
+@app.post("/api/ai/execute")
+async def ai_execute(payload: dict):
+    """Alias for execute_plan to match external callers."""
+    return await ai_execute_plan(payload)
 
 
 @app.post("/api/ai/run")
@@ -200,14 +283,9 @@ async def ai_run(payload: dict):
     context.set_prompt_text(prompt_text)
 
     try:
-        if provider == "openai":
-            raw_reply = await asyncio.to_thread(call_openai, prompt_text, llm_messages)
-        elif provider == "deepseek":
-            raw_reply = await asyncio.to_thread(call_deepseek, prompt_text, llm_messages)
-        elif provider == "qwen":
-            raw_reply = await asyncio.to_thread(call_qwen, prompt_text, llm_messages)
-        else:
-            return {"error": "Unsupported provider", "provider": provider}
+        resolved_provider, raw_reply = await asyncio.to_thread(
+            _call_llm_provider, provider, prompt_text, llm_messages
+        )
     except Exception as exc:  # noqa: BLE001
         return {
             "error": f"LLM call failed: {exc}",
@@ -220,7 +298,7 @@ async def ai_run(payload: dict):
     parsed = parse_action_plan(raw_reply)
     if isinstance(parsed, str):
         return {
-            "provider": provider,
+            "provider": resolved_provider,
             "user_text": user_text,
             "raw_reply": raw_reply,
             "plan_error": parsed,
@@ -242,7 +320,7 @@ async def ai_run(payload: dict):
     except Exception as exc:  # noqa: BLE001
         context.add_error(f"invalid action plan: {exc}")
         return {
-            "provider": provider,
+            "provider": resolved_provider,
             "user_text": user_text,
             "raw_reply": raw_reply,
             "plan_error": f"invalid action plan: {exc}",
@@ -251,7 +329,7 @@ async def ai_run(payload: dict):
 
     if dry_run:
         return {
-            "provider": provider,
+            "provider": resolved_provider,
             "user_text": user_text,
             "raw_reply": raw_reply,
             "plan": plan.model_dump(),
@@ -261,9 +339,15 @@ async def ai_run(payload: dict):
             "context": context.to_dict(),
         }
 
-    exec_result = executor.run_steps(plan, context=context, planner_provider=provider, work_dir=work_dir)
+    exec_result = await asyncio.to_thread(
+        executor.run_steps,
+        plan,
+        context=context,
+        planner_provider=resolved_provider,
+        work_dir=work_dir,
+    )
     return {
-        "provider": provider,
+        "provider": resolved_provider,
         "user_text": user_text,
         "raw_reply": raw_reply,
         "plan": plan.model_dump(),
@@ -318,14 +402,9 @@ async def ai_debug_run(payload: dict):
     context.set_prompt_text(prompt_text)
 
     try:
-        if provider == "openai":
-            raw_reply = await asyncio.to_thread(call_openai, prompt_text, llm_messages)
-        elif provider == "deepseek":
-            raw_reply = await asyncio.to_thread(call_deepseek, prompt_text, llm_messages)
-        elif provider == "qwen":
-            raw_reply = await asyncio.to_thread(call_qwen, prompt_text, llm_messages)
-        else:
-            return {"error": "Unsupported provider", "provider": provider}
+        resolved_provider, raw_reply = await asyncio.to_thread(
+            _call_llm_provider, provider, prompt_text, llm_messages
+        )
     except Exception as exc:  # noqa: BLE001
         return {
             "error": f"LLM call failed: {exc}",
@@ -339,16 +418,17 @@ async def ai_debug_run(payload: dict):
     if isinstance(parsed, str):
         return {
             "error": parsed,
-            "provider": provider,
+            "provider": resolved_provider,
             "raw": raw_reply,
             "context": context.to_dict(),
         }
     context.record_plan(parsed)
 
-    exec_result = executor.run_steps(
+    exec_result = await asyncio.to_thread(
+        executor.run_steps,
         parsed,
         context=context,
-        planner_provider=provider,
+        planner_provider=resolved_provider,
         allow_replan=allow_replan,
         max_replans=max_replans,
         debug_capture_all=debug_force_capture,

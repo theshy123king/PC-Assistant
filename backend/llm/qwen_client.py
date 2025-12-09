@@ -39,16 +39,23 @@ def call_qwen(text: str, messages: Optional[List[dict]] = None, model: Optional[
     """Call Qwen model via DashScope and return the output text (text-only fallback)."""
     api_key = _get_api_key()
     prompt = _messages_to_prompt(messages, text)
-    try:
-        response = Generation.call(
-            model=model or "qwen-turbo",
-            prompt=prompt,
-            api_key=api_key,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return f"Qwen API call failed: {exc}"
+    model_name = model or os.getenv("QWEN_MODEL", "qwen-turbo")
+    last_exc: Exception | None = None
+    # Simple retry loop to mitigate transient SSL/EOF issues.
+    for attempt in range(3):
+        try:
+            response = Generation.call(
+                model=model_name,
+                prompt=prompt,
+                api_key=api_key,
+            )
+            return _extract_text(response)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    raise RuntimeError(f"Qwen API call failed after retries: {last_exc}")
 
     try:
         return _extract_text(response)
     except Exception as exc:  # noqa: BLE001
-        return f"Qwen API response missing text: {exc}"
+        raise RuntimeError(f"Qwen API response missing text: {exc}") from exc

@@ -235,7 +235,7 @@ def locate_target(
     image_base64: Optional[str] = None,
     icon_templates: Optional[Dict[str, str]] = None,
     vlm_call: Optional[Callable[[str, Optional[List[dict]]], str]] = None,
-    vlm_provider: str = "openai",
+    vlm_provider: str = "deepseek",
     high_threshold: float = 0.9,
     medium_threshold: float = 0.75,
 ) -> Dict[str, Any]:

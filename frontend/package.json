@@ -4,6 +4,7 @@
   "description": "",
   "main": "main.js",
   "scripts": {
+    "backend": "cd .. && python -m backend.launch_backend",
     "start": "electron .",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

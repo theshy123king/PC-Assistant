@@ -14,12 +14,24 @@ const statusText = document.getElementById("clickPickerStatus");
 const panelTitle = document.getElementById("panel-title");
 const modelOptions = document.getElementById("model-options");
 const modelButtons = modelOptions ? Array.from(modelOptions.querySelectorAll(".pill-btn")) : [];
-const PROVIDER_LABELS = { deepseek: "DeepSeek", openai: "OpenAI", qwen: "Qwen" };
+const PROVIDER_LABELS = { deepseek: "DeepSeek", doubao: "Doubao", qwen: "Qwen" };
 const PROVIDER_STORAGE_KEY = "pc_assistant_provider";
 const modeOptions = document.getElementById("mode-options");
 const modeButtons = modeOptions ? Array.from(modeOptions.querySelectorAll(".pill-btn")) : [];
 const MODE_STORAGE_KEY = "pc_assistant_mode";
 const MODE_LABELS = { execute: "Execute", chat: "Chat" };
+const DEFAULT_API_BASE = "http://127.0.0.1:5004";
+const API_BASE = (window.api && window.api.backendBaseUrl) || DEFAULT_API_BASE;
+const CHAT_TIMEOUT_MS = 45000;
+const log = (level, message) => {
+    try {
+        if (window.api && typeof window.api.log === "function") {
+            window.api.log(level, message);
+        }
+    } catch (err) {
+        // ignore logging failures
+    }
+};
 
 // Hidden but necessary elements for backend logic compatibility
 const screenshotMain = document.getElementById("screenshotMain");
@@ -35,6 +47,14 @@ let currentProvider = "deepseek";
 let currentMode = "execute";
 let currentStatusState = "idle";
 let currentWorkDir = "";
+let backendConnectionState = "online"; // online | reconnecting | offline
+let healthTimer = null;
+let healthController = null;
+let healthBackoffMs = 1000;
+const HEALTH_BACKOFF_MAX = 15000;
+let healthFailures = 0;
+let lastRestartAt = 0;
+const RESTART_COOLDOWN_MS = 30000;
 
 function getApi() {
     if (window.api) return window.api;
@@ -43,7 +63,7 @@ function getApi() {
         defaultWorkDir: "",
         run: async (text, ocrText = "", manualClick = null, screenshotMeta = null, dryRun = false, workDir = null, screenshotBase64 = null, provider = currentProvider) => {
             try {
-                const res = await fetch("http://127.0.0.1:8000/api/ai/run", {
+                const res = await fetch(`${API_BASE}/api/ai/run`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -236,7 +256,13 @@ function toggleSettings() {
 }
 
 function formatStatusLabel(text) {
-    return `${text} | ${getProviderLabel()} | ${getModeLabel()}`;
+    const backendSuffix =
+        backendConnectionState === "reconnecting"
+            ? " | Backend: reconnecting..."
+            : backendConnectionState === "offline"
+            ? " | Backend: offline"
+            : "";
+    return `${text}${backendSuffix} | ${getProviderLabel()} | ${getModeLabel()}`;
 }
 
 function setStatus(state) {
@@ -258,10 +284,80 @@ function setStatus(state) {
         statusText.textContent = formatStatusLabel("IDLE");
         statusText.style.color = "var(--text-sub)";
     }
+
+    if (backendConnectionState === "offline") {
+        statusText.style.color = "var(--error-color)";
+    } else if (backendConnectionState === "reconnecting") {
+        statusText.style.color = "var(--accent-color)";
+    }
 }
 
 function scrollToBottom() {
     chatScroll.scrollTop = chatScroll.scrollHeight;
+}
+
+function setBackendState(state) {
+    const normalized = state || "online";
+    if (backendConnectionState === normalized) return;
+    backendConnectionState = normalized;
+    setStatus(currentStatusState);
+}
+
+function scheduleHealthCheck(delayMs = healthBackoffMs) {
+    if (healthTimer) clearTimeout(healthTimer);
+    healthTimer = setTimeout(runHealthCheck, delayMs);
+}
+
+async function runHealthCheck() {
+    if (healthController) {
+        healthController.abort();
+    }
+    healthController = new AbortController();
+    const ctrl = healthController;
+    const timeout = setTimeout(() => ctrl.abort(), 1500);
+    try {
+        const res = await fetch(`${API_BASE}/`, { signal: ctrl.signal });
+        if (res.ok) {
+            healthFailures = 0;
+            healthBackoffMs = 1000;
+            setBackendState("online");
+            log("INFO", "Health check OK");
+        } else {
+            throw new Error(`health http ${res.status}`);
+        }
+    } catch (err) {
+        healthFailures += 1;
+        const reconnecting = healthFailures < 3;
+        setBackendState(reconnecting ? "reconnecting" : "offline");
+        healthBackoffMs = Math.min(healthBackoffMs * 2, HEALTH_BACKOFF_MAX);
+        log("WARNING", `Health check failed (${err}); failures=${healthFailures}`);
+
+        const now = Date.now();
+        if (
+            healthFailures >= 3 &&
+            window.api &&
+            typeof window.api.restartBackend === "function" &&
+            now - lastRestartAt > RESTART_COOLDOWN_MS
+        ) {
+            lastRestartAt = now;
+            // Fire and forget restart; don't await to avoid UI freeze.
+            log("WARNING", "Requesting backend restart after repeated failures");
+            window.api.restartBackend().catch(() => {});
+        }
+    } finally {
+        clearTimeout(timeout);
+        if (ctrl === healthController) {
+            healthController = null;
+        }
+        scheduleHealthCheck();
+    }
+}
+
+function startHealthMonitor() {
+    healthBackoffMs = 1000;
+    healthFailures = 0;
+    setBackendState("online");
+    scheduleHealthCheck(0);
 }
 
 // --- Chat Helpers ---
@@ -383,21 +479,22 @@ async function handleRun() {
         // 3. Call Backend with Work Dir
         let result;
         if (chatMode) {
+            let timeoutHandle = null;
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 10000);
+                timeoutHandle = setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
                 const payload = {
                     provider: currentProvider,
                     text,
                     screenshot_base64: screenshotBase64,
                 };
-                const res = await fetch("http://127.0.0.1:8000/api/ai/query", {
+                const res = await fetch(`${API_BASE}/api/ai/query`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(payload),
                     signal: controller.signal,
                 });
-                clearTimeout(timeout);
+                clearTimeout(timeoutHandle);
                 if (!res.ok) {
                     result = { error: `chat_call_failed: http ${res.status}` };
                 } else {
@@ -405,6 +502,9 @@ async function handleRun() {
                 }
             } catch (err) { // AbortError or network failure
                 result = { error: `chat_call_failed: ${err?.name === "AbortError" ? "request timed out" : err}` };
+                log("ERROR", `Chat call failed: ${result.error}`);
+            } finally {
+                if (timeoutHandle) clearTimeout(timeoutHandle);
             }
         } else {
             result = await runFn(
@@ -475,10 +575,10 @@ async function captureScreenshot(showCard = true) {
     setStatus("busy");
     try {
         // Try raw capture first (faster)
-        let res = await fetch("http://127.0.0.1:8000/api/screenshot/raw", { method: "POST" });
+        let res = await fetch(`${API_BASE}/api/screenshot/raw`, { method: "POST" });
         if (!res.ok) {
             // Fallback to vision screenshot
-            res = await fetch("http://127.0.0.1:8000/api/vision/screenshot", { method: "POST" });
+            res = await fetch(`${API_BASE}/api/vision/screenshot`, { method: "POST" });
         }
         if (!res.ok) {
             throw new Error(`screenshot request failed (${res.status})`);
@@ -513,6 +613,7 @@ async function captureScreenshot(showCard = true) {
     } catch (err) {
         setStatus("error");
         console.error("Screenshot failed:", err);
+        log("ERROR", `Screenshot failed: ${err}`);
         if (showCard) {
             const msg = (err && err.message) ? err.message : "Screenshot failed";
             appendAgentHTML(`<div class="bubble" style="color:var(--error-color)">${msg}</div>`);
@@ -571,3 +672,4 @@ clearBtn.addEventListener("click", () => {
 });
 
 setStatus(currentStatusState);
+startHealthMonitor();

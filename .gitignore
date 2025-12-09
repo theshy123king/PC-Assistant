@@ -29,3 +29,6 @@ frontend_bundle/
 demo_output/
 dist/
 build/
+
+logs/
+

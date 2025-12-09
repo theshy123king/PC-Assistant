@@ -46,7 +46,7 @@ def test_locate_target_uses_vlm_when_available(monkeypatch):
         boxes,
         image_base64="abc",
         vlm_call=fake_vlm,
-        vlm_provider="openai",
+        vlm_provider="doubao",
     )
 
     assert result["method"] == "vlm"
