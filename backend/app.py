@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from PIL import Image
 
 from backend.executor import executor
-from backend.executor.actions_schema import validate_action_plan
+from backend.executor.actions_schema import ActionPlan, ActionStep, validate_action_plan
+from backend.executor.apps import get_cached_alias
 from backend.executor.task_context import TaskContext
 from backend.llm.action_parser import parse_action_plan
 from backend.llm.deepseek_client import call_deepseek
@@ -59,6 +60,55 @@ def _doubao_vision_enabled() -> bool:
     if fallback_model and "vision" in fallback_model.lower():
         return True
     return False
+
+
+def _cached_open_plan(user_text: str) -> ActionPlan | None:
+    cached = get_cached_alias(user_text)
+    if not cached:
+        return None
+    target = cached.get("target") or cached.get("path") or user_text
+    params = {"target": target, "user_query": user_text}
+    return ActionPlan(task=user_text, steps=[ActionStep(action="open_app", params=params)])
+
+
+def _maybe_enforce_open_app(user_text: str, plan_data: dict) -> dict:
+    """Heuristically force open_app for common app-launch intents (e.g., WeChat) to avoid click-only plans."""
+    text_lower = (user_text or "").lower()
+    if not plan_data or not isinstance(plan_data, dict):
+        return plan_data
+    steps = plan_data.get("steps") or []
+    if not isinstance(steps, list):
+        return plan_data
+
+    intents = {
+        "wechat": ["wechat", "微信", "weixin"],
+    }
+    for target_key, keywords in intents.items():
+        if not any(k in text_lower for k in keywords):
+            continue
+        has_open = any(
+            (s.get("action") == "open_app" and isinstance(s.get("params"), dict) and target_key in str(s["params"].get("target", "")).lower())
+            for s in steps
+            if isinstance(s, dict)
+        )
+        if has_open:
+            continue
+        # Remove leading click/activate_window steps that try to activate the same app to avoid redundant actions.
+        filtered: list[dict] = []
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            if s.get("action") in {"click", "activate_window"}:
+                params = s.get("params") or {}
+                combined = f"{params} {s.get('action')} {s.get('target', '')}".lower()
+                if any(k in combined for k in keywords):
+                    continue
+            filtered.append(s)
+        steps = filtered
+        steps.insert(0, {"action": "open_app", "params": {"target": target_key, "user_query": user_text}})
+        plan_data["steps"] = steps
+        break
+    return plan_data
 
 
 def _call_llm_provider(provider: str, prompt_text: str, messages: list[dict] | None = None) -> tuple[str, str]:
@@ -172,6 +222,17 @@ async def ai_plan(payload: AIQueryRequest):
             "context": context.to_dict(),
         }
 
+    cached_plan = _cached_open_plan(payload.text)
+    if cached_plan:
+        context.record_plan(cached_plan.model_dump())
+        return {
+            "provider": "alias_cache",
+            "status": "success",
+            "plan": cached_plan.model_dump(),
+            "raw": "alias_cache",
+            "context": context.to_dict(),
+        }
+
     if provider == "test":
         plan_data = build_test_plan(payload.text, payload.screenshot_base64)
         if isinstance(plan_data, dict) and plan_data.get("error_type") == "dangerous_request":
@@ -236,6 +297,18 @@ async def ai_plan(payload: AIQueryRequest):
             "raw": reply,
             "context": context.to_dict(),
         }
+    plan_dict = parsed.model_dump()
+    plan_dict = _maybe_enforce_open_app(payload.text, plan_dict)
+    try:
+        parsed = ActionPlan.model_validate(plan_dict)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "provider": provider,
+            "status": "error",
+            "message": f"invalid action plan after normalization: {exc}",
+            "raw": reply,
+            "context": context.to_dict(),
+        }
     context.record_plan(parsed)
     return {
         "provider": resolved_provider,
@@ -287,6 +360,36 @@ async def ai_run(payload: dict):
     if not user_text or not isinstance(user_text, str):
         return {"error": "user_text is required", "provider": provider}
 
+    cached_plan = _cached_open_plan(user_text)
+    if cached_plan:
+        if dry_run:
+            return {
+                "provider": "alias_cache",
+                "user_text": user_text,
+                "raw_reply": "alias_cache",
+                "plan": cached_plan.model_dump(),
+                "plan_after_injection": cached_plan.model_dump(),
+                "execution": None,
+                "dry_run": True,
+                "context": context.to_dict(),
+            }
+        exec_result = await asyncio.to_thread(
+            executor.run_steps,
+            cached_plan,
+            context=context,
+            planner_provider="alias_cache",
+            work_dir=work_dir,
+        )
+        return {
+            "provider": "alias_cache",
+            "user_text": user_text,
+            "raw_reply": "alias_cache",
+            "plan": cached_plan.model_dump(),
+            "plan_after_injection": cached_plan.model_dump(),
+            "execution": exec_result,
+            "context": context.to_dict(),
+        }
+
     prompt: PromptBundle = format_prompt(
         user_text,
         ocr_text=ocr_text or "",
@@ -331,6 +434,7 @@ async def ai_run(payload: dict):
         }
 
     plan_data = parsed.model_dump()
+    plan_data = _maybe_enforce_open_app(user_text, plan_data)
     context.record_plan(plan_data)
 
     # Inject manual click as the first step if provided.
@@ -412,6 +516,17 @@ async def ai_debug_run(payload: dict):
 
     if not user_text or not isinstance(user_text, str):
         return {"error": "user_text is required", "provider": provider}
+
+    cached_plan = _cached_open_plan(user_text)
+    if cached_plan:
+        exec_result = await asyncio.to_thread(
+            executor.run_steps,
+            cached_plan,
+            context=context,
+            planner_provider="alias_cache",
+            work_dir=work_dir,
+        )
+        return exec_result
 
     prompt: PromptBundle = format_prompt(
         user_text,
