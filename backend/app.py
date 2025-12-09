@@ -50,6 +50,17 @@ def _provider_available(name: str) -> bool:
     return False
 
 
+def _doubao_vision_enabled() -> bool:
+    """Return True if a Doubao vision-capable model is configured."""
+    vision_model = os.getenv("DOUBAO_VISION_MODEL")
+    fallback_model = os.getenv("DOUBAO_MODEL")
+    if vision_model:
+        return True
+    if fallback_model and "vision" in fallback_model.lower():
+        return True
+    return False
+
+
 def _call_llm_provider(provider: str, prompt_text: str, messages: list[dict] | None = None) -> tuple[str, str]:
     """Call the chosen provider; on failure, fall back to other available providers."""
     provider = (provider or "deepseek").lower()
@@ -192,8 +203,15 @@ async def ai_plan(payload: AIQueryRequest):
     prompt: PromptBundle = format_prompt(
         payload.text, ocr_text="", image_base64=payload.screenshot_base64
     )
-    llm_messages = prompt.messages
-    if provider != "deepseek":
+    if provider == "deepseek":
+        llm_messages = prompt.messages
+    elif provider == "doubao":
+        llm_messages = (
+            prompt.vision_messages
+            if (prompt.vision_messages and _doubao_vision_enabled())
+            else prompt.messages
+        )
+    else:
         llm_messages = prompt.vision_messages or prompt.messages
     prompt_text = prompt.prompt_text
     context.set_prompt_text(prompt_text)
@@ -276,8 +294,15 @@ async def ai_run(payload: dict):
         screenshot_meta=screenshot_meta,
         image_base64=screenshot_base64,
     )
-    llm_messages = prompt.messages
-    if provider != "deepseek":
+    if provider == "deepseek":
+        llm_messages = prompt.messages
+    elif provider == "doubao":
+        llm_messages = (
+            prompt.vision_messages
+            if (prompt.vision_messages and _doubao_vision_enabled())
+            else prompt.messages
+        )
+    else:
         llm_messages = prompt.vision_messages or prompt.messages
     prompt_text = prompt.prompt_text
     context.set_prompt_text(prompt_text)
@@ -395,8 +420,15 @@ async def ai_debug_run(payload: dict):
         screenshot_meta=screenshot_meta,
         image_base64=screenshot_base64,
     )
-    llm_messages = prompt.messages
-    if provider != "deepseek":
+    if provider == "deepseek":
+        llm_messages = prompt.messages
+    elif provider == "doubao":
+        llm_messages = (
+            prompt.vision_messages
+            if (prompt.vision_messages and _doubao_vision_enabled())
+            else prompt.messages
+        )
+    else:
         llm_messages = prompt.vision_messages or prompt.messages
     prompt_text = prompt.prompt_text
     context.set_prompt_text(prompt_text)

@@ -23,7 +23,7 @@ python -m pip install -r backend/requirements-dev.txt
 ```
 
 Environment variables:
-- `DEEPSEEK_API_KEY` (primary provider), `DOUBAO_API_KEY` (requires exact Ark model IDs, e.g., `doubao-seed-1-6-lite-251015`, `doubao-seed-1-6-vision-251015`, `doubao-seed-code-preview-251028`), and `QWEN_API_KEY` for fallbacks. Optional: `DOUBAO_MODEL` / `DOUBAO_TEXT_MODEL` / `DOUBAO_VISION_MODEL` / `DOUBAO_REASONING_EFFORT` / `DOUBAO_TEMPERATURE` / `DOUBAO_TOP_P` (must also be exact model IDs if set).
+- `DEEPSEEK_API_KEY` (primary provider), `DOUBAO_API_KEY` (requires exact Ark model IDs, e.g., `doubao-seed-1-6-lite-251015`, `doubao-seed-1-6-vision-251015`, `doubao-seed-code-preview-251028`), and `QWEN_API_KEY` for fallbacks. Optional: `DOUBAO_MODEL` / `DOUBAO_TEXT_MODEL` / `DOUBAO_VISION_MODEL` / `DOUBAO_REASONING_EFFORT` / `DOUBAO_TEMPERATURE` / `DOUBAO_TOP_P` (must also be exact model IDs if set). Vision is used automatically for Doubao only when a screenshot is present **and** a vision-capable model ID is configured via `DOUBAO_VISION_MODEL` (or `DOUBAO_MODEL` points to a vision model).
 - Optional: `EXECUTOR_ALLOWED_ROOTS` to restrict file writes.
 - Ports:
   - Dev/Electron backend: `127.0.0.1:5004` (override with `PC_ASSISTANT_DEV_HOST` / `PC_ASSISTANT_DEV_PORT`).
@@ -79,7 +79,7 @@ python -m pytest backend/tests
 - Pytest sets `EXECUTOR_TEST_MODE=1` and defaults to port `5015` if a server is needed; override with `PC_ASSISTANT_TEST_PORT` to avoid clashes with any dev/Electron instance.
 
 ## Notable Behaviors
-- Default LLM provider: DeepSeek (pure text). Vision/multimodal works with Doubao/Qwen.
+- Default LLM provider: DeepSeek (pure text). Vision/multimodal works with Doubao (when `DOUBAO_VISION_MODEL` or a vision `DOUBAO_MODEL` is set) and Qwen.
 - File saves prefer direct `write_file` to avoid UI IME issues; working directory can be set from the UI (Settings) or via `work_dir` in API payload.
 - Safety layer blocks unsafe paths/keywords and requires confirmation for destructive actions.
 

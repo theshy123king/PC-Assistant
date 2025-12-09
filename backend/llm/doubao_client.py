@@ -38,6 +38,56 @@ def _is_vision(messages: Optional[List[dict]]) -> bool:
     return False
 
 
+def _normalize_content(content: Any) -> Any:
+    """
+    Normalize message content for Doubao Chat API.
+    Supports:
+    - plain string content
+    - OpenAI-style multimodal arrays: [{"type": "text", "text": ...}, {"type": "image_url", "image_url": {"url": ...}}]
+    - shorthand dicts with type/image_url
+    """
+    if isinstance(content, list):
+        normalized_items: List[Dict[str, Any]] = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "text":
+                    normalized_items.append({"type": "text", "text": str(item.get("text", ""))})
+                    continue
+                if item_type == "image_url" or item.get("image_url"):
+                    img = item.get("image_url") or item.get("url")
+                    url = None
+                    if isinstance(img, str):
+                        url = img
+                    elif isinstance(img, dict):
+                        url = img.get("url") or img.get("image_url")
+                    if not url:
+                        raise RuntimeError("Invalid image_url payload for Doubao vision request")
+                    normalized_items.append({"type": "image_url", "image_url": {"url": url}})
+                    continue
+            # Fallback: coerce unknown item to text
+            normalized_items.append({"type": "text", "text": str(item)})
+        return normalized_items
+
+    if isinstance(content, dict):
+        if content.get("type") == "text":
+            return str(content.get("text", ""))
+        if content.get("type") == "image_url" or content.get("image_url"):
+            img = content.get("image_url") or content.get("url")
+            url = None
+            if isinstance(img, str):
+                url = img
+            elif isinstance(img, dict):
+                url = img.get("url") or img.get("image_url")
+            if not url:
+                raise RuntimeError("Invalid image_url payload for Doubao vision request")
+            return [{"type": "image_url", "image_url": {"url": url}}]
+
+    if not isinstance(content, str):
+        return str(content)
+    return content
+
+
 def _build_payload(
     prompt: str,
     model: str,
@@ -49,13 +99,7 @@ def _build_payload(
     normalized_messages: List[Dict[str, Any]] = []
     for msg in payload_messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list) or (isinstance(content, dict) and content.get("image_url")):
-            # Vision messages not supported for chat/completions.
-            raise RuntimeError("Vision content detected: use Responses API for vision models.")
-        # For safety, coerce non-string content to string.
-        if not isinstance(content, str):
-            content = str(content)
+        content = _normalize_content(msg.get("content", ""))
         normalized_messages.append({"role": role, "content": content})
 
     temperature_env = os.getenv("DOUBAO_TEMPERATURE")
@@ -115,15 +159,24 @@ def call_doubao(
     base_env = os.getenv("DOUBAO_BASE_URL")
     base_candidates = [base_env] if base_env else []
     base_candidates += [u for u in [DEFAULT_DOUBAO_BASE_URL] if u not in base_candidates]
-    model_name = (
-        model
-        or os.getenv("DOUBAO_MODEL")
-        or os.getenv("DOUBAO_TEXT_MODEL")
-        or DEFAULT_DOUBAO_TEXT_MODEL
-    )
+    is_vision = _is_vision(messages)
+    if model:
+        model_name = _validate_model_id(model)
+    elif is_vision:
+        model_name = (
+            os.getenv("DOUBAO_VISION_MODEL")
+            or os.getenv("DOUBAO_MODEL")
+            or DEFAULT_DOUBAO_VISION_MODEL
+        )
+    else:
+        model_name = (
+            os.getenv("DOUBAO_MODEL")
+            or os.getenv("DOUBAO_TEXT_MODEL")
+            or DEFAULT_DOUBAO_TEXT_MODEL
+        )
     model_name = _validate_model_id(model_name)
-    if _is_vision(messages) or ("vision" in model_name.lower()):
-        raise RuntimeError("Vision messages are not supported by chat/completions; use Responses API.")
+    if is_vision and not model_name:
+        raise RuntimeError("Vision request detected but no vision-capable DOUBAO_MODEL set")
 
     timeout_sec = float(os.getenv("DOUBAO_TIMEOUT", DEFAULT_TIMEOUT))
     max_retries = int(os.getenv("DOUBAO_RETRIES", DEFAULT_RETRIES))
@@ -138,7 +191,8 @@ def call_doubao(
         for base_url in base_candidates:
             try:
                 with httpx.Client(headers=headers) as client:
-                    response = _send_chat_completion(client, base_url, payload, timeout_sec)
+                    sender = _send_vision_completion if is_vision else _send_chat_completion
+                    response = sender(client, base_url, payload, timeout_sec)
                     response.raise_for_status()
                 data = response.json()
                 return data["choices"][0]["message"]["content"]

@@ -3329,7 +3329,9 @@ def _call_planner_with_fallback(
         order = [normalized, "deepseek", "doubao", "qwen"]
     seen = set()
     last_exc: Exception | None = None
-    messages = prompt_bundle.vision_messages or prompt_bundle.messages
+    doubao_can_use_vision = bool(
+        os.getenv("DOUBAO_VISION_MODEL") or (os.getenv("DOUBAO_MODEL") and "vision" in os.getenv("DOUBAO_MODEL").lower())
+    )
     for name in order:
         if name in seen:
             continue
@@ -3339,7 +3341,15 @@ def _call_planner_with_fallback(
         if not _provider_available(name):
             continue
         try:
-            return name, mapping[name](prompt_bundle.prompt_text, messages)
+            if name == "doubao":
+                selected_messages = (
+                    prompt_bundle.vision_messages
+                    if (prompt_bundle.vision_messages and doubao_can_use_vision)
+                    else prompt_bundle.messages
+                )
+            else:
+                selected_messages = prompt_bundle.vision_messages or prompt_bundle.messages
+            return name, mapping[name](prompt_bundle.prompt_text, selected_messages)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             continue
