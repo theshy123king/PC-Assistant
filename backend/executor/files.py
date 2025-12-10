@@ -267,6 +267,53 @@ def copy_file(params: Dict[str, Any]) -> Dict[str, Any]:
         return _error(action, f"failed to copy file: {exc}")
 
 
+def read_file(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Read a text file with safety checks and size limits."""
+    action = "read_file"
+    params = params or {}
+    base_dir = params.get("base_dir")
+    path = _resolve_path(params.get("path"), base_dir)
+    if not path or not isinstance(path, str):
+        return _error(action, "'path' is required")
+    if not os.path.exists(path):
+        return _error(action, f"path does not exist '{path}'")
+    if not os.path.isfile(path):
+        return _error(action, f"path is not a file '{path}'")
+    if not _is_path_safe(path):
+        return _error(action, "path is not allowed")
+
+    max_bytes = params.get("max_bytes") or 100_000
+    try:
+        max_bytes_int = int(max_bytes)
+        if max_bytes_int < 1_000:
+            max_bytes_int = 1_000
+        if max_bytes_int > 5_000_000:
+            max_bytes_int = 5_000_000
+    except Exception:
+        max_bytes_int = 100_000
+
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes_int + 1)
+        truncated = len(data) > max_bytes_int
+        if truncated:
+            data = data[:max_bytes_int]
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError:
+            content = data.decode("utf-8", errors="replace")
+        return _success(
+            action,
+            path=_abs(path),
+            size=size,
+            truncated=truncated,
+            content=content,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(action, f"failed to read file: {exc}")
+
+
 def write_file(params: Dict[str, Any]) -> Dict[str, Any]:
     """Create or overwrite a file with given content after safety checks."""
     action = "write_file"

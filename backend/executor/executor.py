@@ -99,6 +99,22 @@ ALLOWED_ROOTS = [
     )
     if str(root).strip()
 ]
+
+
+def _add_allowed_root(path: str) -> None:
+    """Append an allowed root if not already covered."""
+    try:
+        resolved = os.path.abspath(path)
+    except Exception:
+        return
+    for root in ALLOWED_ROOTS:
+        try:
+            common = os.path.commonpath([resolved, root])
+            if common == root:
+                return
+        except Exception:
+            continue
+    ALLOWED_ROOTS.append(resolved)
 UNSAFE_KEYWORDS = [
     "format c",
     "rm -rf",
@@ -1472,7 +1488,7 @@ def handle_read_file(step: ActionStep) -> str:
     path = (step.params or {}).get("path")
     if not path or not isinstance(path, str):
         return "error: 'path' param is required"
-    return f"stub: read_file at '{path}' not implemented yet"
+    return files.read_file(step.params)
 
 
 def handle_write_file(step: ActionStep) -> str:
@@ -3559,6 +3575,7 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
     """
     action = step.action
     params = step.params or {}
+    base_dir = params.get("base_dir")
 
     def _unsafe(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"safe": False, "code": code, "message": message}
@@ -3572,20 +3589,26 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
             return _unsafe("confirm_required", "delete_file requires confirm=True", {"action": action})
 
     file_paths: List[str] = []
+
+    def _resolve_file_path(raw: Any) -> Optional[str]:
+        if not isinstance(raw, str):
+            return None
+        return files._resolve_path(raw, base_dir)
+
     if action in {"list_files", "delete_file", "read_file", "write_file"}:
-        path = params.get("path")
-        if isinstance(path, str):
+        path = _resolve_file_path(params.get("path"))
+        if path:
             file_paths.append(path)
     if action in {"move_file", "copy_file"}:
-        src = params.get("source")
-        dest = params.get("destination_dir") or params.get("destination")
-        if isinstance(src, str):
+        src = _resolve_file_path(params.get("source"))
+        dest = _resolve_file_path(params.get("destination_dir") or params.get("destination"))
+        if src:
             file_paths.append(src)
-        if isinstance(dest, str):
+        if dest:
             file_paths.append(dest)
     if action == "rename_file":
-        src = params.get("source")
-        if isinstance(src, str):
+        src = _resolve_file_path(params.get("source"))
+        if src:
             file_paths.append(src)
 
     for path in file_paths:
@@ -3771,6 +3794,9 @@ def run_steps(
             context = TaskContext(work_dir=work_dir)
         except Exception:
             context = None
+
+    if work_dir:
+        _add_allowed_root(work_dir)
     elif work_dir and getattr(context, "work_dir", None) is None:
         try:
             context.work_dir = work_dir

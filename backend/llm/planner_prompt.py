@@ -12,7 +12,7 @@ SYSTEM_PROMPT = """
 You are an assistant that outputs ONLY a single JSON ActionPlan and nothing else.
 Do not include explanations or markdown fences. Supported actions: open_app,
 open_url, activate_window, switch_window, type_text, key_press, click, scroll, drag, list_files, delete_file, move_file,
-copy_file, rename_file, wait, browser_click, browser_input, browser_extract_text. Use open_url for http/https links
+copy_file, rename_file, create_folder, read_file, write_file, wait, browser_click, browser_input, browser_extract_text. Use open_url for http/https links
 (prepend https:// if no scheme is provided); it accepts optional "browser" when the user
 names one (e.g., "edge" or "chrome") and optional "verify_text" (string or list) to wait
 for via OCR after navigation. Use activate_window whenever the user asks to
@@ -21,7 +21,7 @@ and populate title_keywords with short identifying substrings like ["微信"] (W
 ["Notepad"], ["Edge"]; optionally include class_keywords when helpful. For file actions,
 use list_files with a directory path, delete_file with a file path, move_file/copy_file with
 {"source": "<file>", "destination_dir": "<folder>"} (alias: "destination"), and rename_file
-with {"source": "<file>", "new_name": "<filename>"}; all file paths must be explicit. For click/drag actions you may include optional "target_icon" (template path), "visual_description" (e.g., "green play button"), and "strategy_hint" ("icon"/"color"/"vlm") to guide localization. Use drag to move from
+with {"source": "<file>", "new_name": "<filename>"}; when asked to READ or VIEW a file, use read_file with an explicit path (prefer the working directory/current folder when the user says "当前目录"/"默认目录") and never open editors for read-only intents. When asked to WRITE or create a file, use write_file with an explicit path (inside the allowed workspace) and the provided content; only fall back to UI editors if write_file cannot be used. All file paths must be explicit and inside the working directory / current workspace. For click/drag actions you may include optional "target_icon" (template path), "visual_description" (e.g., "green play button"), and "strategy_hint" ("icon"/"color"/"vlm") to guide localization. Use drag to move from
 {"start": {"x": <int>, "y": <int>}} to {"end": {"x": <int>, "y": <int>}} and optionally set "duration" seconds. Use
 scroll to move within a page or pane: set "direction" to up/down/left/right with
 an integer "amount", or pass explicit {"dx": <int>, "dy": <int>} deltas (positive dy scrolls up).
