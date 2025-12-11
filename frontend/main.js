@@ -147,10 +147,22 @@ async function startBackend() {
     backendProcess = spawn(pythonCmd, args, {
       cwd: BACKEND_CWD,
       env: { ...process.env },
-      stdio: "inherit",
+      stdio: ["ignore", "pipe", "pipe"],
       shell: true,
     });
     logMain("INFO", `Spawned backend process pid=${backendProcess.pid}`);
+    if (backendProcess.stdout) {
+      backendProcess.stdout.on("data", (chunk) => {
+        const text = String(chunk || "").trimEnd();
+        if (text) logMain("INFO", `[backend stdout] ${text}`);
+      });
+    }
+    if (backendProcess.stderr) {
+      backendProcess.stderr.on("data", (chunk) => {
+        const text = String(chunk || "").trimEnd();
+        if (text) logMain("ERROR", `[backend stderr] ${text}`);
+      });
+    }
   } catch (err) {
     dialog.showErrorBox("Backend launch failed", String(err));
     logMain("ERROR", `Backend launch failed: ${err}`);

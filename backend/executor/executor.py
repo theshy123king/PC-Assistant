@@ -1185,6 +1185,10 @@ def handle_open_file(step: ActionStep) -> Dict[str, Any]:
     return files.open_file(step.params)
 
 
+def handle_create_folder(step: ActionStep) -> Dict[str, Any]:
+    return files.create_folder(step.params)
+
+
 def handle_wait(step: ActionStep) -> str:
     seconds = (step.params or {}).get("seconds", 0)
     try:
@@ -1482,10 +1486,7 @@ def handle_copy_file(step: ActionStep) -> Dict[str, Any]:
 
 
 def handle_create_folder(step: ActionStep) -> str:
-    path = (step.params or {}).get("path")
-    if not path or not isinstance(path, str):
-        return "error: 'path' param is required"
-    return f"stub: create_folder at '{path}' not implemented yet"
+    return files.create_folder(step.params)
 
 
 def handle_read_file(step: ActionStep) -> str:

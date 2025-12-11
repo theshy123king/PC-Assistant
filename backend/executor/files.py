@@ -181,6 +181,27 @@ def rename_file(params: Dict[str, Any]) -> Dict[str, Any]:
         return _error(action, f"failed to rename file: {exc}")
 
 
+def create_folder(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a directory after safety checks; idempotent if already exists."""
+    action = "create_folder"
+    params = params or {}
+    base_dir = params.get("base_dir")
+    path = _resolve_path(params.get("path") or params.get("name"), base_dir)
+    if not path or not isinstance(path, str):
+        return _error(action, "'path' is required")
+    if not _is_path_safe(path):
+        return _error(action, "path is not allowed")
+    try:
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                return _error(action, f"path exists and is a file '{path}'")
+            return _success(action, path=_abs(path), created=False, exists=True)
+        os.makedirs(path, exist_ok=True)
+        return _success(action, path=_abs(path), created=True)
+    except Exception as exc:  # noqa: BLE001
+        return _error(action, f"failed to create folder: {exc}")
+
+
 def move_file(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Move a file into a destination directory after safety checks.

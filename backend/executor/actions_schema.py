@@ -137,9 +137,38 @@ class DeleteFileAction(BaseModel):
         description="Explicit confirmation for destructive delete operations.",
     )
 
+    @model_validator(mode="before")
+    def _normalize_path(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "path" not in data:
+            for alias in ("file", "file_path", "filepath"):
+                if alias in data:
+                    data = {**data, "path": data.get(alias)}
+                    break
+        return data
+
     @model_validator(mode="after")
     def _require_path(self) -> "DeleteFileAction":
         if not self.path:
+            raise ValueError("'path' is required")
+        return self
+
+
+class CreateFolderAction(BaseModel):
+    """Create a folder; accepts either a full path or a name (resolved via base_dir)."""
+
+    path: Optional[str] = None
+    name: Optional[str] = None
+
+    @model_validator(mode="before")
+    def _normalize(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("path") and data.get("name"):
+                data = {**data, "path": data["name"]}
+        return data
+
+    @model_validator(mode="after")
+    def _require_path(self) -> "CreateFolderAction":
+        if not (self.path or "").strip():
             raise ValueError("'path' is required")
         return self
 
@@ -304,6 +333,8 @@ class ActionStep(BaseModel):
                 validated_params.update(WriteFileAction.model_validate(params).model_dump())
             elif self.action == "open_file":
                 validated_params.update(ListFilesAction.model_validate(params).model_dump())
+            elif self.action == "create_folder":
+                validated_params.update(CreateFolderAction.model_validate(params).model_dump())
             elif self.action == "drag":
                 validated_params.update(DragAction.model_validate(params).model_dump())
             elif self.action in {"click", "right_click", "double_click"}:

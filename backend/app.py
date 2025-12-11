@@ -2,6 +2,7 @@ import base64
 import json
 import asyncio
 import os
+import urllib.parse
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -136,6 +137,86 @@ def _maybe_rewrite_open_file(user_text: str, plan_data: dict) -> dict:
         if isinstance(step, dict) and step.get("action") == "read_file":
             step["action"] = "open_file"
     plan_data["steps"] = steps
+    return plan_data
+
+
+def _normalize_workspace_paths(plan_data: dict, work_dir: str | None) -> dict:
+    """Normalize LLM-produced path placeholders like 'current_directory' to '.' so base_dir can apply."""
+    if not plan_data or not isinstance(plan_data, dict):
+        return plan_data
+    steps = plan_data.get("steps")
+    if not isinstance(steps, list):
+        return plan_data
+    tokens = {"current_directory", "current dir", "current folder", "workspace", ".", "./", ""}
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        params = step.get("params")
+        if not isinstance(params, dict):
+            continue
+        for key in ("path", "destination_dir", "destination", "source"):
+            raw = params.get(key)
+            if isinstance(raw, str) and raw.strip().lower() in tokens:
+                params[key] = "."
+        step["params"] = params
+    plan_data["steps"] = steps
+    return plan_data
+
+
+def _ensure_delete_confirm(plan_data: dict) -> dict:
+    """Safety helper: require confirm=True for delete_file; auto-inject if missing."""
+    if not plan_data or not isinstance(plan_data, dict):
+        return plan_data
+    steps = plan_data.get("steps")
+    if not isinstance(steps, list):
+        return plan_data
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if step.get("action") == "delete_file":
+            params = step.get("params") or {}
+            if "confirm" not in params:
+                params["confirm"] = True
+            step["params"] = params
+    plan_data["steps"] = steps
+    return plan_data
+
+
+def _maybe_rewrite_web_search(user_text: str, plan_data: dict) -> dict:
+    """
+    If the plan tries to click a search box and type a query in a browser,
+    rewrite to a direct search URL to improve reliability.
+    """
+    if not plan_data or not isinstance(plan_data, dict):
+        return plan_data
+    steps = plan_data.get("steps")
+    if not isinstance(steps, list):
+        return plan_data
+
+    text_lower = (user_text or "").lower()
+    search_hints = ["搜索框", "搜索", "search box", "search field"]
+    if not any(h in text_lower for h in search_hints):
+        return plan_data
+
+    query = None
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if step.get("action") == "browser_input":
+            params = step.get("params") or {}
+            val = params.get("value")
+            if isinstance(val, str) and val.strip():
+                query = val.strip()
+                break
+    if not query:
+        return plan_data
+
+    encoded = urllib.parse.quote_plus(query)
+    url = f"https://www.bing.com/search?q={encoded}"
+    new_steps = [
+        {"action": "open_url", "params": {"url": url, "browser": "edge", "verify_text": query}},
+    ]
+    plan_data["steps"] = new_steps
     return plan_data
 
 
@@ -389,6 +470,9 @@ async def ai_plan(payload: AIQueryRequest):
     plan_dict = parsed.model_dump()
     plan_dict = _maybe_enforce_open_app(payload.text, plan_dict)
     plan_dict = _maybe_rewrite_open_file(payload.text, plan_dict)
+    plan_dict = _normalize_workspace_paths(plan_dict, work_dir)
+    plan_dict = _ensure_delete_confirm(plan_dict)
+    plan_dict = _maybe_rewrite_web_search(payload.text, plan_dict)
     try:
         parsed = ActionPlan.model_validate(plan_dict)
     except Exception as exc:  # noqa: BLE001
@@ -604,6 +688,9 @@ async def ai_run(payload: dict):
     plan_data = parsed.model_dump()
     plan_data = _maybe_enforce_open_app(user_text, plan_data)
     plan_data = _maybe_rewrite_open_file(user_text, plan_data)
+    plan_data = _normalize_workspace_paths(plan_data, work_dir)
+    plan_data = _ensure_delete_confirm(plan_data)
+    plan_data = _maybe_rewrite_web_search(user_text, plan_data)
     context.record_plan(plan_data)
 
     # Inject manual click as the first step if provided.
@@ -805,6 +892,9 @@ async def ai_debug_run(payload: dict):
     plan_dict = parsed.model_dump()
     plan_dict = _maybe_enforce_open_app(user_text, plan_dict)
     plan_dict = _maybe_rewrite_open_file(user_text, plan_dict)
+    plan_dict = _normalize_workspace_paths(plan_dict, work_dir)
+    plan_dict = _ensure_delete_confirm(plan_dict)
+    plan_dict = _maybe_rewrite_web_search(user_text, plan_dict)
     try:
         plan_obj = ActionPlan.model_validate(plan_dict)
     except Exception as exc:  # noqa: BLE001

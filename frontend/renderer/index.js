@@ -478,6 +478,28 @@ function appendExecutionDetails(result) {
             appendAgentHTML(
                 `<div class="bubble" style="background:#F8F8F8; color:var(--text-main);"><div style="font-weight:600; margin-bottom:4px;">${escapeHTML(pathLabel)}</div>${escapeHTML(method || "已打开文件")}</div>`
             );
+        } else if (log.action === "list_files") {
+            const message = log.message || log.result || {};
+            const entries = message.entries || message.result?.entries;
+            const pathLabel = message?.path || log?.params?.path || "directory";
+            if (!Array.isArray(entries) || entries.length === 0) {
+                appendAgentHTML(
+                    `<div class="bubble" style="background:#F8F8F8; color:var(--text-main);"><div style="font-weight:600; margin-bottom:4px;">${escapeHTML(pathLabel)}</div>空目录或读取失败</div>`
+                );
+                return;
+            }
+            const lines = entries
+                .map((e) => {
+                    const isDir = e?.is_dir ? "[DIR]" : "     ";
+                    const name = e?.name || "";
+                    return `${isDir} ${name}`;
+                })
+                .slice(0, 100) // cap to avoid huge dumps
+                .map(escapeHTML)
+                .join("<br>");
+            appendAgentHTML(
+                `<div class="bubble" style="background:#F8F8F8; color:var(--text-main); white-space:pre-wrap;"><div style="font-weight:600; margin-bottom:4px;">${escapeHTML(pathLabel)}</div>${lines}</div>`
+            );
         }
     });
 

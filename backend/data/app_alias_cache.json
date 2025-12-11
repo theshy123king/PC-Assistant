@@ -1,0 +1,12 @@
+{
+  "edge": {
+    "target": "edge",
+    "path": "E:\\edge\\AS\\bin\\studio64.exe",
+    "kind": "uwp"
+  },
+  "msedge": {
+    "target": "msedge",
+    "path": "MSEdge",
+    "kind": "uwp"
+  }
+}
