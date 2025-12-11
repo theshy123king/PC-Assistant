@@ -33,6 +33,16 @@ const log = (level, message) => {
     }
 };
 
+function escapeHTML(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 // Hidden but necessary elements for backend logic compatibility
 const screenshotMain = document.getElementById("screenshotMain");
 const ocrTextEl = document.getElementById("ocrText");
@@ -444,6 +454,49 @@ function createExecutionSummaryCard(result) {
     return `<div class="bubble" style="background:#F0F7FF; color:#0F2744;">${lines.join("<br>")}</div>`;
 }
 
+function appendExecutionDetails(result) {
+    const execution = result?.execution || result;
+    const logs = Array.isArray(execution?.logs) ? execution.logs : [];
+    if (!logs.length) return;
+
+    logs.forEach((log) => {
+        if (log.status !== "success") return;
+        if (log.action === "read_file") {
+            const message = log.message || log.result || {};
+            const content = message?.content ?? message?.result?.content;
+            if (typeof content !== "string") return;
+            const truncated = message?.truncated === true || message?.result?.truncated === true;
+            const pathLabel = message?.path || log?.params?.path || "file";
+            const header = `${pathLabel}${truncated ? " (truncated)" : ""}`;
+            appendAgentHTML(
+                `<div class="bubble" style="background:#F8F8F8; color:var(--text-main); white-space:pre-wrap;"><div style="font-weight:600; margin-bottom:4px;">${escapeHTML(header)}</div>${escapeHTML(content)}</div>`
+            );
+        } else if (log.action === "open_file") {
+            const message = log.message || log.result || {};
+            const pathLabel = message?.path || log?.params?.path || "file";
+            const method = message?.method || message?.result?.method;
+            appendAgentHTML(
+                `<div class="bubble" style="background:#F8F8F8; color:var(--text-main);"><div style="font-weight:600; margin-bottom:4px;">${escapeHTML(pathLabel)}</div>${escapeHTML(method || "已打开文件")}</div>`
+            );
+        }
+    });
+
+    const errorLog = logs.find((l) => l.status === "error" || l.status === "unsafe");
+    if (errorLog) {
+        const msgObj = errorLog.message || errorLog.reason || errorLog;
+        const text =
+            (typeof msgObj === "string" && msgObj) ||
+            msgObj?.reason ||
+            msgObj?.message ||
+            msgObj?.error ||
+            JSON.stringify(msgObj);
+        const actionLabel = errorLog.action ? ` (${errorLog.action})` : "";
+        appendAgentHTML(
+            `<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">${escapeHTML(text)}${escapeHTML(actionLabel)}</div>`
+        );
+    }
+}
+
 // --- Core Logic ---
 
 async function handleRun() {
@@ -548,6 +601,8 @@ async function handleRun() {
             if (summaryCard) {
                 appendAgentHTML(summaryCard);
             }
+
+            appendExecutionDetails(result);
             
             // Show Summary / Execution Status
             if (result.execution) {

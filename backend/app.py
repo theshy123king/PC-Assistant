@@ -118,10 +118,32 @@ def _maybe_enforce_open_app(user_text: str, plan_data: dict) -> dict:
     return plan_data
 
 
+def _maybe_rewrite_open_file(user_text: str, plan_data: dict) -> dict:
+    """Convert read_file to open_file for pure 'open file' intents."""
+    if not plan_data or not isinstance(plan_data, dict):
+        return plan_data
+    steps = plan_data.get("steps")
+    if not isinstance(steps, list):
+        return plan_data
+    text_lower = (user_text or "").lower()
+    open_hints = ["打开", "open"]
+    read_hints = ["读取", "read", "内容", "查看", "look at", "read file"]
+    wants_open = any(h in text_lower for h in open_hints)
+    wants_read = any(h in text_lower for h in read_hints)
+    if not wants_open or wants_read:
+        return plan_data
+    for step in steps:
+        if isinstance(step, dict) and step.get("action") == "read_file":
+            step["action"] = "open_file"
+    plan_data["steps"] = steps
+    return plan_data
+
+
 def _call_llm_provider(provider: str, prompt_text: str, messages: list[dict] | None = None) -> tuple[str, str]:
     """Call the chosen provider; on failure, fall back to other available providers."""
     provider = (provider or "deepseek").lower()
     last_exc: Exception | None = None
+    attempted: list[str] = []
 
     def _try_call(name: str) -> str:
         if name == "deepseek":
@@ -132,24 +154,23 @@ def _call_llm_provider(provider: str, prompt_text: str, messages: list[dict] | N
             return call_qwen(prompt_text, messages)
         raise HTTPException(status_code=400, detail="Unsupported provider")
 
-    # If requested provider is available, try only that; otherwise fall back.
-    if _provider_available(provider):
-        order = [provider]
-    else:
-        order = [p for p in [provider, "deepseek", "doubao", "qwen"] if p]
-    seen = set()
+    # Always try requested provider first, then fall back to others that are configured.
+    order = []
+    for name in [provider, "deepseek", "doubao", "qwen"]:
+        if name and name not in order:
+            order.append(name)
+
     for name in order:
-        if name in seen:
-            continue
-        seen.add(name)
         if not _provider_available(name):
             continue
+        attempted.append(name)
         try:
             return name, _try_call(name)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             continue
-    raise RuntimeError(f"LLM call failed ({provider}): {last_exc or 'no providers available'}")
+    attempted_msg = f" after trying {attempted}" if attempted else ""
+    raise RuntimeError(f"LLM call failed ({provider}){attempted_msg}: {last_exc or 'no providers available'}")
 
 
 def _resolve_work_dir(raw: str | None) -> str | None:
@@ -367,6 +388,7 @@ async def ai_plan(payload: AIQueryRequest):
         }
     plan_dict = parsed.model_dump()
     plan_dict = _maybe_enforce_open_app(payload.text, plan_dict)
+    plan_dict = _maybe_rewrite_open_file(payload.text, plan_dict)
     try:
         parsed = ActionPlan.model_validate(plan_dict)
     except Exception as exc:  # noqa: BLE001
@@ -581,6 +603,7 @@ async def ai_run(payload: dict):
 
     plan_data = parsed.model_dump()
     plan_data = _maybe_enforce_open_app(user_text, plan_data)
+    plan_data = _maybe_rewrite_open_file(user_text, plan_data)
     context.record_plan(plan_data)
 
     # Inject manual click as the first step if provided.
@@ -779,11 +802,29 @@ async def ai_debug_run(payload: dict):
             "context": context.to_dict(),
             "request_id": request_id,
         }
-    context.record_plan(parsed)
+    plan_dict = parsed.model_dump()
+    plan_dict = _maybe_enforce_open_app(user_text, plan_dict)
+    plan_dict = _maybe_rewrite_open_file(user_text, plan_dict)
+    try:
+        plan_obj = ActionPlan.model_validate(plan_dict)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            "ai_debug_run.invalid_plan",
+            request_id,
+            {"provider": resolved_provider, "error": str(exc), "raw_reply": raw_reply},
+        )
+        return {
+            "error": f"invalid action plan: {exc}",
+            "provider": resolved_provider,
+            "raw": raw_reply,
+            "context": context.to_dict(),
+            "request_id": request_id,
+        }
+    context.record_plan(plan_obj)
 
     exec_result = await asyncio.to_thread(
         executor.run_steps,
-        parsed,
+        plan_obj,
         context=context,
         planner_provider=resolved_provider,
         allow_replan=allow_replan,

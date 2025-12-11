@@ -24,6 +24,7 @@ Supported actions and expected params:
 - list_files: {"path": "<dir>"}.
 - delete_file: {"path": "<file>"}.
 - create_folder: {"path": "<dir>"}.
+- open_file: {"path": "<file>"}.
 - read_file: {"path": "<file>"}.
 - write_file: {"path": "<file>", "content": "<text>"}.
 - wait: {"seconds": <float>} duration to pause.
@@ -61,6 +62,7 @@ ActionName = Literal[
     "list_files",
     "delete_file",
     "create_folder",
+    "open_file",
     "read_file",
     "write_file",
     "wait",
@@ -300,6 +302,8 @@ class ActionStep(BaseModel):
                 validated_params.update(RenameFileAction.model_validate(params).model_dump())
             elif self.action == "write_file":
                 validated_params.update(WriteFileAction.model_validate(params).model_dump())
+            elif self.action == "open_file":
+                validated_params.update(ListFilesAction.model_validate(params).model_dump())
             elif self.action == "drag":
                 validated_params.update(DragAction.model_validate(params).model_dump())
             elif self.action in {"click", "right_click", "double_click"}:

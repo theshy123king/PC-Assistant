@@ -1181,6 +1181,10 @@ def handle_rename_file(step: ActionStep) -> Dict[str, Any]:
     return files.rename_file(step.params)
 
 
+def handle_open_file(step: ActionStep) -> Dict[str, Any]:
+    return files.open_file(step.params)
+
+
 def handle_wait(step: ActionStep) -> str:
     seconds = (step.params or {}).get("seconds", 0)
     try:
@@ -3595,7 +3599,7 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
             return None
         return files._resolve_path(raw, base_dir)
 
-    if action in {"list_files", "delete_file", "read_file", "write_file"}:
+    if action in {"list_files", "delete_file", "read_file", "write_file", "open_file"}:
         path = _resolve_file_path(params.get("path"))
         if path:
             file_paths.append(path)
@@ -3686,6 +3690,7 @@ ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
     "move_file": handle_move_file,
     "copy_file": handle_copy_file,
     "rename_file": handle_rename_file,
+    "open_file": handle_open_file,
     "mouse_move": handle_mouse_move,
     "right_click": handle_right_click,
     "double_click": handle_double_click,
@@ -3715,6 +3720,7 @@ FILE_PATH_ACTIONS = {
     "list_files",
     "delete_file",
     "create_folder",
+    "open_file",
     "read_file",
     "write_file",
 }

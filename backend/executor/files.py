@@ -7,6 +7,8 @@ callers resilient and machine-readable.
 
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -265,6 +267,36 @@ def copy_file(params: Dict[str, Any]) -> Dict[str, Any]:
         )
     except Exception as exc:  # noqa: BLE001
         return _error(action, f"failed to copy file: {exc}")
+
+
+def open_file(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Open a file with the system default application after safety checks."""
+    action = "open_file"
+    params = params or {}
+    base_dir = params.get("base_dir")
+    path = _resolve_path(params.get("path"), base_dir)
+    if not path or not isinstance(path, str):
+        return _error(action, "'path' is required")
+    if not os.path.exists(path):
+        return _error(action, f"path does not exist '{path}'")
+    if not os.path.isfile(path):
+        return _error(action, f"path is not a file '{path}'")
+    if not _is_path_safe(path):
+        return _error(action, "path is not allowed")
+
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+            return _success(action, path=_abs(path), opened=True, method="os.startfile")
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        proc = subprocess.Popen(
+            [opener, path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return _success(action, path=_abs(path), opened=True, method=opener, pid=proc.pid)
+    except Exception as exc:  # noqa: BLE001
+        return _error(action, f"failed to open file: {exc}")
 
 
 def read_file(params: Dict[str, Any]) -> Dict[str, Any]:
