@@ -17,10 +17,12 @@ import shutil
 import subprocess
 import time
 import webbrowser
+import yaml
 from ctypes import wintypes
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
+from functools import lru_cache
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse
@@ -115,15 +117,6 @@ def _add_allowed_root(path: str) -> None:
         except Exception:
             continue
     ALLOWED_ROOTS.append(resolved)
-UNSAFE_KEYWORDS = [
-    "format c",
-    "rm -rf",
-    "wipe",
-    "destroy data",
-    "delete all",
-    "factory reset",
-    "shutdown system",
-]
 OCR_PREVIEW_LIMIT = 1200
 OCR_CAPTURE_ACTIONS = {
     "browser_click",
@@ -3565,11 +3558,26 @@ def _is_path_within_allowed_roots(path: str) -> bool:
 def _detect_dangerous_request(user_instruction: Optional[str]) -> Optional[str]:
     if not user_instruction:
         return None
+    policy = _load_safety_policy()
+    keywords = policy.get("danger_keywords", [])
     lowered = user_instruction.lower()
-    for term in UNSAFE_KEYWORDS:
+    for term in keywords:
         if term in lowered:
             return term
     return None
+
+
+@lru_cache(maxsize=1)
+def _load_safety_policy() -> Dict[str, Any]:
+    path = Path(__file__).resolve().parent.parent / "config" / "safety_policy.yaml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as exc:
+        print(f"Error loading safety policy: {exc}")
+        return {}
 
 
 def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
@@ -3581,6 +3589,7 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
     action = step.action
     params = step.params or {}
     base_dir = params.get("base_dir")
+    policy = _load_safety_policy()
 
     def _unsafe(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"safe": False, "code": code, "message": message}
@@ -3588,10 +3597,23 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
             payload["details"] = details
         return payload
 
-    if action == "delete_file":
-        confirmed = params.get("confirm") is True
-        if not confirmed:
-            return _unsafe("confirm_required", "delete_file requires confirm=True", {"action": action})
+    # Keyword check on any string parameter.
+    danger_keywords = policy.get("danger_keywords", []) if isinstance(policy, dict) else []
+    if danger_keywords:
+        for val in params.values():
+            try:
+                if isinstance(val, str) and any(k.lower() in val.lower() for k in danger_keywords):
+                    return _unsafe("danger_keyword", f"param contains danger keyword for action '{action}'")
+            except Exception:
+                continue
+
+    # Action level check.
+    sensitivity = {}
+    if isinstance(policy, dict):
+        sensitivity = policy.get("sensitive_actions", {}) or {}
+    level = sensitivity.get(action)
+    if level == "high" and params.get("confirm") is not True:
+        return _unsafe("confirm_required", f"{action} requires confirm=True due to high risk", {"action": action})
 
     file_paths: List[str] = []
 
@@ -3616,11 +3638,19 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
         if src:
             file_paths.append(src)
 
+    blocked_paths = policy.get("blocked_paths", []) if isinstance(policy, dict) else []
+
     for path in file_paths:
         if not _is_path_within_allowed_roots(path):
             return _unsafe("path_outside_workspace", f"path not allowed: {path}", {"path": path})
         if not files._is_path_safe(path):
             return _unsafe("path_blocked", f"path blocked by safety rules: {path}", {"path": path})
+        for blocked in blocked_paths:
+            try:
+                if os.path.abspath(path).startswith(os.path.abspath(blocked)):
+                    return _unsafe("path_blocked_policy", f"path blocked by policy: {path}", {"path": path})
+            except Exception:
+                continue
 
     return {"safe": True}
 
@@ -3748,6 +3778,21 @@ STUB_UI_ACTIONS = {
     "browser_input",
     "browser_extract_text",
     "adjust_volume",
+}
+
+INTERACTIVE_ACTIONS = {
+    "click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "drag",
+    "scroll",
+    "type_text",
+    "key_press",
+    "hotkey",
+    "browser_click",
+    "browser_input",
+    "browser_extract_text",
 }
 
 
@@ -3990,6 +4035,13 @@ def run_steps(
 
             try:
                 for attempt in range(1, step_feedback["max_attempts"] + 1):
+                    pre_fingerprint = None
+                    if context and hasattr(context, "get_ui_fingerprint"):
+                        try:
+                            pre_fingerprint = context.get_ui_fingerprint(lite_only=True)
+                        except Exception:
+                            pre_fingerprint = None
+
                     before_obs = _capture_observation(
                         step_feedback["capture_before"],
                         step_feedback["capture_before"] and step_feedback["capture_ocr"],
@@ -4003,6 +4055,13 @@ def run_steps(
                         handler_status = "error"
                     duration_ms = (perf_counter() - start) * 1000.0
                     combined_duration_ms += duration_ms
+                    post_fingerprint = None
+                    if context and hasattr(context, "get_ui_fingerprint"):
+                        try:
+                            post_fingerprint = context.get_ui_fingerprint(lite_only=True)
+                        except Exception:
+                            post_fingerprint = None
+
                     after_obs = _capture_observation(
                         step_feedback["capture_after"],
                         step_feedback["capture_after"] and step_feedback.get("run_ocr_after", step_feedback["capture_ocr"]),
@@ -4033,6 +4092,14 @@ def run_steps(
                     )
                     last_message = message
                     last_verification = verification
+
+                    if (
+                        pre_fingerprint
+                        and post_fingerprint
+                        and pre_fingerprint == post_fingerprint
+                        and step.action in INTERACTIVE_ACTIONS
+                    ):
+                        logs.append({"warning": "UI State unchanged", "fingerprint": pre_fingerprint, "step_index": idx, "action": step.action})
 
                     if verification["decision"] == "success":
                         step_status = "success"

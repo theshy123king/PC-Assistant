@@ -8,4 +8,6 @@ httpx
 dashscope
 pyautogui
 pygetwindow
+uiautomation
+PyYAML
 psutil

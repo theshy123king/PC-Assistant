@@ -7,7 +7,11 @@ metadata, and any errors for downstream analysis or replanning.
 
 from __future__ import annotations
 
+import hashlib
+import uuid
 from typing import Any, Dict, List, Optional
+
+import uiautomation as auto
 
 from backend.executor.actions_schema import ActionPlan
 
@@ -90,6 +94,67 @@ class TaskContext:
             self.summary = dict(summary)
         except Exception:
             self.summary = {"error": "failed to set summary"}
+
+    def get_ui_fingerprint(self, lite_only: bool = False) -> str:
+        """
+        Compute a lightweight UI state fingerprint (foreground window + focused control).
+        When lite_only is False, enrich with a snapshot hash of up to 50 visible children.
+        Always returns a string hash; on error returns a random token.
+        """
+        try:
+            with auto.UIAutomationInitializerInThread(debug=False):
+                fg = auto.GetForegroundControl()
+                focused = auto.GetFocusedControl()
+                parts: List[str] = []
+                if fg:
+                    try:
+                        parts.append(str(getattr(fg, "NativeWindowHandle", "")))
+                        parts.append(str(getattr(fg, "Name", "") or ""))
+                        parts.append(str(getattr(fg, "ProcessId", "") or ""))
+                    except Exception:
+                        pass
+                if focused:
+                    try:
+                        rid = getattr(focused, "RuntimeId", None)
+                        if rid:
+                            parts.append(str(rid))
+                    except Exception:
+                        pass
+                lite_hash = hashlib.md5("|".join(parts).encode("utf-8", "ignore")).hexdigest()
+                if lite_only:
+                    return lite_hash
+
+                snapshot: List[str] = []
+                try:
+                    top = fg.GetTopLevelControl() if fg else None
+                except Exception:
+                    top = None
+                if top:
+                    try:
+                        children = top.GetChildren()
+                    except Exception:
+                        children = []
+                    count = 0
+                    for child in children:
+                        if count >= 50:
+                            break
+                        try:
+                            if getattr(child, "IsOffscreen", True):
+                                continue
+                            ctype = str(getattr(child, "ControlTypeName", "") or "")
+                            name = str(getattr(child, "Name", "") or "")
+                            rect = getattr(child, "BoundingRectangle", None)
+                            bounds = ""
+                            if rect:
+                                bounds = f"{rect.left},{rect.top},{rect.right},{rect.bottom}"
+                            snapshot.append(f"{ctype}|{name}|{bounds}")
+                            count += 1
+                        except Exception:
+                            continue
+                full_hash = hashlib.md5((lite_hash + "|" + ";".join(snapshot)).encode("utf-8", "ignore")).hexdigest()
+                return full_hash
+        except Exception:
+            return f"uia_error_{uuid.uuid4().hex}"
 
     def to_dict(self) -> Dict[str, Any]:
         return {

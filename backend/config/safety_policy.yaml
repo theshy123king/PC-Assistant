@@ -1,0 +1,21 @@
+blocked_processes:
+  - "cmd.exe"
+  - "powershell.exe"
+  - "bash.exe"
+
+blocked_paths:
+  - "C:\\Windows"
+  - "C:\\Program Files"
+  - "/bin"
+  - "/usr/bin"
+
+sensitive_actions:
+  delete_file: "high"
+  send_message: "medium"
+  click: "low"
+
+danger_keywords:
+  - "format c:"
+  - "rm -rf"
+  - "mkfs"
+  - "dd if="
