@@ -34,3 +34,7 @@ logs/
 
 data/
 
+# PC-Assistant runtime caches (keep local; don't commit)
+/backend/data/
+
+code_bundle/

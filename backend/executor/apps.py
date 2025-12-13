@@ -45,6 +45,11 @@ APP_PATHS: Dict[str, str] = {
     "资源管理器": r"C:\\Windows\\explorer.exe",
 }
 
+_local_app_data = os.environ.get("LOCALAPPDATA")
+if _local_app_data:
+    _chrome_user = str(Path(_local_app_data) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    APP_PATHS.setdefault("chrome_user", _chrome_user)
+
 WECHAT_BRIDGE_APPID = r"{6D809377-6AF0-444B-8957-A3773F02200E}\\Tencent\\Weixin\\Weixin.exe"
 
 def _normalize_alias_key(value: Optional[str]) -> Optional[str]:
@@ -251,6 +256,86 @@ def _collect_roots() -> List[str]:
                 roots.append(candidate)
     return roots
 
+def _looks_like_filesystem_path(value: str) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    try:
+        if os.path.isabs(value):
+            return True
+    except Exception:
+        pass
+    lowered = value.lower()
+    # Drive-letter paths like C:\..., UNC paths, or Unix-style paths.
+    if len(lowered) >= 3 and lowered[1:3] == ":\\":
+        return True
+    if lowered.startswith("\\\\") or lowered.startswith("//"):
+        return True
+    if "/" in lowered or "\\" in lowered:
+        return True
+    return False
+
+
+def _normalize_app_target_key(raw: str) -> str:
+    """
+    Normalize common app names into stable keys to reduce LLM ambiguity.
+
+    In particular, treat "edge浏览器"/"Microsoft Edge" as "msedge" so it resolves
+    reliably to the actual browser instead of unrelated apps containing "edge".
+    """
+    key = (raw or "").strip().lower()
+    if not key:
+        return key
+
+    browser_hints = ("浏览器" in key) or ("browser" in key)
+
+    if key in {"edge", "msedge", "microsoft edge"}:
+        return "msedge"
+    if ("微软edge" in key) or ("微软 edge" in key):
+        return "msedge"
+
+    if browser_hints and ("edge" in key or "msedge" in key or "microsoft edge" in key or "微软" in key):
+        return "msedge"
+    if browser_hints and ("chrome" in key or "google chrome" in key or "谷歌" in key or "google" in key):
+        return "chrome"
+    if browser_hints and ("firefox" in key or "火狐" in key):
+        return "firefox"
+    if browser_hints and "safari" in key:
+        return "safari"
+
+    return key
+
+
+def _trusted_cached_match(target_key: str, cached_path: str, cached_kind: str) -> bool:
+    key = (target_key or "").strip().lower()
+    kind = (cached_kind or "win32").strip().lower()
+    path = str(cached_path or "")
+    if not path:
+        return False
+    path_lower = path.lower()
+    basename = os.path.basename(path_lower)
+    base_no_ext = os.path.splitext(basename)[0]
+
+    if key in {"edge", "msedge", "microsoft edge"}:
+        if kind == "win32":
+            return "msedge" in base_no_ext
+        if kind == "uwp":
+            if _looks_like_filesystem_path(path):
+                return False
+            return ("msedge" in path_lower) or ("microsoftedge" in path_lower)
+        return False
+
+    if key in {"chrome", "google chrome"}:
+        if kind == "win32":
+            return "chrome" in base_no_ext
+        if kind == "uwp":
+            if _looks_like_filesystem_path(path):
+                return False
+            return "chrome" in path_lower
+        return False
+
+    return True
+
+
 def _prefer_path_score(path: str, base_score: float, target_key: str) -> float:
     name = os.path.splitext(os.path.basename(path))[0].lower()
     penalty_keywords = ["update", "installer", "uninstall", "crash", "helper", "dbg", "launcher"]
@@ -265,6 +350,10 @@ def _prefer_path_score(path: str, base_score: float, target_key: str) -> float:
             score += 0.5
         if "launcher" in name:
             score -= 1.5
+    if target_key in {"edge", "msedge", "microsoft edge"} and name == "msedge":
+        score += 4.0
+    if target_key in {"chrome", "google chrome"} and name == "chrome":
+        score += 4.0
     return score
 
 def _search_registry(target: str, target_key: str) -> List[str]:
@@ -294,6 +383,10 @@ def _search_registry(target: str, target_key: str) -> List[str]:
 def _gather_matches(target_key: str, user_query: str, params: dict) -> Tuple[List[dict], List[str], List[dict]]:
     logs: List[dict] = []
     params = dict(params or {})
+    normalized_key = _normalize_app_target_key(target_key)
+    if normalized_key and normalized_key != target_key:
+        logs.append({"candidate": target_key, "source": "normalize_target", "normalized": normalized_key})
+        target_key = normalized_key
 
     path_entry = get_cached_path(target_key)
     cached_path_candidates: List[Tuple[float, str, str]] = []
@@ -301,8 +394,19 @@ def _gather_matches(target_key: str, user_query: str, params: dict) -> Tuple[Lis
         cached_path = path_entry.get("path")
         cached_kind = path_entry.get("kind") or "win32"
         if cached_path and (os.path.isfile(cached_path) or cached_kind in {"uwp", "bridge"}):
-            cached_path_candidates.append((6.0, cached_path, cached_kind))
-            logs.append({"candidate": target_key, "source": "path_cache", "path": cached_path, "kind": cached_kind})
+            if not _trusted_cached_match(target_key, str(cached_path), str(cached_kind)):
+                logs.append(
+                    {
+                        "candidate": target_key,
+                        "source": "path_cache_ignored",
+                        "path": cached_path,
+                        "kind": cached_kind,
+                        "reason": "untrusted_for_target",
+                    }
+                )
+            else:
+                cached_path_candidates.append((6.0, cached_path, cached_kind))
+                logs.append({"candidate": target_key, "source": "path_cache", "path": cached_path, "kind": cached_kind})
 
     cached = get_cached_alias(user_query) or get_cached_alias(target_key)
     cached_candidates: List[Tuple[float, str, str]] = []
@@ -310,11 +414,21 @@ def _gather_matches(target_key: str, user_query: str, params: dict) -> Tuple[Lis
         cached_path = cached.get("path")
         cached_kind = cached.get("kind") or "win32"
         cached_target = cached.get("target") or target_key
-        if cached_target:
-            target_key = cached_target
-        if cached_path:
+        if cached_path and _trusted_cached_match(target_key, str(cached_path), str(cached_kind)):
+            if cached_target:
+                target_key = str(cached_target).lower().strip()
             cached_candidates.append((5.0, cached_path, cached_kind))
             logs.append({"candidate": target_key, "source": "alias_cache", "path": cached_path, "kind": cached_kind})
+        else:
+            logs.append(
+                {
+                    "candidate": target_key,
+                    "source": "alias_cache_ignored",
+                    "path": cached_path,
+                    "kind": cached_kind,
+                    "reason": "untrusted_for_target",
+                }
+            )
 
     if target_key in {"notepad", "notepad.exe", "记事本"}:
         params["target"] = r"C:\\Windows\\System32\\notepad.exe"
@@ -440,7 +554,7 @@ def _build_candidate_keys(primary: str) -> List[Tuple[str, str]]:
     return ordered or [(primary_key, "primary")]
 
 def _select_best_resolution(target: str, user_query: str, params: dict) -> Tuple[Optional[dict], List[str], List[dict]]:
-    target_key = str(target).lower().strip()
+    target_key = _normalize_app_target_key(str(target))
     candidates = _build_candidate_keys(target_key)
 
     async def _run_all():
@@ -483,6 +597,12 @@ def open_app(params: dict) -> dict:
     user_query = (params or {}).get("user_query") or target
     if not target:
         return "error: 'target' param is required"
+
+    normalized_target = _normalize_app_target_key(str(target))
+    if normalized_target and normalized_target != str(target).lower().strip():
+        params = dict(params or {})
+        params["target"] = normalized_target
+        target = normalized_target
 
     resolution, search_terms, logs = _select_best_resolution(target, user_query, params)
     if not resolution or not resolution.get("matches"):

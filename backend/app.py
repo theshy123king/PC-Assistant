@@ -2,7 +2,8 @@ import base64
 import json
 import asyncio
 import os
-import urllib.parse
+import re
+from urllib.parse import parse_qs, quote_plus, urlparse, unquote
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -182,11 +183,104 @@ def _ensure_delete_confirm(plan_data: dict) -> dict:
     return plan_data
 
 
+def _clean_query(text: str) -> str:
+    """Extract core search term by truncating at common connector words."""
+    stops = [
+        " and",
+        " then",
+        " read",
+        " return",
+        " extract",
+        " 并",
+        "并",
+        " 然后",
+        "然后",
+        " 返回",
+        "返回",
+        " 查看",
+        "查看",
+        " 告诉我",
+        "告诉我",
+        " 给我",
+        "给我",
+        " 找",
+    ]
+    candidate = text or ""
+    candidate = candidate.strip().strip("'\"“”‘’").strip()
+    lower = candidate.lower()
+    cut = len(candidate)
+    for stop in stops:
+        pos = lower.find(stop)
+        if pos != -1 and pos < cut:
+            cut = pos
+    candidate = candidate[:cut]
+    return candidate.strip(" ，,。:.：;")
+
+
+def _extract_query_from_user_text(user_text: str) -> str | None:
+    """Extract a search query directly from the user instruction."""
+    if not user_text or not isinstance(user_text, str):
+        return None
+    text = user_text.strip()
+    patterns = [
+        r"(?:搜索|搜一下|搜一搜|查一下|查找|查询|找一下|找一找)\s*[:：]?\s*(.+)",
+        r"(?:search(?: for)?|find)\s*[:：]?\s*(.+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1)
+        cleaned = _clean_query(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _normalize_browser_preference(value: str | None) -> str | None:
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+
+    edge_terms = [
+        "edge",
+        "msedge",
+        "microsoft edge",
+        "微软edge",
+        "微软 edge",
+        "微软浏览器",
+    ]
+    if any(term in text for term in edge_terms):
+        return "edge"
+
+    chrome_terms = [
+        "chrome",
+        "google chrome",
+        "chrome.exe",
+        "谷歌浏览器",
+        "google浏览器",
+        "google 浏览器",
+        "chrome浏览器",
+        "chrome 浏览器",
+    ]
+    if any(term in text for term in chrome_terms) or ("谷歌" in text and "浏览器" in text):
+        return "chrome"
+
+    firefox_terms = ["firefox", "火狐"]
+    if any(term in text for term in firefox_terms):
+        return "firefox"
+
+    safari_terms = ["safari"]
+    if any(term in text for term in safari_terms):
+        return "safari"
+
+    return None
+
+
 def _maybe_rewrite_web_search(user_text: str, plan_data: dict) -> dict:
-    """
-    If the plan tries to click a search box and type a query in a browser,
-    rewrite to a direct search URL to improve reliability.
-    """
+    """Rewrite search intents into a robust open_url + visual extract flow."""
     if not plan_data or not isinstance(plan_data, dict):
         return plan_data
     steps = plan_data.get("steps")
@@ -194,30 +288,137 @@ def _maybe_rewrite_web_search(user_text: str, plan_data: dict) -> dict:
         return plan_data
 
     text_lower = (user_text or "").lower()
-    search_hints = ["搜索框", "搜索", "search box", "search field"]
+    search_hints = ["搜索", "search", "查一下", "find", "google", "bing", "baidu"]
     if not any(h in text_lower for h in search_hints):
         return plan_data
 
-    query = None
+    web_context_hints = [
+        "edge",
+        "msedge",
+        "microsoft edge",
+        "chrome",
+        "firefox",
+        "safari",
+        "浏览器",
+        "网页",
+        "bing",
+        "google",
+        "baidu",
+    ]
+    has_browser_actions = any(
+        isinstance(s, dict)
+        and s.get("action")
+        in {
+            "open_url",
+            "browser_input",
+            "browser_click",
+            "browser_extract_text",
+            "web_search",
+        }
+        for s in steps
+    )
+    mentions_web = any(h in text_lower for h in web_context_hints)
+    if not has_browser_actions and not mentions_web:
+        return plan_data
+
+    query: str | None = None
+    browser_pref: str | None = None
+
+    # 1) browser_input value
     for step in steps:
         if not isinstance(step, dict):
             continue
+        if not browser_pref and step.get("action") == "open_app":
+            params = step.get("params") or {}
+            target = params.get("target") or params.get("app")
+            browser_pref = _normalize_browser_preference(target)
         if step.get("action") == "browser_input":
             params = step.get("params") or {}
             val = params.get("value")
             if isinstance(val, str) and val.strip():
-                query = val.strip()
-                break
+                query = _clean_query(val)
+        if step.get("action") == "open_url":
+            params = step.get("params") or {}
+            b = params.get("browser")
+            if isinstance(b, str) and b.strip():
+                browser_pref = _normalize_browser_preference(b) or b.strip()
+        if query and browser_pref:
+            break
+
+    if not browser_pref:
+        browser_pref = _normalize_browser_preference(user_text)
+
+    # 2) open_url query params
+    if not query:
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if step.get("action") != "open_url":
+                continue
+            params = step.get("params") or {}
+            url_val = params.get("url")
+            if not isinstance(url_val, str):
+                continue
+            try:
+                parsed = urlparse(url_val)
+                qs = parse_qs(parsed.query)
+                raw_q = (qs.get("q") or qs.get("wd") or qs.get("text") or qs.get("query") or [None])[0]
+                if raw_q:
+                    query = _clean_query(unquote(raw_q))
+                    break
+            except Exception:
+                continue
+
+    if not query:
+        query = _extract_query_from_user_text(user_text)
+
     if not query:
         return plan_data
 
-    encoded = urllib.parse.quote_plus(query)
+    encoded = quote_plus(query)
     url = f"https://www.bing.com/search?q={encoded}"
+    browser = browser_pref or "edge"
     new_steps = [
-        {"action": "open_url", "params": {"url": url, "browser": "edge", "verify_text": query}},
+        {"action": "open_url", "params": {"url": url, "browser": browser, "verify_text": ["Results", "结果", "search results"]}},
+        {"action": "wait", "params": {"seconds": 4.0}},
+        {
+            "action": "browser_extract_text",
+            "params": {
+                "text": query,
+                "target": "第一条搜索结果标题",
+                "visual_description": "What is the title of the first main search result? Return ONLY the title text.",
+                "strategy_hint": "vlm",
+                "prefer_top_line": True,
+            },
+        },
     ]
     plan_data["steps"] = new_steps
+    plan_data["_rewrite_reason"] = "visual_web_search_v3_cleaned"
     return plan_data
+
+
+def _summarize_logs(logs: list[dict] | None, limit: int = 10) -> list[dict]:
+    """Lightweight step-level log summary for persistent logging."""
+    if not isinstance(logs, list):
+        return []
+    summary: list[dict] = []
+    for entry in logs[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("message")
+        if isinstance(msg, dict):
+            msg = sanitize_payload(msg, keep_full={"text", "content"})
+        elif msg is not None:
+            msg = str(msg)
+        summary.append(
+            {
+                "step_index": entry.get("step_index"),
+                "action": entry.get("action"),
+                "status": entry.get("status"),
+                "message": msg,
+            }
+        )
+    return summary
 
 
 def _call_llm_provider(provider: str, prompt_text: str, messages: list[dict] | None = None) -> tuple[str, str]:
@@ -751,6 +952,7 @@ async def ai_run(payload: dict):
             "provider": resolved_provider,
             "plan": summarize_plan(plan.model_dump()),
             "execution": summarize_execution(exec_result),
+            "step_logs": _summarize_logs(exec_result.get("logs")),
             "work_dir": work_dir,
         },
     )
@@ -935,6 +1137,7 @@ async def ai_debug_run(payload: dict):
             "provider": resolved_provider,
             "plan": summarize_plan(getattr(parsed, "model_dump", lambda: {})() if hasattr(parsed, "model_dump") else context.action_plan),
             "execution": summarize_execution(exec_result),
+            "step_logs": _summarize_logs(exec_result.get("logs")),
             "work_dir": work_dir,
         },
     )
