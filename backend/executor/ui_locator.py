@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from backend.vision.ocr import OcrBox
 from backend.vision.icon_locator import locate_icons
 from backend.vision.vlm_locator import locate_with_vlm
+from backend.vision.uia_locator import find_element as find_uia_element
 
 Box = Any
 Center = Tuple[float, float]
@@ -243,6 +244,28 @@ def locate_target(
     Unified locator that tries OCR text, then icon templates, then VLM.
     """
     logs: List[str] = []
+    # Step 1: UIA fast path
+    try:
+        uia_result = find_uia_element(query)
+    except Exception:
+        uia_result = None
+    if uia_result:
+        logs.append(f"method:uia:{uia_result.get('name')}")
+        return {
+            "status": "success",
+            "method": "uia",
+            "candidate": {
+                "text": uia_result.get("name"),
+                "match_type": "exact",
+                "source": uia_result,
+            },
+            "center": uia_result.get("center"),
+            "bounds": uia_result.get("bbox"),
+            "score": 1.0,
+            "log": logs,
+        }
+    logs.append("uia:no_match")
+
     candidates = rank_text_candidates(query, boxes, high_threshold=high_threshold, medium_threshold=medium_threshold)
     if candidates:
         best = candidates[0]
