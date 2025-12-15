@@ -460,7 +460,29 @@ function appendExecutionDetails(result) {
     if (!logs.length) return;
 
     logs.forEach((log) => {
+        // 1) UI state warnings
+        if (log.warning) {
+            appendAgentHTML(
+                `<div class="bubble" style="color:#856404; background:#fff3cd; border:1px solid #ffeeba;">⚠️ <strong>无效操作检测</strong><br>界面状态未发生变化 (UI State Unchanged)</div>`
+            );
+            // Continue to allow other info in the same log (if any)
+        }
+
         if (log.status !== "success") return;
+
+        // 2) Click success feedback
+        if (log.action === "click") {
+            const method =
+                log.method ||
+                (typeof log.message === "object" && log.message ? log.message.method : "") ||
+                "Unknown";
+            appendAgentHTML(
+                `<div class="bubble" style="color:#155724; background:#d4edda; border:1px solid #c3e6cb;">🖱️ 点击执行成功 <span style="font-size:0.85em; opacity:0.8; margin-left:4px;">(引擎: ${escapeHTML(
+                    method
+                )})</span></div>`
+            );
+        }
+
         if (log.action === "read_file") {
             const message = log.message || log.result || {};
             const content = message?.content ?? message?.result?.content;

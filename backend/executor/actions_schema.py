@@ -28,6 +28,7 @@ Supported actions and expected params:
 - read_file: {"path": "<file>"}.
 - write_file: {"path": "<file>", "content": "<text>"}.
 - wait: {"seconds": <float>} duration to pause.
+- wait_until: {"condition": "ui_stable"|"element_exists"|"text_exists"|"window_exists", "target": "<text or element name>", "timeout": 10.0}
 - adjust_volume: {"level": <0-100>} or {"delta": <int>}.
 - click_text: {"query": "<text to click>", "boxes": [...]}.
 - browser_click: {"text": "<label to click>", "variants": ["Alt"], "button": "left"}.
@@ -66,6 +67,7 @@ ActionName = Literal[
     "read_file",
     "write_file",
     "wait",
+    "wait_until",
     "adjust_volume",
     "click_text",
     "browser_click",
@@ -297,6 +299,33 @@ class ClickAction(BaseModel):
             raise ValueError("click requires x/y or a target/visual hint")
         return self
 
+
+class WaitUntilAction(BaseModel):
+    """Wait for a UI condition instead of fixed sleeps."""
+
+    condition: Literal["element_exists", "text_exists", "ui_stable", "window_exists"]
+    target: Optional[str] = None
+    timeout: float = 10.0
+    poll_interval: float = 0.25
+    stability_duration: float = 1.0
+    stable_samples: int = 3
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WaitUntilAction":
+        needs_target = self.condition in {"element_exists", "text_exists", "window_exists"}
+        if needs_target and not (self.target or "").strip():
+            raise ValueError("'target' is required for this condition")
+        if self.poll_interval <= 0:
+            raise ValueError("'poll_interval' must be positive")
+        if self.timeout <= 0:
+            raise ValueError("'timeout' must be positive")
+        if self.stability_duration <= 0:
+            raise ValueError("'stability_duration' must be positive")
+        if self.stable_samples < 1:
+            raise ValueError("'stable_samples' must be >= 1")
+        return self
+
+
 class ActionStep(BaseModel):
     """One executable action with provider-specific params."""
 
@@ -339,6 +368,8 @@ class ActionStep(BaseModel):
                 validated_params.update(DragAction.model_validate(params).model_dump())
             elif self.action in {"click", "right_click", "double_click"}:
                 validated_params.update(ClickAction.model_validate(params).model_dump())
+            elif self.action == "wait_until":
+                validated_params.update(WaitUntilAction.model_validate(params).model_dump())
         except ValidationError as exc:  # noqa: BLE001
             raise ValueError(f"invalid {self.action} params: {exc}") from exc
         self.params = validated_params

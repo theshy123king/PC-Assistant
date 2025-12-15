@@ -62,11 +62,16 @@ Required JSON structure:
   ]
 }
 Ensure the JSON is valid and includes only supported actions.
+For UI elements that may have localized names (e.g., menus like "File"/"文件", buttons like "Save"/"保存"), ALWAYS populate the "variants" parameter with both English and Chinese terms to ensure UIA/OCR matching. Example: params={'text': '文件', 'variants': ['File', 'Menu']}.
+Check the "Currently open windows" list. If a matching window exists (fuzzy match), use activate_window instead of open_app.
 """.strip()
 
 USER_TEMPLATE = """
 User request:
 {user_text}
+
+Currently open windows:
+{open_windows}
 
 OCR extracted text:
 {ocr_text}
@@ -82,6 +87,9 @@ Recent step summaries (if any):
 
 Failure details / replanning hints:
 {failure_info}
+
+Currently open windows (titles):
+{open_windows}
 
 If OCR is empty, ignore it. Return ONLY a valid JSON ActionPlan. No extra text.
 """.strip()
@@ -103,6 +111,7 @@ def _build_user_content(
     screenshot_meta: Optional[dict],
     recent_steps: Optional[str],
     failure_info: Optional[str],
+    open_windows: str = "",
 ) -> Dict[str, str]:
     width = (
         screenshot_meta.get("width")
@@ -125,6 +134,7 @@ def _build_user_content(
         screenshot_resolution=screenshot_resolution,
         recent_steps=recent_steps or "(none)",
         failure_info=failure_info or "(none)",
+        open_windows=open_windows or "(none)",
     )
     return {"system": SYSTEM_PROMPT, "user": user_content}
 
@@ -137,6 +147,7 @@ def format_prompt(
     image_base64: Optional[str] = None,
     recent_steps: Optional[str] = None,
     failure_info: Optional[str] = None,
+    open_windows: str = "",
 ) -> PromptBundle:
     """
     Build chat messages for planning. Returns both text-only and optional vision messages.
@@ -148,6 +159,7 @@ def format_prompt(
         screenshot_meta,
         recent_steps=recent_steps,
         failure_info=failure_info,
+        open_windows=open_windows,
     )
 
     text_messages = [

@@ -8,12 +8,13 @@ Provides:
 """
 
 import difflib
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from backend.vision.ocr import OcrBox
 from backend.vision.icon_locator import locate_icons
 from backend.vision.vlm_locator import locate_with_vlm
-from backend.vision.uia_locator import find_element as find_uia_element
+from backend.vision.uia_locator import MatchPolicy, find_element as find_uia_element
 
 Box = Any
 Center = Tuple[float, float]
@@ -239,24 +240,30 @@ def locate_target(
     vlm_provider: str = "deepseek",
     high_threshold: float = 0.9,
     medium_threshold: float = 0.75,
+    match_policy: Union[MatchPolicy, str] = MatchPolicy.HYBRID,
 ) -> Dict[str, Any]:
     """
     Unified locator that tries OCR text, then icon templates, then VLM.
     """
     logs: List[str] = []
+    variants_info = [query] if isinstance(query, str) else []
+    print(f"[LOCATOR] Locating: '{query}' with variants: {variants_info}")
     # Step 1: UIA fast path
+    t0 = time.perf_counter()
     try:
-        uia_result = find_uia_element(query)
+        uia_result = find_uia_element(query, policy=match_policy)
     except Exception:
         uia_result = None
     if uia_result:
         logs.append(f"method:uia:{uia_result.get('name')}")
+        print(f"[PERF] UIA search took {(time.perf_counter() - t0)*1000:.1f}ms")
         return {
             "status": "success",
             "method": "uia",
             "candidate": {
                 "text": uia_result.get("name"),
                 "match_type": "exact",
+                "kind": uia_result.get("kind"),
                 "source": uia_result,
             },
             "center": uia_result.get("center"),
@@ -265,12 +272,22 @@ def locate_target(
             "log": logs,
         }
     logs.append("uia:no_match")
+    print(f"[LOCATOR] UIA failed for '{query}'")
+    print(f"[PERF] UIA search took {(time.perf_counter() - t0)*1000:.1f}ms")
 
+    t1 = time.perf_counter()
     candidates = rank_text_candidates(query, boxes, high_threshold=high_threshold, medium_threshold=medium_threshold)
+    if candidates:
+        preview = [
+            {"text": c.get("text"), "conf": c.get("conf"), "score": c.get("score")}
+            for c in candidates[:3]
+        ]
+        print(f"[DEBUG] OCR Candidates: {preview}")
     if candidates:
         best = candidates[0]
         if best["high_enough"] or best["medium_enough"]:
             logs.append("method:ocr")
+            print(f"[PERF] OCR search took {(time.perf_counter() - t1)*1000:.1f}ms")
             return {
                 "status": "success",
                 "method": "ocr",
@@ -281,12 +298,15 @@ def locate_target(
                 "log": logs,
             }
     logs.append("ocr:no_match")
+    print(f"[PERF] OCR search took {(time.perf_counter() - t1)*1000:.1f}ms")
 
     if image_path and icon_templates:
+        t2 = time.perf_counter()
         matches = locate_icons(image_path, icon_templates)
         if matches:
             best = matches[0]
             logs.append(f"method:icon:{best.get('name')}")
+            print(f"[PERF] Icon search took {(time.perf_counter() - t2)*1000:.1f}ms")
             return {
                 "status": "success",
                 "method": "icon",
@@ -297,12 +317,15 @@ def locate_target(
                 "log": logs,
             }
         logs.append("icon:no_match")
+        print(f"[PERF] Icon search took {(time.perf_counter() - t2)*1000:.1f}ms")
 
     if image_base64 and vlm_call:
+        t3 = time.perf_counter()
         vlm_result = locate_with_vlm(query, image_base64, vlm_call, provider_name=vlm_provider)
         if vlm_result.get("status") == "success":
             top = vlm_result.get("top") or {}
             logs.append("method:vlm")
+            print(f"[PERF] VLM search took {(time.perf_counter() - t3)*1000:.1f}ms")
             return {
                 "status": "success",
                 "method": "vlm",
@@ -314,6 +337,7 @@ def locate_target(
                 "log": logs,
             }
         logs.append(f"vlm:{vlm_result.get('reason', 'failed')}")
+        print(f"[PERF] VLM search took {(time.perf_counter() - t3)*1000:.1f}ms")
 
     return {
         "status": "error",

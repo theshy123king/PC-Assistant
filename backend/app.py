@@ -19,6 +19,10 @@ from backend.llm.action_parser import parse_action_plan
 from backend.llm.deepseek_client import call_deepseek
 from backend.llm.doubao_client import call_doubao
 from backend.llm.planner_prompt import PromptBundle, format_prompt
+try:
+    import pygetwindow as gw
+except Exception:
+    gw = None
 from backend.llm.qwen_client import call_qwen
 from backend.llm.test_planner import build_test_plan
 from backend.vision.ocr import run_ocr, run_ocr_with_boxes
@@ -469,6 +473,18 @@ def _resolve_work_dir(raw: str | None) -> str | None:
     return None
 
 
+def _get_open_windows_summary() -> str:
+    if not gw:
+        return "(unavailable)"
+    try:
+        titles = [t for t in gw.getAllTitles() if t and str(t).strip()]
+        if not titles:
+            return "(none)"
+        return ", ".join(titles[:50])
+    except Exception:
+        return "(unavailable)"
+
+
 @app.get("/")
 async def read_root():
     return {"message": "backend running"}
@@ -523,6 +539,7 @@ async def ai_plan(payload: AIQueryRequest):
     request_id = generate_request_id()
     context = TaskContext(user_instruction=payload.text)
     provider = (payload.provider or "deepseek").lower()
+    work_dir = None
 
     log_event(
         "ai_plan.start",
@@ -617,7 +634,10 @@ async def ai_plan(payload: AIQueryRequest):
         }
 
     prompt: PromptBundle = format_prompt(
-        payload.text, ocr_text="", image_base64=payload.screenshot_base64
+        payload.text,
+        ocr_text="",
+        image_base64=payload.screenshot_base64,
+        open_windows=_get_open_windows_summary(),
     )
     if provider == "deepseek":
         llm_messages = prompt.messages
@@ -784,6 +804,8 @@ async def ai_run(payload: dict):
         )
         return {"error": "user_text is required", "provider": provider, "request_id": request_id}
 
+    open_windows = _get_open_windows_summary()
+
     cached_plan = _cached_open_plan(user_text)
     if cached_plan:
         if dry_run:
@@ -837,6 +859,7 @@ async def ai_run(payload: dict):
         manual_click=manual_click,
         screenshot_meta=screenshot_meta,
         image_base64=screenshot_base64,
+        open_windows=open_windows,
     )
     if provider == "deepseek":
         llm_messages = prompt.messages
@@ -1021,6 +1044,8 @@ async def ai_debug_run(payload: dict):
         )
         return {"error": "user_text is required", "provider": provider, "request_id": request_id}
 
+    open_windows = _get_open_windows_summary()
+
     cached_plan = _cached_open_plan(user_text)
     if cached_plan:
         exec_result = await asyncio.to_thread(
@@ -1044,6 +1069,7 @@ async def ai_debug_run(payload: dict):
         manual_click=manual_click,
         screenshot_meta=screenshot_meta,
         image_base64=screenshot_base64,
+        open_windows=open_windows,
     )
     if provider == "deepseek":
         llm_messages = prompt.messages

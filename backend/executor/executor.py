@@ -11,8 +11,10 @@ Future work: flesh out remaining stubs with OS-specific implementations.
 import base64
 import ctypes
 import difflib
+import hashlib
 import json
 import os
+import threading
 import shutil
 import subprocess
 import time
@@ -21,8 +23,8 @@ import yaml
 from ctypes import wintypes
 from contextvars import ContextVar
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from functools import lru_cache
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse
@@ -32,13 +34,14 @@ import pytesseract
 from pydantic import ValidationError
 
 import pygetwindow as gw
+import uiautomation as auto
 try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover
     psutil = None  # type: ignore
 
 from backend.executor import apps, files, input, mouse
-from backend.executor.actions_schema import ActionPlan, ActionStep, DragAction, ScrollAction
+from backend.executor.actions_schema import ActionPlan, ActionStep, DragAction, ScrollAction, WaitUntilAction
 from backend.vision.ocr import OcrBox
 from backend.vision.ocr import run_ocr, run_ocr_with_boxes
 from backend.llm.action_parser import parse_action_plan
@@ -50,6 +53,7 @@ from backend.llm.doubao_client import call_doubao
 from backend.llm.qwen_client import call_qwen
 from backend.vision.screenshot import capture_screen
 from backend.executor.ui_locator import locate_target, locate_text, rank_text_candidates
+from backend.vision.uia_locator import MatchPolicy, find_element
 from backend.llm.vlm_config import get_vlm_call
 
 MAX_STEPS = 10
@@ -130,6 +134,7 @@ OCR_CAPTURE_ACTIONS = {
     "drag",
 }
 VLM_DISABLED: ContextVar[bool] = ContextVar("VLM_DISABLED", default=DEFAULT_DISABLE_VLM)
+CURRENT_CONTEXT: ContextVar[Any] = ContextVar("CURRENT_CONTEXT", default=None)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -720,6 +725,7 @@ def activate_window(params: Dict[str, Any]) -> dict:
     """
     Activate a window by fuzzy-matching title/class keywords and foregrounding it.
     """
+    global LAST_WINDOW_TITLE
     logs: List[str] = []
     raw_title_terms = params.get("title_keywords") or params.get("title") or []
     raw_class_terms = params.get("class_keywords") or []
@@ -735,6 +741,39 @@ def activate_window(params: Dict[str, Any]) -> dict:
 
     if not title_keywords and not class_keywords:
         return {"success": False, "reason": "title_keywords or class_keywords required", "hwnd": None, "log": logs}
+
+    primary_query = title_keywords[0] if title_keywords else ""
+    if primary_query:
+        try:
+            uia_probe = locate_target(
+                primary_query,
+                [],
+                match_policy=MatchPolicy.WINDOW_FIRST,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"uia:error:{exc}")
+            uia_probe = None
+        if isinstance(uia_probe, dict) and uia_probe.get("method") == "uia":
+            logs.append("uia:match")
+            source = (uia_probe.get("candidate") or {}).get("source") or {}
+            handle = source.get("handle")
+            if handle:
+                activated = _activate_hwnd(int(handle), int(source.get("pid") or -1))
+                logs.append(f"uia:activate:{activated}")
+                if activated:
+                    LAST_WINDOW_TITLE = source.get("name") or primary_query
+                    return {
+                        "success": True,
+                        "reason": "activated",
+                        "hwnd": int(handle),
+                        "pid": source.get("pid"),
+                        "matched_title": source.get("name") or primary_query,
+                        "matched_class": source.get("control_type"),
+                        "matched_term": primary_query,
+                        "score": uia_probe.get("score", 1.0),
+                        "log": logs,
+                    }
+            logs.append("uia:no_handle_or_activation")
 
     snapshots = _enum_top_windows()
     logs.append(f"enum_windows:{len(snapshots)}")
@@ -764,7 +803,6 @@ def activate_window(params: Dict[str, Any]) -> dict:
 
     activated = _foreground_window(best_snap.hwnd, best_snap.pid, logs)
     if activated:
-        global LAST_WINDOW_TITLE
         LAST_WINDOW_TITLE = best_snap.title
     return {
         "success": bool(activated),
@@ -1057,13 +1095,34 @@ def handle_switch_window(step: ActionStep) -> str:
 
     target = title.strip()
     target_lower = target.lower()
+    global LAST_WINDOW_TITLE
+
+    try:
+        uia_probe = locate_target(target, [], match_policy=MatchPolicy.WINDOW_FIRST)
+    except Exception:
+        uia_probe = None
+    if isinstance(uia_probe, dict) and uia_probe.get("method") == "uia":
+        candidate = uia_probe.get("candidate") or {}
+        source = candidate.get("source") or {}
+        handle = source.get("handle")
+        if handle:
+            activated = _activate_hwnd(int(handle), int(source.get("pid") or -1))
+            if activated:
+                LAST_WINDOW_TITLE = source.get("name") or target
+                return {
+                    "status": "activated",
+                    "requested": target,
+                    "matched_title": source.get("name") or candidate.get("text") or target,
+                    "score": uia_probe.get("score", 1.0),
+                    "method": "uia",
+                    "locator": uia_probe,
+                }
     try:
         windows = gw.getAllWindows()
     except Exception as exc:  # noqa: BLE001
         return f"error: failed to query windows: {exc}"
 
     # Prefer last launched/activated window if available.
-    global LAST_WINDOW_TITLE
     if LAST_WINDOW_TITLE:
         for win in windows:
             if (getattr(win, "title", "") or "").strip() == LAST_WINDOW_TITLE:
@@ -1131,11 +1190,12 @@ def handle_click(step: ActionStep) -> str:
     x = params.get("x")
     y = params.get("y")
     if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        print(f"[EXEC] Clicking at ({x}, {y})")
         result = MOUSE.click({"x": x, "y": y, "button": button})
         return {"status": "success", "method": "absolute", "reason": result}
 
-    query = params.get("text") or params.get("target") or params.get("label") or params.get("visual_description")
-    if not query:
+    targets = _extract_targets(params)
+    if not targets:
         return "error: 'x'/'y' or 'text/target/visual_description' is required"
 
     try:
@@ -1147,8 +1207,19 @@ def handle_click(step: ActionStep) -> str:
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "reason": f"ocr failed: {exc}"}
 
-    locate_result = _locate_from_params(query, params, boxes, Path(screenshot_path))
-    if locate_result.get("status") != "success":
+    locate_result = None
+    for query in targets:
+        print(f"[EXEC] Trying variant: '{query}'")
+        try:
+            locate_result = _locate_from_params(
+                query, params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
+            )
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc)}
+        if locate_result.get("status") == "success":
+            break
+
+    if not locate_result or locate_result.get("status") != "success":
         return {"status": "error", "reason": "locate_failed", "locator": locate_result}
     center = locate_result.get("center") or {}
     cx = center.get("x")
@@ -1156,6 +1227,7 @@ def handle_click(step: ActionStep) -> str:
     if cx is None or cy is None:
         return {"status": "error", "reason": "locate_missing_center", "locator": locate_result}
 
+    print(f"[EXEC] Clicking at ({cx}, {cy})")
     result = MOUSE.click({"x": cx, "y": cy, "button": button})
     return {
         "status": "success",
@@ -1195,6 +1267,192 @@ def handle_wait(step: ActionStep) -> str:
     return f"waited {seconds} seconds"
 
 
+def _get_active_window_rect() -> Optional[Tuple[int, int, int, int]]:
+    """Return bounding rect of the foreground top-level window."""
+    try:
+        with auto.UIAutomationInitializerInThread(debug=False):
+            fg = auto.GetForegroundControl()
+            if not fg:
+                return None
+            top = fg.GetTopLevelControl()
+            rect = getattr(top, "BoundingRectangle", None)
+            if not rect:
+                return None
+            left, top_v, right, bottom = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+            if right <= left or bottom <= top_v:
+                return None
+            return left, top_v, right, bottom
+    except Exception:
+        return None
+
+
+def _hash_active_window_region(rect: Tuple[int, int, int, int]) -> Tuple[Optional[str], Optional[str]]:
+    """Compute a SHA1 hash of the active window region to track stability."""
+    try:
+        screenshot_path = capture_screen()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"screenshot_error:{exc}"
+    try:
+        with Image.open(screenshot_path) as img:
+            left, top, right, bottom = rect
+            left = max(0, left)
+            top = max(0, top)
+            right = min(img.width, right)
+            bottom = min(img.height, bottom)
+            if right <= left or bottom <= top:
+                return None, "empty_rect"
+            region = img.crop((left, top, right, bottom))
+            buf = BytesIO()
+            region.save(buf, format="PNG")
+            digest = hashlib.sha1(buf.getvalue()).hexdigest()
+            return digest, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"hash_error:{exc}"
+
+
+def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
+    """
+    Wait for a UI condition such as element presence or UI stability.
+    """
+    params = step.params or {}
+    try:
+        wait_action = WaitUntilAction.model_validate(params)
+    except ValidationError as exc:  # noqa: BLE001
+        return {
+            "status": "timeout",
+            "condition": params.get("condition"),
+            "reason": f"invalid wait_until params: {exc}",
+            "elapsed": 0.0,
+            "polls": 0,
+        }
+
+    start = time.monotonic()
+    polls = 0
+    last_observed: Any = None
+    last_reason: Optional[str] = None
+    stable_value: Optional[str] = None
+    stable_method: Optional[str] = None
+    stable_count = 0
+    last_change_ts = start
+
+    def _current_ui_state() -> Tuple[Optional[str], str, Optional[str]]:
+        ctx = CURRENT_CONTEXT.get(None)
+        if ctx and hasattr(ctx, "get_ui_fingerprint"):
+            try:
+                fp = ctx.get_ui_fingerprint(lite_only=True)
+            except Exception:
+                fp = None
+            if fp:
+                return str(fp), "fingerprint", None
+        rect = _get_active_window_rect()
+        if not rect:
+            return None, "hash", "no_active_window_rect"
+        digest, err = _hash_active_window_region(rect)
+        return digest, "hash", err
+
+    while True:
+        polls += 1
+        now = time.monotonic()
+        elapsed = now - start
+
+        if wait_action.condition == "window_exists":
+            res = find_element(wait_action.target, policy=MatchPolicy.WINDOW_FIRST)
+            last_observed = res
+            if res and res.get("kind") == "window":
+                return {
+                    "status": "success",
+                    "condition": wait_action.condition,
+                    "elapsed": elapsed,
+                    "matched_target": res,
+                    "polls": polls,
+                }
+        elif wait_action.condition == "element_exists":
+            screenshot_path: Optional[Path] = None
+            boxes: List[OcrBox] = []
+            try:
+                screenshot_path = Path(capture_screen())
+                _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            except Exception as exc:  # noqa: BLE001
+                last_reason = f"ocr_failed:{exc}"
+            try:
+                locate_result = locate_target(
+                    query=wait_action.target,
+                    boxes=boxes,
+                    image_path=str(screenshot_path) if screenshot_path else None,
+                    match_policy=MatchPolicy.CONTROL_ONLY,
+                )
+                _reject_window_match(locate_result, wait_action.target or "")
+                last_observed = locate_result
+                if locate_result.get("status") == "success":
+                    return {
+                        "status": "success",
+                        "condition": wait_action.condition,
+                        "elapsed": elapsed,
+                        "matched_target": locate_result,
+                        "polls": polls,
+                    }
+            except ValueError as exc:
+                last_reason = str(exc)
+        elif wait_action.condition == "text_exists":
+            screenshot_path: Optional[Path] = None
+            boxes: List[OcrBox] = []
+            try:
+                screenshot_path = Path(capture_screen())
+                _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            except Exception as exc:  # noqa: BLE001
+                last_reason = f"ocr_failed:{exc}"
+            candidates = rank_text_candidates(wait_action.target or "", boxes)
+            last_observed = candidates[0] if candidates else None
+            if candidates:
+                best = candidates[0]
+                if best.get("high_enough") or best.get("medium_enough"):
+                    return {
+                        "status": "success",
+                        "condition": wait_action.condition,
+                        "elapsed": elapsed,
+                        "matched_target": best,
+                        "polls": polls,
+                    }
+        elif wait_action.condition == "ui_stable":
+            value, method, reason = _current_ui_state()
+            last_observed = {"value": value, "method": method, "reason": reason}
+            if reason:
+                last_reason = reason
+            if value:
+                if value == stable_value and method == stable_method:
+                    stable_count += 1
+                else:
+                    stable_value = value
+                    stable_method = method
+                    stable_count = 1
+                    last_change_ts = now
+                if stable_count >= wait_action.stable_samples or (now - last_change_ts) >= wait_action.stability_duration:
+                    return {
+                        "status": "success",
+                        "condition": wait_action.condition,
+                        "elapsed": elapsed,
+                        "matched_target": last_observed,
+                        "polls": polls,
+                    }
+            else:
+                stable_count = 0
+        else:
+            last_reason = f"unsupported_condition:{wait_action.condition}"
+
+        if elapsed >= wait_action.timeout:
+            break
+        time.sleep(wait_action.poll_interval)
+
+    return {
+        "status": "timeout",
+        "condition": wait_action.condition,
+        "elapsed": elapsed,
+        "last_observed": last_observed,
+        "reason": last_reason or "timeout",
+        "polls": polls,
+    }
+
+
 def _require_number(value, name: str) -> Optional[str]:
     if not isinstance(value, (int, float)):
         return f"error: '{name}' must be a number"
@@ -1232,7 +1490,12 @@ def _handle_click_variant(step: ActionStep, variant: str) -> str:
             _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
         except Exception as exc:  # noqa: BLE001
             return f"error: locate failed: {exc}"
-        locate_result = _locate_from_params(query, params, boxes, Path(screenshot_path))
+        try:
+            locate_result = _locate_from_params(
+                query, params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
+            )
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc)}
         if locate_result.get("status") != "success":
             return {"status": "error", "reason": "locate_failed", "locator": locate_result}
         center = locate_result.get("center") or {}
@@ -1337,7 +1600,12 @@ def handle_drag(step: ActionStep) -> Dict[str, Any]:
         if not query or not screenshot_path:
             return None, None, {"status": "error", "reason": "missing_target"}
         merged_params = {**params, **point}
-        loc_result = _locate_from_params(query, merged_params, boxes, Path(screenshot_path))
+        try:
+            loc_result = _locate_from_params(
+                query, merged_params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
+            )
+        except ValueError as exc:
+            return None, None, {"status": "error", "reason": str(exc)}
         if loc_result.get("status") != "success":
             return None, None, loc_result
         center = loc_result.get("center") or {}
@@ -1720,15 +1988,20 @@ def handle_browser_click(step: ActionStep) -> Any:
         icon_templates = _icon_templates_from_params(params)
         use_vlm = _use_vlm(params)
         for term in targets:
-            locate_result = locate_target(
-                query=term,
-                boxes=boxes,
-                image_path=str(screenshot_path),
-                image_base64=image_b64 if (icon_templates or use_vlm) else None,
-                icon_templates=icon_templates if icon_templates else None,
-                vlm_call=provider_call if use_vlm else None,
-                vlm_provider=provider_name,
-            )
+            try:
+                locate_result = locate_target(
+                    query=term,
+                    boxes=boxes,
+                    image_path=str(screenshot_path),
+                    image_base64=image_b64 if (icon_templates or use_vlm) else None,
+                    icon_templates=icon_templates if icon_templates else None,
+                    vlm_call=provider_call if use_vlm else None,
+                    vlm_provider=provider_name,
+                    match_policy=MatchPolicy.CONTROL_ONLY,
+                )
+                _reject_window_match(locate_result, term)
+            except ValueError as exc:
+                return {"status": "error", "reason": str(exc)}
             if locate_result.get("status") != "success":
                 continue
             center = locate_result.get("center") or {}
@@ -1986,17 +2259,31 @@ def _use_vlm(params: Dict[str, Any]) -> bool:
     return bool(params.get("visual_description"))
 
 
+def _reject_window_match(locate_result: Dict[str, Any], query: str) -> None:
+    """
+    Prevent accidental interactions on entire windows when UIA matches titles.
+    """
+    if not locate_result or not isinstance(locate_result, dict) or locate_result.get("method") != "uia":
+        return
+    candidate = locate_result.get("candidate") or {}
+    source = candidate.get("source") or {}
+    kind = candidate.get("kind") or source.get("kind")
+    if kind == "window":
+        raise ValueError(f"Refusing window match for interaction: '{query}' (kind=window)")
+
+
 def _locate_from_params(
     query: str,
     params: Dict[str, Any],
     boxes: List[OcrBox],
     screenshot_path: Path,
+    match_policy: MatchPolicy = MatchPolicy.HYBRID,
 ) -> Dict[str, Any]:
     icon_templates = _icon_templates_from_params(params)
     image_b64 = _encode_image_base64(screenshot_path) if (icon_templates or _use_vlm(params)) else None
     provider_name, provider_call = get_vlm_call()
     vlm_call = provider_call if _use_vlm(params) else None
-    return locate_target(
+    result = locate_target(
         query=query,
         boxes=boxes,
         image_path=str(screenshot_path),
@@ -2004,7 +2291,11 @@ def _locate_from_params(
         icon_templates=icon_templates if icon_templates else None,
         vlm_call=vlm_call,
         vlm_provider=provider_name,
+        match_policy=match_policy,
     )
+    if match_policy == MatchPolicy.CONTROL_ONLY:
+        _reject_window_match(result, query)
+    return result
 
 
 def _run_region_ocr(image_path: Path, bounds: Dict[str, float], padding: int = 40) -> List[OcrBox]:
@@ -3567,17 +3858,116 @@ def _detect_dangerous_request(user_instruction: Optional[str]) -> Optional[str]:
     return None
 
 
-@lru_cache(maxsize=1)
+_SAFETY_POLICY_CACHE: Dict[str, Any] = {}
+_SAFETY_POLICY_MTIME: Optional[float] = None
+_SAFETY_POLICY_LOCK = threading.Lock()
+
+
 def _load_safety_policy() -> Dict[str, Any]:
+    """
+    Load the safety policy with mtime-based caching for hot-reload.
+    Returns the last known-good policy on parse errors.
+    """
+    global _SAFETY_POLICY_CACHE, _SAFETY_POLICY_MTIME
+
     path = Path(__file__).resolve().parent.parent / "config" / "safety_policy.yaml"
     if not path.exists():
+        with _SAFETY_POLICY_LOCK:
+            _SAFETY_POLICY_CACHE = {}
+            _SAFETY_POLICY_MTIME = None
         return {}
+
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+        mtime = path.stat().st_mtime
     except Exception as exc:
         print(f"Error loading safety policy: {exc}")
+        with _SAFETY_POLICY_LOCK:
+            return _SAFETY_POLICY_CACHE or {}
         return {}
+
+    with _SAFETY_POLICY_LOCK:
+        if _SAFETY_POLICY_MTIME is not None and mtime == _SAFETY_POLICY_MTIME:
+            return _SAFETY_POLICY_CACHE
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            data = {}
+        with _SAFETY_POLICY_LOCK:
+            _SAFETY_POLICY_CACHE = data
+            _SAFETY_POLICY_MTIME = mtime
+        return data
+    except Exception as exc:
+        print(f"Error loading safety policy: {exc}")
+        with _SAFETY_POLICY_LOCK:
+            return _SAFETY_POLICY_CACHE or {}
+
+
+def _normalize_process_name(name: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Normalize a process identifier or path to lowercase basename and a no-extension variant.
+    Returns (normalized, no_ext) where either can be None.
+    """
+    try:
+        cleaned = str(name).strip().strip("\"'")
+        if not cleaned:
+            return None, None
+        lower = cleaned.lower()
+        try:
+            base = os.path.basename(lower) or lower
+        except Exception:
+            base = lower
+        no_ext = base[:-4] if base.endswith(".exe") else base
+        return base, no_ext
+    except Exception:
+        return None, None
+
+
+def _match_blocked_process(requested: str, rules: List[str]) -> Optional[Dict[str, str]]:
+    req_norm, req_no_ext = _normalize_process_name(requested)
+    if not req_norm:
+        return None
+
+    req_candidates = {req_norm}
+    if req_no_ext:
+        req_candidates.add(req_no_ext)
+        req_candidates.add(f"{req_no_ext}.exe")
+
+    for rule in rules:
+        rule_norm, rule_no_ext = _normalize_process_name(rule)
+        if not rule_norm:
+            continue
+        rule_candidates = {rule_norm}
+        if rule_no_ext:
+            rule_candidates.add(rule_no_ext)
+            rule_candidates.add(f"{rule_no_ext}.exe")
+        if req_candidates & rule_candidates:
+            matched_rule = next(iter(req_candidates & rule_candidates))
+            return {
+                "requested": requested,
+                "normalized": req_norm,
+                "matched_rule": matched_rule,
+            }
+    return None
+
+    with _SAFETY_POLICY_LOCK:
+        if _SAFETY_POLICY_MTIME is not None and mtime == _SAFETY_POLICY_MTIME:
+            return _SAFETY_POLICY_CACHE
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            data = {}
+        with _SAFETY_POLICY_LOCK:
+            _SAFETY_POLICY_CACHE = data
+            _SAFETY_POLICY_MTIME = mtime
+        return data
+    except Exception as exc:
+        print(f"Error loading safety policy: {exc}")
+        with _SAFETY_POLICY_LOCK:
+            return _SAFETY_POLICY_CACHE or {}
 
 
 def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
@@ -3606,6 +3996,23 @@ def _evaluate_step_safety(step: ActionStep) -> Dict[str, Any]:
                     return _unsafe("danger_keyword", f"param contains danger keyword for action '{action}'")
             except Exception:
                 continue
+
+    # Blocked process enforcement for open_app.
+    if action == "open_app":
+        requested = None
+        for key in ("target", "app", "name", "path"):
+            if isinstance(params.get(key), str):
+                requested = params.get(key)
+                break
+        if requested:
+            blocked_rules = policy.get("blocked_processes", []) if isinstance(policy, dict) else []
+            match_info = _match_blocked_process(requested, blocked_rules) if blocked_rules else None
+            if match_info:
+                return _unsafe(
+                    "process_blocked",
+                    f"Blocked by safety policy: {requested}",
+                    match_info,
+                )
 
     # Action level check.
     sensitivity = {}
@@ -3737,6 +4144,7 @@ ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
     "read_file": handle_read_file,
     "write_file": handle_write_file,
     "wait": handle_wait,
+    "wait_until": handle_wait_until,
     "adjust_volume": handle_adjust_volume,
     "click_text": handle_click_text,
     "browser_click": handle_browser_click,
@@ -3912,6 +4320,7 @@ def run_steps(
             pass
 
     # Per-run toggle for VLM usage; restore after run to avoid affecting other calls.
+    context_token = CURRENT_CONTEXT.set(context)
     base_vlm_token = VLM_DISABLED.set(not base_allow_vlm)
 
     steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
@@ -4201,6 +4610,7 @@ def run_steps(
 
             idx += 1
     finally:
+        CURRENT_CONTEXT.reset(context_token)
         VLM_DISABLED.reset(base_vlm_token)
 
     result = {"overall_status": overall_status, "logs": logs}
