@@ -73,6 +73,7 @@ ActionName = Literal[
     "browser_click",
     "browser_input",
     "browser_extract_text",
+    "take_over",
 ]
 
 

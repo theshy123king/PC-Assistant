@@ -55,6 +55,13 @@ from backend.vision.screenshot import capture_screen
 from backend.executor.ui_locator import locate_target, locate_text, rank_text_candidates
 from backend.vision.uia_locator import MatchPolicy, find_element
 from backend.llm.vlm_config import get_vlm_call
+from backend.executor.task_registry import (
+    TaskStatus,
+    create_task,
+    update_task,
+    get_task,
+)
+from backend.utils.time_utils import now_iso_utc
 
 MAX_STEPS = 10
 LAST_WINDOW_TITLE: Optional[str] = None
@@ -135,6 +142,7 @@ OCR_CAPTURE_ACTIONS = {
 }
 VLM_DISABLED: ContextVar[bool] = ContextVar("VLM_DISABLED", default=DEFAULT_DISABLE_VLM)
 CURRENT_CONTEXT: ContextVar[Any] = ContextVar("CURRENT_CONTEXT", default=None)
+CURRENT_TASK_ID: ContextVar[Optional[str]] = ContextVar("CURRENT_TASK_ID", default=None)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -1310,6 +1318,25 @@ def _hash_active_window_region(rect: Tuple[int, int, int, int]) -> Tuple[Optiona
         return None, f"hash_error:{exc}"
 
 
+def _build_context_snapshot(context) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {}
+    if not context:
+        return snapshot
+    try:
+        snapshot["last_ui_fingerprint"] = context.get_ui_fingerprint(lite_only=True)
+    except Exception:
+        snapshot["last_ui_fingerprint"] = None
+    try:
+        snapshot["last_screenshot_path"] = getattr(context, "last_screenshot_path", None)
+    except Exception:
+        snapshot["last_screenshot_path"] = None
+    try:
+        snapshot["work_dir"] = getattr(context, "work_dir", None)
+    except Exception:
+        pass
+    return snapshot
+
+
 def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
     """
     Wait for a UI condition such as element presence or UI stability.
@@ -1461,6 +1488,13 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
             f"wait_until failed: condition '{wait_action.condition}' not met within {wait_action.timeout}s"
         )
     return timeout_result
+
+
+def handle_take_over(step: ActionStep) -> Dict[str, Any]:
+    """
+    Placeholder handler that signals user takeover.
+    """
+    return {"status": "awaiting_user", "message": "User takeover required", "ok": True}
 
 
 def _require_number(value, name: str) -> Optional[str]:
@@ -3450,7 +3484,7 @@ def _capture_observation(capture_screenshot: bool, capture_ocr: bool) -> Dict[st
     """
     Capture an observation snapshot (screenshot + optional OCR) for feedback loops.
     """
-    observation: Dict[str, Any] = {"captured": False, "timestamp": datetime.now().isoformat()}
+    observation: Dict[str, Any] = {"captured": False, "timestamp": now_iso_utc()}
     if not capture_screenshot:
         observation["capture_enabled"] = False
         return observation
@@ -4160,6 +4194,7 @@ ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
     "browser_click": handle_browser_click,
     "browser_input": handle_browser_input,
     "browser_extract_text": handle_browser_extract_text,
+    "take_over": handle_take_over,
 }
 
 FILE_PATH_ACTIONS = {
@@ -4196,6 +4231,7 @@ STUB_UI_ACTIONS = {
     "browser_input",
     "browser_extract_text",
     "adjust_volume",
+    "take_over",
 }
 
 INTERACTIVE_ACTIONS = {
@@ -4245,6 +4281,8 @@ def run_steps(
     allow_vlm_override: Optional[bool] = None,
     verify_mode_override: Optional[str] = None,
     work_dir: Optional[str] = None,
+    task_id: Optional[str] = None,
+    start_index: int = 0,
 ) -> Dict[str, Any]:
     """
     Execute an ActionPlan with a global observe-execute-observe-verify loop and optional replanning.
@@ -4334,6 +4372,19 @@ def run_steps(
     base_vlm_token = VLM_DISABLED.set(not base_allow_vlm)
 
     steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
+    task_record = None
+    task_token = CURRENT_TASK_ID.set(task_id) if task_id else None
+    if task_id:
+        task_record = get_task(task_id) or create_task(
+            getattr(context, "user_instruction", None) if context else None,
+            action_plan.model_dump() if hasattr(action_plan, "model_dump") else {},
+            status=TaskStatus.RUNNING,
+            task_id=task_id,
+        )
+        try:
+            CURRENT_TASK_ID.set(task_id)
+        except Exception:
+            pass
     # Rewrite UI save patterns to direct write_file when possible.
     steps, rewrite_log = _rewrite_save_pattern(steps, base_dir=work_dir)
     plan_rewrites: List[Dict[str, Any]] = []
@@ -4342,7 +4393,7 @@ def run_steps(
     # Allow additional steps when replanning to avoid premature truncation.
     max_total_steps = max(len(steps), MAX_STEPS * (1 + max(0, base_max_replans)))
     overall_status = "success"
-    idx = 0
+    idx = max(0, int(start_index))
     executed_steps = 0
 
     # Plan-level safety checks before executing anything.
@@ -4354,7 +4405,7 @@ def run_steps(
             "params": {},
             "status": "unsafe",
             "message": f"user request flagged as dangerous ('{dangerous_term}')",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_iso_utc(),
             "duration_ms": 0.0,
             "safety": {"code": "dangerous_request", "term": dangerous_term},
         }
@@ -4377,7 +4428,7 @@ def run_steps(
                 "params": pre_step.params,
                 "status": "unsafe",
                 "message": safety_check.get("message"),
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": now_iso_utc(),
                 "duration_ms": 0.0,
                 "safety": safety_check,
             }
@@ -4407,7 +4458,7 @@ def run_steps(
                     "params": step.params,
                     "status": "error",
                     "message": f"No handler for action '{step.action}'",
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": now_iso_utc(),
                     "duration_ms": 0.0,
                 }
                 logs.append(entry)
@@ -4428,7 +4479,7 @@ def run_steps(
                     "params": step.params,
                     "status": "unsafe",
                     "message": step_safety.get("message"),
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": now_iso_utc(),
                     "duration_ms": 0.0,
                     "safety": step_safety,
                 }
@@ -4537,12 +4588,12 @@ def run_steps(
                 "params": step.params,
                 "status": step_status,
                 "message": last_message,
-                "timestamp": datetime.now().isoformat(),
-                "duration_ms": combined_duration_ms,
-                "attempts": attempt_logs,
-                "verification": last_verification,
-                "feedback": step_feedback,
-            }
+            "timestamp": now_iso_utc(),
+            "duration_ms": combined_duration_ms,
+            "attempts": attempt_logs,
+            "verification": last_verification,
+            "feedback": step_feedback,
+        }
             if attempt_logs:
                 entry["observations"] = attempt_logs[-1].get("observation")
 
@@ -4611,6 +4662,27 @@ def run_steps(
                     context.record_step_result(entry)
                 except Exception:
                     pass
+            if task_record:
+                update_task(
+                    task_id,
+                    step_index=idx + 1,
+                    step_results=(context.step_results if context else logs),
+                    status=TaskStatus.RUNNING,
+                    last_error=None,
+                    context_snapshot=_build_context_snapshot(context),
+                )
+
+            if step.action == "take_over":
+                if task_record:
+                    update_task(
+                        task_id,
+                        status=TaskStatus.AWAITING_USER,
+                        step_index=idx + 1,
+                        last_error=None,
+                        context_snapshot=_build_context_snapshot(context),
+                    )
+                overall_status = "awaiting_user"
+                break
 
             if step_status == "error" and not replan_successful:
                 overall_status = "error"
@@ -4622,6 +4694,11 @@ def run_steps(
     finally:
         CURRENT_CONTEXT.reset(context_token)
         VLM_DISABLED.reset(base_vlm_token)
+        if task_token is not None:
+            try:
+                CURRENT_TASK_ID.reset(task_token)
+            except Exception:
+                pass
 
     result = {"overall_status": overall_status, "logs": logs}
     if context:
@@ -4635,6 +4712,23 @@ def run_steps(
             context.set_summary(summary)
         except Exception:
             pass
+    if task_record:
+        final_status = (
+            TaskStatus.COMPLETED
+            if overall_status == "success"
+            else TaskStatus.FAILED
+            if overall_status == "error"
+            else TaskStatus.AWAITING_USER
+        )
+        step_cursor = idx + 1 if final_status == TaskStatus.AWAITING_USER else idx
+        update_task(
+            task_id,
+            status=final_status,
+            step_index=step_cursor,
+            last_error=None if final_status != TaskStatus.FAILED else str(summary),
+            context_snapshot=_build_context_snapshot(context),
+        )
+        result["task_id"] = task_id
     return result
 
 

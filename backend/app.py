@@ -15,6 +15,7 @@ from backend.executor import executor
 from backend.executor.actions_schema import ActionPlan, ActionStep, validate_action_plan
 from backend.executor.apps import get_cached_alias
 from backend.executor.task_context import TaskContext
+from backend.executor.task_registry import get_task, update_task, TaskStatus
 from backend.llm.action_parser import parse_action_plan
 from backend.llm.deepseek_client import call_deepseek
 from backend.llm.doubao_client import call_doubao
@@ -749,13 +750,15 @@ async def ai_execute_plan(payload: dict):
         )
         return {"error": f"invalid action plan: {exc}", "request_id": request_id}
 
-    result = await asyncio.to_thread(executor.run_steps, plan, work_dir=work_dir)
+    task_id = generate_request_id()
+    result = await asyncio.to_thread(executor.run_steps, plan, work_dir=work_dir, task_id=task_id)
     log_event(
         "ai_execute_plan.finished",
         request_id,
         {"execution": summarize_execution(result), "work_dir": work_dir},
     )
     result["request_id"] = request_id
+    result["task_id"] = task_id
     return result
 
 
@@ -825,12 +828,14 @@ async def ai_run(payload: dict):
                 "context": context.to_dict(),
                 "request_id": request_id,
             }
+        task_id = generate_request_id()
         exec_result = await asyncio.to_thread(
             executor.run_steps,
             cached_plan,
             context=context,
             planner_provider="alias_cache",
             work_dir=work_dir,
+            task_id=task_id,
         )
         log_event(
             "ai_run.cached",
@@ -838,10 +843,10 @@ async def ai_run(payload: dict):
             {
                 "provider": "alias_cache",
                 "plan": summarize_plan(cached_plan.model_dump()),
-                "execution": summarize_execution(exec_result),
-                "dry_run": False,
-            },
-        )
+            "execution": summarize_execution(exec_result),
+            "dry_run": False,
+        },
+    )
         return {
             "provider": "alias_cache",
             "user_text": user_text,
@@ -851,6 +856,7 @@ async def ai_run(payload: dict):
             "execution": exec_result,
             "context": context.to_dict(),
             "request_id": request_id,
+            "task_id": task_id,
         }
 
     prompt: PromptBundle = format_prompt(
@@ -961,12 +967,14 @@ async def ai_run(payload: dict):
             "request_id": request_id,
         }
 
+    task_id = generate_request_id()
     exec_result = await asyncio.to_thread(
         executor.run_steps,
         plan,
         context=context,
         planner_provider=resolved_provider,
         work_dir=work_dir,
+        task_id=task_id,
     )
     log_event(
         "ai_run.finished",
@@ -988,6 +996,7 @@ async def ai_run(payload: dict):
         "execution": exec_result,
         "context": context.to_dict(),
         "request_id": request_id,
+        "task_id": task_id,
     }
 
 
@@ -1140,6 +1149,7 @@ async def ai_debug_run(payload: dict):
         }
     context.record_plan(plan_obj)
 
+    task_id = generate_request_id()
     exec_result = await asyncio.to_thread(
         executor.run_steps,
         plan_obj,
@@ -1154,6 +1164,7 @@ async def ai_debug_run(payload: dict):
         allow_vlm_override=False if debug_disable_vlm else None,
         capture_ocr=True if debug_force_capture else None,
         work_dir=work_dir,
+        task_id=task_id,
     )
 
     log_event(
@@ -1168,6 +1179,51 @@ async def ai_debug_run(payload: dict):
         },
     )
     exec_result["request_id"] = request_id
+    exec_result["task_id"] = task_id
+    return exec_result
+
+
+def _task_response(record):
+    if not record:
+        return None
+    data = record.to_dict()
+    return data
+
+
+@app.get("/api/tasks/{task_id}/status")
+async def get_task_status(task_id: str):
+    record = get_task(task_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="task not found")
+    return _task_response(record)
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def resume_task(task_id: str, payload: dict | None = None):
+    record = get_task(task_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="task not found")
+    if record.status != TaskStatus.AWAITING_USER:
+        raise HTTPException(status_code=400, detail="task not awaiting user")
+    try:
+        plan = ActionPlan.model_validate(record.plan)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid stored plan: {exc}")
+    context = TaskContext(user_instruction=record.user_text, work_dir=(record.context_snapshot or {}).get("work_dir"))
+    context.record_plan(plan)
+    try:
+        context.step_results = list(record.step_results or [])
+    except Exception:
+        context.step_results = []
+    update_task(task_id, status=TaskStatus.RUNNING, last_error=None)
+    exec_result = await asyncio.to_thread(
+        executor.run_steps,
+        plan,
+        context=context,
+        task_id=task_id,
+        start_index=record.step_index,
+    )
+    exec_result["task_id"] = task_id
     return exec_result
 
 

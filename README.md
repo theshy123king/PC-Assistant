@@ -77,6 +77,7 @@ Backend tests:
 python -m pytest backend/tests
 ```
 - Pytest sets `EXECUTOR_TEST_MODE=1` and defaults to port `5015` if a server is needed; override with `PC_ASSISTANT_TEST_PORT` to avoid clashes with any dev/Electron instance.
+- Task takeover state is kept **in-memory only**. Run the FastAPI backend with a single worker (no multi-worker gunicorn/Uvicorn) to avoid losing task state.
 
 ## Notable Behaviors
 - Default LLM provider: DeepSeek (pure text). Vision/multimodal works with Doubao (when `DOUBAO_VISION_MODEL` or a vision `DOUBAO_MODEL` is set) and Qwen.
