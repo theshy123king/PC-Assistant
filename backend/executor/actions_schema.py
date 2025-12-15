@@ -309,6 +309,7 @@ class WaitUntilAction(BaseModel):
     poll_interval: float = 0.25
     stability_duration: float = 1.0
     stable_samples: int = 3
+    require: bool = False
 
     @model_validator(mode="after")
     def _validate(self) -> "WaitUntilAction":

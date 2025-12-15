@@ -1361,6 +1361,7 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
             if res and res.get("kind") == "window":
                 return {
                     "status": "success",
+                    "ok": True,
                     "condition": wait_action.condition,
                     "elapsed": elapsed,
                     "matched_target": res,
@@ -1386,6 +1387,7 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
                 if locate_result.get("status") == "success":
                     return {
                         "status": "success",
+                        "ok": True,
                         "condition": wait_action.condition,
                         "elapsed": elapsed,
                         "matched_target": locate_result,
@@ -1408,6 +1410,7 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
                 if best.get("high_enough") or best.get("medium_enough"):
                     return {
                         "status": "success",
+                        "ok": True,
                         "condition": wait_action.condition,
                         "elapsed": elapsed,
                         "matched_target": best,
@@ -1429,6 +1432,7 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
                 if stable_count >= wait_action.stable_samples or (now - last_change_ts) >= wait_action.stability_duration:
                     return {
                         "status": "success",
+                        "ok": True,
                         "condition": wait_action.condition,
                         "elapsed": elapsed,
                         "matched_target": last_observed,
@@ -1443,14 +1447,20 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
             break
         time.sleep(wait_action.poll_interval)
 
-    return {
+    timeout_result = {
         "status": "timeout",
+        "ok": False,
         "condition": wait_action.condition,
         "elapsed": elapsed,
         "last_observed": last_observed,
         "reason": last_reason or "timeout",
         "polls": polls,
     }
+    if wait_action.require:
+        raise RuntimeError(
+            f"wait_until failed: condition '{wait_action.condition}' not met within {wait_action.timeout}s"
+        )
+    return timeout_result
 
 
 def _require_number(value, name: str) -> Optional[str]:
