@@ -331,7 +331,7 @@ def _search_in_root(root, query_norm: str, policy: MatchPolicy) -> Optional[Dict
             if handle:
                 seen.add(handle)
             if getattr(element, "IsOffscreen", False):
-                pass
+                continue
             if not _is_control_allowed(element, policy):
                 # Still traverse its children for nested matches.
                 try:
