@@ -550,9 +550,23 @@ async function handleRun() {
     const api = getApi();
     const runFn = api.run;
     const chatMode = currentMode === "chat";
+    const startedAt = performance.now();
+    let durationLogged = false;
+    const modeLabel = chatMode ? "对话" : "执行";
+    const logDuration = () => {
+        if (durationLogged) return;
+        durationLogged = true;
+        const seconds = ((performance.now() - startedAt) / 1000).toFixed(2);
+        appendAgentHTML(
+            `<div class="bubble" style="color:var(--text-sub); background:#F0F4FF;">⏱️ ${escapeHTML(
+                modeLabel
+            )}耗时 ${seconds}s</div>`
+        );
+    };
     if (!runFn || typeof runFn !== "function") {
         appendAgentHTML('<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">Backend bridge unavailable. Please restart the app.</div>');
         setStatus("error");
+        logDuration();
         return;
     }
 
@@ -626,6 +640,7 @@ async function handleRun() {
                     `<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">${result?.error || result?.message || "chat call failed"}</div>`
                 );
                 setStatus("error");
+                logDuration();
                 return;
             }
             const reply =
@@ -637,6 +652,7 @@ async function handleRun() {
                 JSON.stringify(result);
             appendAgentHTML(`<div class="bubble">${reply}</div>`);
             setStatus("success");
+            logDuration();
         } else {
             // Show Plan
             appendAgentHTML(createPlanCardWrapper(result));
@@ -658,6 +674,7 @@ async function handleRun() {
                 // Dry run successful
                 setStatus("success");
             }
+            logDuration();
         }
 
     } catch (err) {
@@ -665,6 +682,7 @@ async function handleRun() {
         if (loadingEl) loadingEl.remove();
         appendAgentHTML(`<div class="bubble" style="color:var(--error-color); background:#FFF5F5;">Error: ${err}</div>`);
         setStatus("error");
+        logDuration();
     }
 }
 

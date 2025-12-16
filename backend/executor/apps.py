@@ -444,6 +444,28 @@ def _gather_matches(target_key: str, user_query: str, params: dict) -> Tuple[Lis
             if alias not in search_terms:
                 search_terms.append(alias)
 
+    def _finalize(
+        cands: List[Tuple[float, str, str]], source: str = "resolver"
+    ) -> Tuple[List[dict], List[str], List[dict]]:
+        dedup: Dict[str, Tuple[float, str, str]] = {}
+        for sc, p, kind in cands:
+            if kind == "uwp":
+                norm = f"uwp:{p.lower()}"
+                adjusted_score = sc
+            elif kind == "bridge":
+                norm = f"bridge:{p.lower()}"
+                adjusted_score = sc + 1.0
+            else:
+                norm = f"win32:{os.path.normcase(os.path.abspath(p))}"
+                adjusted_score = _prefer_path_score(p, sc, target_key)
+            if norm not in dedup or adjusted_score > dedup[norm][0]:
+                dedup[norm] = (adjusted_score, p, kind)
+
+        sorted_candidates = sorted(dedup.values(), key=lambda item: item[0], reverse=True)
+        matches = [{"score": sc, "path": p, "kind": kind} for sc, p, kind in sorted_candidates]
+        logs.append({"candidate": target_key, "source": source, "match_count": len(matches)})
+        return matches, search_terms, logs
+
     if target_key == "wechat":
         bridge_appid = _find_wechat_bridge_appid()
         if bridge_appid:
@@ -493,6 +515,9 @@ def _gather_matches(target_key: str, user_query: str, params: dict) -> Tuple[Lis
     for reg_path in _search_registry(target_key, target_key):
         candidates.append((_score(os.path.basename(reg_path), target_key), reg_path, "win32"))
 
+    if candidates:
+        return _finalize(candidates, source="early_return")
+
     uwp_info = _find_uwp_app(target_key)
     if uwp_info and uwp_info.get("appid"):
         uwp_appid = uwp_info["appid"]
@@ -509,24 +534,7 @@ def _gather_matches(target_key: str, user_query: str, params: dict) -> Tuple[Lis
         base_score = 4.5 if uwp_kind == "bridge" else 3.5
         candidates.append((base_score, uwp_appid, uwp_kind))
 
-    dedup: Dict[str, Tuple[float, str, str]] = {}
-    for sc, p, kind in candidates:
-        if kind == "uwp":
-            norm = f"uwp:{p.lower()}"
-            adjusted_score = sc
-        elif kind == "bridge":
-            norm = f"bridge:{p.lower()}"
-            adjusted_score = sc + 1.0
-        else:
-            norm = f"win32:{os.path.normcase(os.path.abspath(p))}"
-            adjusted_score = _prefer_path_score(p, sc, target_key)
-        if norm not in dedup or adjusted_score > dedup[norm][0]:
-            dedup[norm] = (adjusted_score, p, kind)
-
-    sorted_candidates = sorted(dedup.values(), key=lambda item: item[0], reverse=True)
-    matches = [{"score": sc, "path": p, "kind": kind} for sc, p, kind in sorted_candidates]
-    logs.append({"candidate": target_key, "source": "resolver", "match_count": len(matches)})
-    return matches, search_terms, logs
+    return _finalize(candidates)
 
 def _build_candidate_keys(primary: str) -> List[Tuple[str, str]]:
     alias_map = {
