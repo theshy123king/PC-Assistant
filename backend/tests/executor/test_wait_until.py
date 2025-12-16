@@ -7,7 +7,7 @@ from backend.executor.executor import handle_wait_until
 def test_wait_until_timeout_ok_false(monkeypatch):
     calls = {"count": 0}
 
-    def fake_find_element(_query, policy=None):
+    def fake_find_element(_query, policy=None, **kwargs):
         calls["count"] += 1
         return None
 
@@ -27,7 +27,7 @@ def test_wait_until_timeout_ok_false(monkeypatch):
 
 
 def test_wait_until_timeout_with_require_raises(monkeypatch):
-    def fake_find_element(_query, policy=None):
+    def fake_find_element(_query, policy=None, **kwargs):
         return None
 
     monkeypatch.setattr("backend.executor.executor.find_element", fake_find_element)
@@ -44,7 +44,7 @@ def test_wait_until_timeout_with_require_raises(monkeypatch):
 
 
 def test_wait_until_success_sets_ok_true(monkeypatch):
-    def fake_find_element(_query, policy=None):
+    def fake_find_element(_query, policy=None, **kwargs):
         return {"kind": "window", "name": "Demo"}
 
     monkeypatch.setattr("backend.executor.executor.find_element", fake_find_element)

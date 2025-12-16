@@ -84,6 +84,10 @@ python -m pytest backend/tests
 - File saves prefer direct `write_file` to avoid UI IME issues; working directory can be set from the UI (Settings) or via `work_dir` in API payload.
 - Safety layer blocks unsafe paths/keywords and requires confirmation for destructive actions.
 
+## Pattern-first UIA execution (Commit 4)
+- UI interactions prefer UIA patterns first (Invoke/Value/Toggle/SelectionItem) with safe rebind via runtime_id + locator_key TargetRef, then fall back to focus+click/clipboard typing as needed.
+- After an `activate_window` step, the executor binds UIA searches to the activated hwnd/pid and blocks VLM/coordinate fallbacks when the preferred root is missing, reducing accidental clicks on the wrong window.
+
 ## Frontend Notes
 - Renderer: `frontend/renderer/index.html` and `index.js`.
 - Main process: `frontend/main.js` (launches backend; handles quit).

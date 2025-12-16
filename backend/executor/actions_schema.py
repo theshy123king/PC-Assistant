@@ -291,6 +291,7 @@ class ClickAction(BaseModel):
     visual_description: Optional[str] = None
     target_icon: Optional[Any] = None
     strategy_hint: Optional[str] = None
+    strict_foreground: Optional[bool] = None
 
     @model_validator(mode="after")
     def _require_target(self) -> "ClickAction":
@@ -325,6 +326,30 @@ class WaitUntilAction(BaseModel):
             raise ValueError("'stability_duration' must be positive")
         if self.stable_samples < 1:
             raise ValueError("'stable_samples' must be >= 1")
+        return self
+
+
+class ActivateWindowAction(BaseModel):
+    """Activate a window by title/class keywords with an optional convenience target."""
+
+    target: Optional[str] = None
+    title_keywords: List[str] = Field(default_factory=list)
+    class_keywords: List[str] = Field(default_factory=list)
+    strict: bool = False
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "ActivateWindowAction":
+        self.title_keywords = [str(t).strip() for t in self.title_keywords if str(t).strip()]
+        self.class_keywords = [str(t).strip() for t in self.class_keywords if str(t).strip()]
+        self.target = (self.target or "").strip() or None
+
+        if not self.strict and self.target and not (self.title_keywords or self.class_keywords):
+            self.title_keywords = [self.target]
+
+        if self.strict and not (self.title_keywords or self.class_keywords):
+            raise ValueError("title_keywords or class_keywords required when strict is True")
+        if not self.title_keywords and not self.class_keywords:
+            raise ValueError("target or keywords required for activate_window")
         return self
 
 
@@ -372,6 +397,8 @@ class ActionStep(BaseModel):
                 validated_params.update(ClickAction.model_validate(params).model_dump())
             elif self.action == "wait_until":
                 validated_params.update(WaitUntilAction.model_validate(params).model_dump())
+            elif self.action == "activate_window":
+                validated_params.update(ActivateWindowAction.model_validate(params).model_dump())
         except ValidationError as exc:  # noqa: BLE001
             raise ValueError(f"invalid {self.action} params: {exc}") from exc
         self.params = validated_params

@@ -1,0 +1,11 @@
+﻿{
+  "task": "Commit4 smoke: click menu via text (CN)",
+  "steps": [
+    {
+      "action": "click",
+      "params": {
+        "text": "文件"
+      }
+    }
+  ]
+}

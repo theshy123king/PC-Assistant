@@ -44,6 +44,7 @@ class TaskContext:
         self.replan_history: List[Dict[str, Any]] = []
         self.summary: Optional[Dict[str, Any]] = None
         self.work_dir: Optional[str] = work_dir
+        self.active_window: Optional[Dict[str, Any]] = None
 
     def record_plan(self, plan: ActionPlan | Dict[str, Any]) -> None:
         try:
@@ -173,6 +174,7 @@ class TaskContext:
             "replan_history": self.replan_history,
             "summary": self.summary,
             "work_dir": self.work_dir,
+            "active_window": self.active_window,
         }
 
 

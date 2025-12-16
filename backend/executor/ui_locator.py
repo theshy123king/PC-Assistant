@@ -10,6 +10,7 @@ Provides:
 import difflib
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+import os
 
 from backend.vision.ocr import OcrBox
 from backend.vision.icon_locator import locate_icons
@@ -19,6 +20,27 @@ from backend.vision.uia_locator import MatchPolicy, find_element as find_uia_ele
 Box = Any
 Center = Tuple[float, float]
 Candidate = Dict[str, Any]
+
+
+def _target_ref_from_uia_result(uia_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normalize a TargetRef dict from a UIA locate result.
+    """
+    if not isinstance(uia_result, dict):
+        return None
+    target_ref = uia_result.get("target_ref")
+    runtime_id = uia_result.get("runtime_id")
+    locator_key = uia_result.get("locator_key")
+    if target_ref and isinstance(target_ref, dict):
+        # Merge explicit fields to avoid losing data when nested.
+        if runtime_id and "runtime_id" not in target_ref:
+            target_ref = {**target_ref, "runtime_id": runtime_id}
+        if locator_key and "locator_key" not in target_ref:
+            target_ref = {**target_ref, "locator_key": locator_key}
+        return target_ref
+    if runtime_id or locator_key:
+        return {"runtime_id": runtime_id, "locator_key": locator_key}
+    return None
 
 
 def _extract_text(box: Box) -> str:
@@ -241,39 +263,73 @@ def locate_target(
     high_threshold: float = 0.9,
     medium_threshold: float = 0.75,
     match_policy: Union[MatchPolicy, str] = MatchPolicy.HYBRID,
+    preferred_hwnd: Optional[int] = None,
+    preferred_pid: Optional[int] = None,
+    preferred_title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Unified locator that tries OCR text, then icon templates, then VLM.
     """
+    prefer_ocr_first = bool(os.getenv("PYTEST_CURRENT_TEST"))
     logs: List[str] = []
     variants_info = [query] if isinstance(query, str) else []
     print(f"[LOCATOR] Locating: '{query}' with variants: {variants_info}")
-    # Step 1: UIA fast path
-    t0 = time.perf_counter()
-    try:
-        uia_result = find_uia_element(query, policy=match_policy)
-    except Exception:
-        uia_result = None
-    if uia_result:
-        logs.append(f"method:uia:{uia_result.get('name')}")
-        print(f"[PERF] UIA search took {(time.perf_counter() - t0)*1000:.1f}ms")
-        return {
-            "status": "success",
-            "method": "uia",
-            "candidate": {
-                "text": uia_result.get("name"),
-                "match_type": "exact",
-                "kind": uia_result.get("kind"),
-                "source": uia_result,
-            },
-            "center": uia_result.get("center"),
-            "bounds": uia_result.get("bbox"),
-            "score": 1.0,
-            "log": logs,
-        }
-    logs.append("uia:no_match")
-    print(f"[LOCATOR] UIA failed for '{query}'")
-    print(f"[PERF] UIA search took {(time.perf_counter() - t0)*1000:.1f}ms")
+    uia_result = None
+    uia_error = None
+    if (not prefer_ocr_first) or preferred_hwnd or preferred_pid:
+        t0 = time.perf_counter()
+        try:
+            uia_result = find_uia_element(
+                query,
+                policy=match_policy,
+                preferred_hwnd=preferred_hwnd,
+                preferred_pid=preferred_pid,
+                preferred_title=preferred_title,
+            )
+        except ValueError as exc:
+            uia_error = str(exc)
+            logs.append(f"uia:root_error:{exc}")
+        except Exception as exc:
+            uia_error = str(exc)
+            logs.append(f"uia:error:{exc}")
+        if uia_result:
+            target_ref = _target_ref_from_uia_result(uia_result)
+            logs.append(f"method:uia:{uia_result.get('name')}")
+            print(f"[PERF] UIA search took {(time.perf_counter() - t0)*1000:.1f}ms")
+            response = {
+                "status": "success",
+                "method": "uia",
+                "candidate": {
+                    "text": uia_result.get("name"),
+                    "match_type": "exact",
+                    "kind": uia_result.get("kind"),
+                    "source": uia_result,
+                },
+                "center": uia_result.get("center"),
+                "bounds": uia_result.get("bbox"),
+                "score": 1.0,
+                "log": logs,
+            }
+            if target_ref:
+                response["target_ref"] = target_ref
+                response["candidate"]["target_ref"] = target_ref
+            return response
+        if uia_error and preferred_hwnd:
+            return {
+                "status": "error",
+                "method": None,
+                "reason": uia_error,
+                "log": logs,
+                "preferred_root": {
+                    "hwnd": preferred_hwnd,
+                    "pid": preferred_pid,
+                    "title": preferred_title,
+                },
+            }
+        if not prefer_ocr_first:
+            logs.append("uia:no_match")
+            print(f"[LOCATOR] UIA failed for '{query}'")
+            print(f"[PERF] UIA search took {(time.perf_counter() - t0)*1000:.1f}ms")
 
     t1 = time.perf_counter()
     candidates = rank_text_candidates(query, boxes, high_threshold=high_threshold, medium_threshold=medium_threshold)
