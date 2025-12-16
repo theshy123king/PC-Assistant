@@ -500,6 +500,16 @@ function appendExecutionDetails(result) {
             appendAgentHTML(
                 `<div class="bubble" style="background:#F8F8F8; color:var(--text-main);"><div style="font-weight:600; margin-bottom:4px;">${escapeHTML(pathLabel)}</div>${escapeHTML(method || "已打开文件")}</div>`
             );
+        } else if (log.action === "browser_extract_text") {
+            const message = log.message || log.result || {};
+            const matched = message?.matched_text || message?.text || "(no match)";
+            const term = message?.matched_term || log?.params?.text || "";
+            const fullText = typeof message?.full_text === "string" ? message.full_text : "";
+            const preview = fullText ? escapeHTML(fullText.slice(0, 300)) : "浏览器文本提取完成";
+            const header = term ? `${escapeHTML(term)} → ${escapeHTML(matched)}` : escapeHTML(matched);
+            appendAgentHTML(
+                `<div class="bubble" style="background:#F0F7FF; color:#0F2744; white-space:pre-wrap;"><div style="font-weight:600; margin-bottom:4px;">${header}</div>${preview}</div>`
+            );
         } else if (log.action === "list_files") {
             const message = log.message || log.result || {};
             const entries = message.entries || message.result?.entries;

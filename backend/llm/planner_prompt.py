@@ -37,7 +37,7 @@ browser_input to focus a labeled field and type; set "text" to the field label,
 put alternate translations in "variants", set "value" to the text to enter, and optionally
 provide "verify_text" to confirm via OCR after typing. Use browser_extract_text to OCR a
 labeled value (e.g., price, status, or result
-count); set "text" to the label and provide "variants" for translations.
+count); set "text" to the label and provide "variants" for translations. For dynamic content (e.g., search results), set "text" to a visual description (e.g., "first search result title") and include "strategy_hint": "vlm".
 When launching Windows Notepad (记事本/Notepad), always use the explicit path "C:/Windows/System32/notepad.exe".
 For typing actions, include optional "auto_enter" (default true); set to false only when you must avoid pressing Enter (e.g., multi-line without submit), and set to true when confirming dialogs/filenames.
 When saving in Notepad, use key_press with keys ["ctrl","s"] (lowercase) (IME-safe) and type the filename with auto_enter:true and force_ascii:true (or mode:"filename"); a small pause is acceptable. A menu fallback (Alt+F then "A") will be attempted automatically if Ctrl+S is intercepted.

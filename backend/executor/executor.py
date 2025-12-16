@@ -2522,7 +2522,7 @@ def handle_browser_input(step: ActionStep) -> Any:
 
 def handle_browser_extract_text(step: ActionStep) -> Any:
     """
-    OCR-driven extractor for browser UI labels; returns the best-matching text and bounds.
+    Locate-then-read extractor: locate target region (VLM/UIA/icon) then OCR inside it.
     """
     params = step.params or {}
     targets = _extract_targets(params)
@@ -2553,39 +2553,74 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
         except Exception as exc:  # noqa: BLE001
             return f"error: ocr failed: {exc}"
 
-        best = None
-        best_term = None
-        for term in targets:
-            ranked = rank_text_candidates(term, boxes)
-            if ranked:
-                last_candidates.extend(ranked[:5])
-            if not ranked:
-                continue
-            top = ranked[0]
-            if not best or top.get("high_enough") and not best.get("high_enough"):
-                best = top
-                best_term = term
-            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
-                best = top
-                best_term = term
-            if top.get("high_enough"):
-                break
+        locate_result: Dict[str, Any] = {}
+        try:
+            locate_result = _locate_from_params(
+                targets[0], params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
+            )
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc)}
 
-        if best and (best.get("high_enough") or best.get("medium_enough")):
-            center = best.get("center") or {}
-            bounds = best.get("bounds") or {}
+        if locate_result.get("status") != "success":
+            logs.append(f"locate_failed:{locate_result.get('reason')}")
+            continue
+
+        bounds = locate_result.get("bounds") or (locate_result.get("candidate") or {}).get("bounds") or {}
+        if not bounds:
+            logs.append("locate_success_no_bounds")
+            continue
+
+        def _overlap_ratio(a: Dict[str, float], b: Dict[str, float]) -> float:
+            try:
+                ax1, ay1 = float(a["x"]), float(a["y"])
+                ax2, ay2 = ax1 + float(a["width"]), ay1 + float(a["height"])
+                bx1, by1 = float(b["x"]), float(b["y"])
+                bx2, by2 = bx1 + float(b["width"]), by1 + float(b["height"])
+            except Exception:
+                return 0.0
+            inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+            inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+            inter_area = inter_w * inter_h
+            area_b = max(0.0, (bx2 - bx1) * (by2 - by1))
+            if area_b <= 0:
+                return 0.0
+            return inter_area / area_b
+
+        region_text_boxes: List[Dict[str, Any]] = []
+        for box in boxes:
+            if not isinstance(box, OcrBox):
+                continue
+            b_bounds = {"x": box.x, "y": box.y, "width": box.width, "height": box.height}
+            if _overlap_ratio(bounds, b_bounds) >= 0.2:
+                region_text_boxes.append(
+                    {
+                        "text": box.text or "",
+                        "x": box.x,
+                        "y": box.y,
+                        "width": box.width,
+                        "height": box.height,
+                    }
+                )
+
+        region_text_boxes.sort(key=lambda b: (b["y"], b["x"]))
+        extracted_text = " ".join([b["text"] for b in region_text_boxes if b.get("text")])
+
+        if extracted_text:
+            center = locate_result.get("center") or {}
             result = {
                 "status": "ok",
-                "matched_text": best.get("text"),
-                "matched_term": best_term,
+                "matched_text": extracted_text,
+                "matched_term": targets[0],
                 "center": {"x": center.get("x"), "y": center.get("y")},
                 "bounds": bounds,
+                "locator": locate_result,
                 "full_text": full_text,
                 "log": logs,
+                "candidates": region_text_boxes[:50],
             }
-            if last_candidates:
-                result["candidates"] = last_candidates[:10]
             return result
+
+        logs.append("no_text_in_region")
 
         logs.append("no_match_found")
 
