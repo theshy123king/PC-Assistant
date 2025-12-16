@@ -41,7 +41,14 @@ except Exception:  # pragma: no cover
     psutil = None  # type: ignore
 
 from backend.executor import apps, files, input, mouse
-from backend.executor.actions_schema import ActionPlan, ActionStep, DragAction, ScrollAction, WaitUntilAction
+from backend.executor.actions_schema import (
+    ActionPlan,
+    ActionStep,
+    ActivateWindowAction,
+    DragAction,
+    ScrollAction,
+    WaitUntilAction,
+)
 from backend.vision.ocr import OcrBox
 from backend.vision.ocr import run_ocr, run_ocr_with_boxes
 from backend.llm.action_parser import parse_action_plan
@@ -51,7 +58,7 @@ import os
 from backend.llm.deepseek_client import call_deepseek
 from backend.llm.doubao_client import call_doubao
 from backend.llm.qwen_client import call_qwen
-from backend.vision.screenshot import capture_screen
+from backend.vision.screenshot import capture_screen, capture_window
 from backend.executor.ui_locator import locate_target, locate_text, rank_text_candidates
 from backend.vision.uia_locator import MatchPolicy, find_element
 from backend.llm.vlm_config import get_vlm_call
@@ -61,7 +68,10 @@ from backend.executor.task_registry import (
     update_task,
     get_task,
 )
+from backend.executor.uia_rebind import rebind_element
+from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
 from backend.utils.time_utils import now_iso_utc
+from backend.utils.win32_foreground import ensure_foreground, get_foreground_info
 
 MAX_STEPS = 10
 LAST_WINDOW_TITLE: Optional[str] = None
@@ -92,6 +102,169 @@ def _coerce_nonnegative_int(value: Any, default: int) -> int:
     except Exception:
         return default
     return max(0, parsed)
+
+
+def _store_active_window(snapshot: Optional[Dict[str, Any]]) -> None:
+    """
+    Persist active window info in both the context var and the current TaskContext when available.
+    """
+    ACTIVE_WINDOW.set(snapshot)
+    ctx = CURRENT_CONTEXT.get(None)
+    if ctx is not None:
+        try:
+            ctx.active_window = snapshot
+        except Exception:
+            try:
+                setattr(ctx, "active_window", snapshot)
+            except Exception:
+                pass
+
+
+def _get_active_window_snapshot() -> Optional[Dict[str, Any]]:
+    ctx = CURRENT_CONTEXT.get(None)
+    if ctx is not None:
+        snap = getattr(ctx, "active_window", None)
+        if snap:
+            return snap
+    return ACTIVE_WINDOW.get(None)
+
+
+def _foreground_snapshot() -> Dict[str, Any]:
+    """Return hwnd/pid/title/class of current foreground window."""
+    info = get_foreground_info()
+    return {
+        "hwnd": info.get("hwnd"),
+        "pid": info.get("pid"),
+        "title": info.get("title"),
+        "class": info.get("class_name"),
+        "class_name": info.get("class_name"),
+    }
+
+
+def _foreground_matches(preferred: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    """Check whether the current foreground matches the preferred window."""
+    if not preferred:
+        return True
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    if pref_hwnd and current.get("hwnd") and pref_hwnd == current.get("hwnd"):
+        return True
+    pref_pid = preferred.get("pid")
+    if pref_pid and current.get("pid") and pref_pid == current.get("pid"):
+        return True
+    pref_title = str(preferred.get("title") or "").strip().lower()
+    cur_title = str(current.get("title") or "").strip().lower()
+    if pref_title and cur_title and pref_title in cur_title:
+        return True
+    return False
+
+
+def _ensure_foreground(preferred: Dict[str, Any], strict: bool, logs: Optional[List[str]] = None) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Ensure the preferred window is in foreground. Attempts one re-activation if needed.
+    """
+    preferred = preferred or {}
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+
+    fg_snapshot = _foreground_snapshot()
+    if pref_hwnd and fg_snapshot.get("hwnd") == pref_hwnd:
+        return True, fg_snapshot
+    if not pref_hwnd and _foreground_matches(preferred, fg_snapshot):
+        return True, fg_snapshot
+
+    if pref_hwnd:
+        try:
+            enforce_result = ensure_foreground(int(pref_hwnd))
+            if logs is not None:
+                logs.append(f"foreground_enforce:{enforce_result}")
+            fg_snapshot = enforce_result.get("final_foreground") or _foreground_snapshot()
+            if enforce_result.get("ok") and fg_snapshot.get("hwnd") == pref_hwnd:
+                return True, fg_snapshot
+        except Exception as exc:  # noqa: BLE001
+            if logs is not None:
+                logs.append(f"foreground_enforce_error:{exc}")
+
+    if not pref_hwnd and _foreground_matches(preferred, fg_snapshot):
+        return True, fg_snapshot
+
+    if strict:
+        if logs is not None:
+            logs.append(f"foreground_mismatch:preferred:{preferred} current:{fg_snapshot}")
+        return False, fg_snapshot
+    return True, fg_snapshot
+
+
+def _enforce_strict_foreground_once(
+    preferred: Dict[str, Any], logs: Optional[List[str]] = None
+) -> Tuple[bool, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """
+    Attempt to enforce a strict foreground match for a preferred hwnd exactly once.
+
+    Returns (success, foreground_snapshot, enforcement_result).
+    """
+    preferred = preferred or {}
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    fg_snapshot = _foreground_snapshot()
+    if pref_hwnd and fg_snapshot.get("hwnd") == pref_hwnd:
+        return True, fg_snapshot, None
+    if not pref_hwnd:
+        return False, fg_snapshot, None
+    enforcement = ensure_foreground(int(pref_hwnd))
+    if logs is not None:
+        logs.append(f"foreground_enforce:{enforcement}")
+    fg_after = enforcement.get("final_foreground") or _foreground_snapshot()
+    ok = bool(enforcement.get("ok")) and fg_after.get("hwnd") == pref_hwnd
+    return ok, fg_after, enforcement
+
+
+def _capture_for_interaction(preferred: Dict[str, Any], strict: bool) -> Tuple[Optional[Path], Dict[str, Any], Optional[str]]:
+    """
+    Capture screenshot with preferred window awareness. Returns (path, fg_snapshot, error_reason).
+    """
+    preferred = preferred or {}
+    if not preferred.get("hwnd"):
+        active = ACTIVE_WINDOW.get(None)
+        if isinstance(active, dict) and active.get("hwnd"):
+            preferred = active
+    if strict and not preferred.get("hwnd"):
+        fg_hint = _foreground_snapshot()
+        if fg_hint.get("hwnd"):
+            preferred = {**preferred, **fg_hint}
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    fg_snapshot = _foreground_snapshot()
+    if strict and pref_hwnd and fg_snapshot.get("hwnd") != pref_hwnd:
+        return None, fg_snapshot, "capture_foreground_mismatch"
+    if strict and not pref_hwnd and preferred and not _foreground_matches(preferred, fg_snapshot):
+        return None, fg_snapshot, "capture_foreground_mismatch"
+
+    if preferred.get("hwnd"):
+        try:
+            path = capture_window(int(preferred["hwnd"]))
+            return Path(path), fg_snapshot, None
+        except Exception as exc:  # noqa: BLE001
+            if strict:
+                return None, fg_snapshot, f"capture_window_failed:{exc}"
+
+    try:
+        path = capture_screen()
+        return Path(path), fg_snapshot, None
+    except Exception as exc:  # noqa: BLE001
+        return None, fg_snapshot, f"capture_failed:{exc}"
 
 
 DEFAULT_STEP_MAX_RETRIES = _coerce_nonnegative_int(os.getenv("EXECUTOR_MAX_STEP_RETRIES", "1"), 1)
@@ -143,6 +316,7 @@ OCR_CAPTURE_ACTIONS = {
 VLM_DISABLED: ContextVar[bool] = ContextVar("VLM_DISABLED", default=DEFAULT_DISABLE_VLM)
 CURRENT_CONTEXT: ContextVar[Any] = ContextVar("CURRENT_CONTEXT", default=None)
 CURRENT_TASK_ID: ContextVar[Optional[str]] = ContextVar("CURRENT_TASK_ID", default=None)
+ACTIVE_WINDOW: ContextVar[Optional[Dict[str, Any]]] = ContextVar("ACTIVE_WINDOW", default=None)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -153,6 +327,7 @@ except Exception:  # pragma: no cover - dwmapi may be missing
 
 DWMWA_CLOAKED = 14
 SW_RESTORE = 9
+SW_SHOWMAXIMIZED = 3
 GW_OWNER = 4
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
@@ -478,11 +653,8 @@ def _activate_hwnd(hwnd: int, pid: int) -> bool:
     except Exception:
         pass
     try:
-        user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
-    except Exception:
-        pass
-    try:
-        return bool(user32.SetForegroundWindow(wintypes.HWND(hwnd)))
+        fg_result = ensure_foreground(int(hwnd))
+        return bool(fg_result.get("ok"))
     except Exception:
         return False
 
@@ -655,78 +827,26 @@ def _foreground_window(hwnd: int, pid: int, logs: List[str]) -> bool:
     """
     Restore and foreground a window using topmost bounce and thread attachment.
     """
-    success = False
     try:
         user32.AllowSetForegroundWindow(pid if pid and pid > 0 else -1)
         logs.append("AllowSetForegroundWindow:ok")
     except Exception as exc:  # noqa: BLE001
         logs.append(f"AllowSetForegroundWindow:error:{exc}")
 
+    # Preserve window state in logs for diagnostics.
     try:
-        res = user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
-        success = success or bool(res)
-        logs.append("ShowWindow:SW_RESTORE")
-    except Exception as exc:  # noqa: BLE001
-        logs.append(f"ShowWindow:error:{exc}")
-
+        was_minimized = bool(user32.IsIconic(wintypes.HWND(hwnd)))
+    except Exception:
+        was_minimized = False
     try:
-        user32.SetWindowPos(
-            wintypes.HWND(hwnd),
-            wintypes.HWND(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-        )
-        user32.SetWindowPos(
-            wintypes.HWND(hwnd),
-            wintypes.HWND(HWND_NOTOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-        )
-        logs.append("SetWindowPos:topmost_bounce")
-        success = True
-    except Exception as exc:  # noqa: BLE001
-        logs.append(f"SetWindowPos:error:{exc}")
+        was_maximized = bool(user32.IsZoomed(wintypes.HWND(hwnd)))
+    except Exception:
+        was_maximized = False
+    logs.append(f"WindowState:minimized:{was_minimized}:maximized:{was_maximized}")
 
-    attached = False
-    target_tid = None
-    try:
-        pid_out = wintypes.DWORD()
-        target_tid = user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid_out))
-        current_tid = kernel32.GetCurrentThreadId()
-        attach_ok = user32.AttachThreadInput(current_tid, target_tid, True)
-        attached = bool(attach_ok)
-        logs.append(f"AttachThreadInput:{attached}")
-    except Exception as exc:  # noqa: BLE001
-        logs.append(f"AttachThreadInput:error:{exc}")
-
-    try:
-        res = user32.SetForegroundWindow(wintypes.HWND(hwnd))
-        success = success or bool(res)
-        logs.append(f"SetForegroundWindow:{bool(res)}")
-    except Exception as exc:  # noqa: BLE001
-        logs.append(f"SetForegroundWindow:error:{exc}")
-
-    try:
-        res = user32.BringWindowToTop(wintypes.HWND(hwnd))
-        success = success or bool(res)
-        logs.append(f"BringWindowToTop:{bool(res)}")
-    except Exception as exc:  # noqa: BLE001
-        logs.append(f"BringWindowToTop:error:{exc}")
-
-    if attached and target_tid is not None:
-        try:
-            user32.AttachThreadInput(kernel32.GetCurrentThreadId(), target_tid, False)
-            logs.append("AttachThreadInput:detached")
-        except Exception as exc:  # noqa: BLE001
-            logs.append(f"AttachThreadInput:detach_error:{exc}")
-
-    return success
+    fg_result = ensure_foreground(int(hwnd))
+    logs.append(f"ensure_foreground:{fg_result}")
+    return bool(fg_result.get("ok"))
 
 
 def activate_window(params: Dict[str, Any]) -> dict:
@@ -735,20 +855,23 @@ def activate_window(params: Dict[str, Any]) -> dict:
     """
     global LAST_WINDOW_TITLE
     logs: List[str] = []
-    raw_title_terms = params.get("title_keywords") or params.get("title") or []
-    raw_class_terms = params.get("class_keywords") or []
+    try:
+        action = ActivateWindowAction.model_validate(params)
+    except ValidationError as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "status": "error",
+            "reason": f"invalid activate_window params: {exc}",
+            "hwnd": None,
+            "log": logs,
+        }
 
-    if isinstance(raw_title_terms, str):
-        raw_title_terms = [raw_title_terms]
-    if isinstance(raw_class_terms, str):
-        raw_class_terms = [raw_class_terms]
-
-    title_keywords = [str(t).strip() for t in raw_title_terms if str(t).strip()]
-    class_keywords = [str(t).strip() for t in raw_class_terms if str(t).strip()]
-    logs.append(f"title_keywords:{title_keywords} class_keywords:{class_keywords}")
+    title_keywords = list(action.title_keywords)
+    class_keywords = list(action.class_keywords)
+    logs.append(f"title_keywords:{title_keywords} class_keywords:{class_keywords} strict:{action.strict}")
 
     if not title_keywords and not class_keywords:
-        return {"success": False, "reason": "title_keywords or class_keywords required", "hwnd": None, "log": logs}
+        return {"success": False, "status": "error", "reason": "title_keywords or class_keywords required", "hwnd": None, "log": logs}
 
     primary_query = title_keywords[0] if title_keywords else ""
     if primary_query:
@@ -757,6 +880,7 @@ def activate_window(params: Dict[str, Any]) -> dict:
                 primary_query,
                 [],
                 match_policy=MatchPolicy.WINDOW_FIRST,
+                preferred_title=primary_query,
             )
         except Exception as exc:  # noqa: BLE001
             logs.append(f"uia:error:{exc}")
@@ -765,20 +889,30 @@ def activate_window(params: Dict[str, Any]) -> dict:
             logs.append("uia:match")
             source = (uia_probe.get("candidate") or {}).get("source") or {}
             handle = source.get("handle")
+            pid = source.get("pid")
             if handle:
                 activated = _activate_hwnd(int(handle), int(source.get("pid") or -1))
                 logs.append(f"uia:activate:{activated}")
                 if activated:
                     LAST_WINDOW_TITLE = source.get("name") or primary_query
+                    snapshot = {
+                        "hwnd": int(handle),
+                        "pid": pid,
+                        "title": source.get("name") or primary_query,
+                        "class": source.get("control_type"),
+                    }
+                    _store_active_window(snapshot)
                     return {
                         "success": True,
+                        "status": "success",
                         "reason": "activated",
                         "hwnd": int(handle),
-                        "pid": source.get("pid"),
+                        "pid": pid,
                         "matched_title": source.get("name") or primary_query,
                         "matched_class": source.get("control_type"),
                         "matched_term": primary_query,
                         "score": uia_probe.get("score", 1.0),
+                        "active_window": snapshot,
                         "log": logs,
                     }
             logs.append("uia:no_handle_or_activation")
@@ -810,10 +944,46 @@ def activate_window(params: Dict[str, Any]) -> dict:
     )
 
     activated = _foreground_window(best_snap.hwnd, best_snap.pid, logs)
-    if activated:
+    snapshot = {
+        "hwnd": best_snap.hwnd,
+        "pid": best_snap.pid,
+        "title": best_snap.title,
+        "class": best_snap.class_name,
+        "class_name": best_snap.class_name,
+    }
+
+    # Strict foreground enforcement
+    if action.strict:
+        fg_result = ensure_foreground(best_snap.hwnd)
+        logs.append(f"foreground_enforce:{fg_result}")
+        activated = bool(fg_result.get("ok")) and (fg_result.get("final_foreground") or {}).get("hwnd") == best_snap.hwnd
+        if not activated:
+            _store_active_window(None)
+            return {
+                "success": False,
+                "status": "error",
+                "reason": "foreground_enforcement_failed",
+                "hwnd": best_snap.hwnd,
+                "pid": best_snap.pid,
+                "matched_title": best_snap.title,
+                "matched_class": best_snap.class_name,
+                "matched_term": matched_term,
+                "score": best_score,
+                "active_window": None,
+                "foreground": fg_result.get("final_foreground"),
+                "log": logs,
+            }
+        snapshot["foreground"] = fg_result.get("final_foreground")
+    elif activated:
         LAST_WINDOW_TITLE = best_snap.title
+
+    if activated:
+        _store_active_window(snapshot)
+        LAST_WINDOW_TITLE = best_snap.title
+
     return {
         "success": bool(activated),
+        "status": "success" if activated else "error",
         "reason": "activated" if activated else "foreground_failed",
         "hwnd": best_snap.hwnd,
         "pid": best_snap.pid,
@@ -821,6 +991,7 @@ def activate_window(params: Dict[str, Any]) -> dict:
         "matched_class": best_snap.class_name,
         "matched_term": matched_term,
         "score": best_score,
+        "active_window": snapshot if activated else None,
         "log": logs,
     }
 
@@ -1181,7 +1352,13 @@ def handle_switch_window(step: ActionStep) -> str:
 
 
 def handle_activate_window(step: ActionStep) -> Any:
-    return activate_window(step.params or {})
+    result = activate_window(step.params or {})
+    if result.get("success"):
+        result.setdefault("status", "success")
+    else:
+        result.setdefault("status", "error")
+        _store_active_window(None)
+    return result
 
 
 def handle_type_text(step: ActionStep) -> str:
@@ -1195,6 +1372,19 @@ def handle_key_press(step: ActionStep) -> str:
 def handle_click(step: ActionStep) -> str:
     params = step.params or {}
     button = params.get("button", "left")
+    strict_fg = _coerce_bool(params.get("strict_foreground"), False)
+    preferred_window = _get_active_window_snapshot() or (ACTIVE_WINDOW.get(None) or {})
+    if strict_fg and not preferred_window.get("hwnd"):
+        preferred_window = _foreground_snapshot()
+    preferred = preferred_window
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    if strict_fg and not pref_hwnd:
+        return {"status": "error", "reason": "preferred_window_unavailable", "preferred": preferred}
+
     x = params.get("x")
     y = params.get("y")
     if isinstance(x, (int, float)) and isinstance(y, (int, float)):
@@ -1206,10 +1396,25 @@ def handle_click(step: ActionStep) -> str:
     if not targets:
         return "error: 'x'/'y' or 'text/target/visual_description' is required"
 
-    try:
-        screenshot_path = capture_screen()
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "reason": f"screenshot failed: {exc}"}
+    logs: List[str] = []
+    if strict_fg:
+        fg_ok, fg_after, enforcement = _enforce_strict_foreground_once(preferred, logs=logs)
+        if not fg_ok:
+            _store_active_window(None)
+            return {
+                "status": "error",
+                "reason": "foreground_mismatch",
+                "foreground": fg_after,
+                "preferred": preferred,
+                "enforcement": enforcement,
+            }
+    else:
+        _ensure_foreground(preferred, strict_fg, logs=logs)
+
+    screenshot_path, fg_after, capture_err = _capture_for_interaction(preferred, strict_fg)
+    if capture_err:
+        return {"status": "error", "reason": capture_err, "foreground": fg_after, "preferred": preferred}
+
     try:
         _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
     except Exception as exc:  # noqa: BLE001
@@ -1228,22 +1433,34 @@ def handle_click(step: ActionStep) -> str:
             break
 
     if not locate_result or locate_result.get("status") != "success":
-        return {"status": "error", "reason": "locate_failed", "locator": locate_result}
-    center = locate_result.get("center") or {}
-    cx = center.get("x")
-    cy = center.get("y")
-    if cx is None or cy is None:
-        return {"status": "error", "reason": "locate_missing_center", "locator": locate_result}
-
-    print(f"[EXEC] Clicking at ({cx}, {cy})")
-    result = MOUSE.click({"x": cx, "y": cy, "button": button})
-    return {
-        "status": "success",
-        "method": locate_result.get("method"),
-        "locator": locate_result,
-        "center": {"x": cx, "y": cy},
-        "reason": result,
-    }
+        reason = (locate_result or {}).get("reason") if isinstance(locate_result, dict) else None
+        return {"status": "error", "reason": reason or "locate_failed", "locator": locate_result}
+    if strict_fg and locate_result.get("method") == "vlm":
+        return {"status": "error", "reason": "unverified_click_vlm_strict", "locator": locate_result}
+    center = _extract_center_from_locator(locate_result)
+    valid_center, center_reason = _validate_locator_center(center, locate_result)
+    if not valid_center:
+        return {"status": "error", "reason": center_reason, "locator": locate_result}
+    locate_result["center"] = center
+    try:
+        return _execute_click_strategies(locate_result, button=button)
+    except InteractionStrategyError as exc:
+        target_ref = getattr(exc, "target_ref", None) or _extract_target_ref_from_locator(locate_result)
+        rebind_meta = getattr(exc, "rebind_meta", {})
+        return {
+            "status": "error",
+            "reason": str(exc),
+            "locator": locate_result,
+            "target_ref": target_ref,
+            "message": {
+                "ok": False,
+                "status": "error",
+                "method": locate_result.get("method"),
+                "pattern": None,
+                "rebind": rebind_meta,
+                "reason": str(exc),
+            },
+        }
 
 
 def handle_move_file(step: ActionStep) -> Dict[str, Any]:
@@ -1334,6 +1551,10 @@ def _build_context_snapshot(context) -> Dict[str, Any]:
         snapshot["work_dir"] = getattr(context, "work_dir", None)
     except Exception:
         pass
+    try:
+        snapshot["active_window"] = getattr(context, "active_window", None)
+    except Exception:
+        snapshot["active_window"] = None
     return snapshot
 
 
@@ -1361,6 +1582,7 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
     stable_method: Optional[str] = None
     stable_count = 0
     last_change_ts = start
+    preferred_window = _preferred_window_hint()
 
     def _current_ui_state() -> Tuple[Optional[str], str, Optional[str]]:
         ctx = CURRENT_CONTEXT.get(None)
@@ -1383,7 +1605,13 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
         elapsed = now - start
 
         if wait_action.condition == "window_exists":
-            res = find_element(wait_action.target, policy=MatchPolicy.WINDOW_FIRST)
+            res = find_element(
+                wait_action.target,
+                policy=MatchPolicy.WINDOW_FIRST,
+                preferred_hwnd=preferred_window.get("preferred_hwnd"),
+                preferred_pid=preferred_window.get("preferred_pid"),
+                preferred_title=preferred_window.get("preferred_title"),
+            )
             last_observed = res
             if res and res.get("kind") == "window":
                 return {
@@ -1408,6 +1636,9 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
                     boxes=boxes,
                     image_path=str(screenshot_path) if screenshot_path else None,
                     match_policy=MatchPolicy.CONTROL_ONLY,
+                    preferred_hwnd=preferred_window.get("preferred_hwnd"),
+                    preferred_pid=preferred_window.get("preferred_pid"),
+                    preferred_title=preferred_window.get("preferred_title"),
                 )
                 _reject_window_match(locate_result, wait_action.target or "")
                 last_observed = locate_result
@@ -1541,12 +1772,19 @@ def _handle_click_variant(step: ActionStep, variant: str) -> str:
         except ValueError as exc:
             return {"status": "error", "reason": str(exc)}
         if locate_result.get("status") != "success":
-            return {"status": "error", "reason": "locate_failed", "locator": locate_result}
+            reason = (locate_result or {}).get("reason") if isinstance(locate_result, dict) else None
+            return {"status": "error", "reason": reason or "locate_failed", "locator": locate_result}
         center = locate_result.get("center") or {}
         cx = center.get("x")
         cy = center.get("y")
         if cx is None or cy is None:
             return {"status": "error", "reason": "locate_missing_center", "locator": locate_result}
+        center = {"x": cx, "y": cy}
+        valid_center, center_reason = _validate_locator_center(center, locate_result)
+        if not valid_center:
+            return {"status": "error", "reason": center_reason, "locator": locate_result}
+        cx = center["x"]
+        cy = center["y"]
         locator_meta = locate_result
 
     try:
@@ -2011,16 +2249,41 @@ def handle_browser_click(step: ActionStep) -> Any:
     verify_attempts = params.get("verify_attempts", 2)
     verify_targets = _normalize_target_list(params.get("verify_text"))
     verify_attempts = params.get("verify_attempts", 2)
+    preferred = _preferred_window_hint()
+    preferred = preferred or (ACTIVE_WINDOW.get(None) or {})
+    strict_fg = _coerce_bool(params.get("strict_foreground"), False)
+    if strict_fg and not preferred:
+        preferred = _get_active_window_snapshot() or {}
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    if strict_fg and not pref_hwnd:
+        return {"status": "error", "reason": "preferred_window_unavailable", "preferred": preferred}
 
     logs: List[str] = []
     provider_name, provider_call = get_vlm_call()
     for attempt in range(1, attempts + 1):
         logs.append(f"attempt:{attempt}")
-        try:
-            screenshot_path = capture_screen()
-            logs.append(f"screenshot:{screenshot_path}")
-        except Exception as exc:  # noqa: BLE001
-            return f"error: screenshot failed: {exc}"
+        if strict_fg:
+            ok_fg, fg_snapshot, enforcement = _enforce_strict_foreground_once(preferred, logs=logs)
+            if not ok_fg:
+                _store_active_window(None)
+                return {
+                    "status": "error",
+                    "reason": "foreground_mismatch",
+                    "foreground": fg_snapshot,
+                    "preferred": preferred,
+                    "enforcement": enforcement,
+                }
+        else:
+            _ensure_foreground(preferred, strict_fg, logs=logs)
+
+        screenshot_path, fg_after, capture_err = _capture_for_interaction(preferred, strict_fg)
+        if capture_err:
+            return {"status": "error", "reason": capture_err, "foreground": fg_after, "preferred": preferred}
+        logs.append(f"screenshot:{screenshot_path}")
 
         try:
             _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
@@ -2048,27 +2311,56 @@ def handle_browser_click(step: ActionStep) -> Any:
                 return {"status": "error", "reason": str(exc)}
             if locate_result.get("status") != "success":
                 continue
-            center = locate_result.get("center") or {}
-            cx = float(center.get("x", 0))
-            cy = float(center.get("y", 0))
-            try:
-                with Image.open(screenshot_path) as img:
-                    cx, cy = _clamp_point(cx, cy, img.width, img.height)
-            except Exception:
-                cx, cy = _clamp_point(cx, cy, 10_000, 10_000)
-            click_step = ActionStep(action="click", params={"x": cx, "y": cy, "button": button})
-            click_result = handle_click(click_step)
+            if strict_fg and locate_result.get("method") == "vlm":
+                return {"status": "error", "reason": "unverified_click_vlm_strict", "locator": locate_result}
+            center = _extract_center_from_locator(locate_result) or locate_result.get("center") or {}
+            if center:
+                try:
+                    with Image.open(screenshot_path) as img:
+                        cx, cy = _clamp_point(float(center.get("x", 0)), float(center.get("y", 0)), img.width, img.height)
+                        locate_result["center"] = {"x": cx, "y": cy}
+                        center = locate_result.get("center") or center
+                except Exception:
+                    pass
+            valid_center, center_reason = _validate_locator_center(center, locate_result)
+            if not valid_center:
+                return {"status": "error", "reason": center_reason, "locator": locate_result}
+            if strict_fg:
+                try:
+                    click_result = _execute_click_strategies(locate_result, button=button)
+                except InteractionStrategyError as exc:
+                    return {
+                        "status": "error",
+                        "reason": str(exc),
+                        "locator": locate_result,
+                        "target_ref": getattr(exc, "target_ref", None),
+                        "message": {
+                            "ok": False,
+                            "status": "error",
+                            "method": locate_result.get("method"),
+                            "pattern": None,
+                            "rebind": getattr(exc, "rebind_meta", {}),
+                            "reason": str(exc),
+                        },
+                        "log": logs,
+                    }
+            else:
+                click_step = ActionStep(action="click", params={"x": center.get("x"), "y": center.get("y"), "button": button})
+                click_result = handle_click(click_step)
             result: Dict[str, Any] = {
                 "status": "clicked",
                 "matched_text": locate_result.get("candidate", {}).get("text"),
                 "matched_term": term,
-                "center": {"x": cx, "y": cy},
+                "center": click_result.get("center") or center,
                 "bounds": locate_result.get("bounds"),
-                "reason": click_result,
+                "reason": click_result.get("reason"),
                 "locator": locate_result,
-                "method": locate_result.get("method"),
+                "method": click_result.get("method") or locate_result.get("method"),
+                "message": click_result.get("message"),
                 "log": logs,
             }
+            if click_result.get("target_ref"):
+                result["target_ref"] = click_result.get("target_ref")
             if verify_targets:
                 verification = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
                 result["verification"] = verification
@@ -2106,17 +2398,42 @@ def handle_browser_input(step: ActionStep) -> Any:
     attempts = max(1, min(5, attempts))
     verify_targets = _normalize_target_list(params.get("verify_text"))
     verify_attempts = params.get("verify_attempts", 2)
+    auto_enter = _coerce_bool(params.get("auto_enter"), True)
+    preferred = _preferred_window_hint()
+    strict_fg = _coerce_bool(params.get("strict_foreground"), False)
+    if strict_fg and not preferred:
+        preferred = _get_active_window_snapshot() or {}
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    if strict_fg and not pref_hwnd:
+        return {"status": "error", "reason": "preferred_window_unavailable", "preferred": preferred}
 
     logs: List[str] = []
     last_candidates: List[Dict[str, Any]] = []
 
     for attempt in range(1, attempts + 1):
         logs.append(f"attempt:{attempt}")
-        try:
-            screenshot_path = capture_screen()
-            logs.append(f"screenshot:{screenshot_path}")
-        except Exception as exc:  # noqa: BLE001
-            return f"error: screenshot failed: {exc}"
+        if strict_fg:
+            ok_fg, fg_snapshot, enforcement = _enforce_strict_foreground_once(preferred, logs=logs)
+            if not ok_fg:
+                _store_active_window(None)
+                return {
+                    "status": "error",
+                    "reason": "foreground_mismatch",
+                    "foreground": fg_snapshot,
+                    "preferred": preferred,
+                    "enforcement": enforcement,
+                }
+        else:
+            _ensure_foreground(preferred, strict_fg, logs=logs)
+
+        screenshot_path, fg_after, capture_err = _capture_for_interaction(preferred, strict_fg)
+        if capture_err:
+            return {"status": "error", "reason": capture_err, "foreground": fg_after, "preferred": preferred}
+        logs.append(f"screenshot:{screenshot_path}")
 
         try:
             _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
@@ -2124,54 +2441,68 @@ def handle_browser_input(step: ActionStep) -> Any:
         except Exception as exc:  # noqa: BLE001
             return f"error: ocr failed: {exc}"
 
-        best = None
-        best_term = None
         for term in targets:
             ranked = rank_text_candidates(term, boxes)
             if ranked:
                 last_candidates.extend(ranked[:3])
-            if not ranked:
-                continue
-            top = ranked[0]
-            if not best or top.get("high_enough") and not best.get("high_enough"):
-                best = top
-                best_term = term
-            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
-                best = top
-                best_term = term
-            if top.get("high_enough"):
-                break
-
-        if best and (best.get("high_enough") or best.get("medium_enough")):
-            center = best.get("center") or {}
-            cx = float(center.get("x", 0))
-            cy = float(center.get("y", 0))
             try:
-                with Image.open(screenshot_path) as img:
-                    cx, cy = _clamp_point(cx, cy, img.width, img.height)
-            except Exception:
-                cx, cy = _clamp_point(cx, cy, 10_000, 10_000)
-            click_step = ActionStep(action="click", params={"x": cx, "y": cy, "button": button})
-            click_result = handle_click(click_step)
-            if isinstance(click_result, str) and click_result.startswith("error"):
-                return {
-                    "status": "error",
-                    "reason": click_result,
-                    "matched_text": best.get("text"),
-                    "matched_term": best_term,
-                    "log": logs,
-                }
-            type_result = input.type_text({"text": value})
+                locate_result = _locate_from_params(
+                    term, params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
+                )
+            except ValueError as exc:
+                return {"status": "error", "reason": str(exc)}
+            if locate_result.get("status") != "success":
+                continue
+            if strict_fg and locate_result.get("method") == "vlm":
+                return {"status": "error", "reason": "unverified_click_vlm_strict", "locator": locate_result}
+            center = _extract_center_from_locator(locate_result) or locate_result.get("center") or {}
+            if center:
+                try:
+                    with Image.open(screenshot_path) as img:
+                        cx, cy = _clamp_point(float(center.get("x", 0)), float(center.get("y", 0)), img.width, img.height)
+                        locate_result["center"] = {"x": cx, "y": cy}
+                        center = locate_result.get("center") or center
+                except Exception:
+                    pass
+            valid_center, center_reason = _validate_locator_center(center, locate_result)
+            if not valid_center and center:
+                return {"status": "error", "reason": center_reason, "locator": locate_result}
+            try:
+                type_result = _type_with_strategies(value, locate_result, button=button, auto_enter=auto_enter)
+            except InteractionStrategyError as exc:
+                if strict_fg:
+                    return {
+                        "status": "error",
+                        "reason": str(exc),
+                        "locator": locate_result,
+                        "target_ref": getattr(exc, "target_ref", None),
+                        "message": {
+                            "ok": False,
+                            "status": "error",
+                            "method": locate_result.get("method"),
+                            "pattern": None,
+                            "rebind": getattr(exc, "rebind_meta", {}),
+                            "reason": str(exc),
+                        },
+                        "log": logs,
+                    }
+                else:
+                    type_result = {"status": "success", "method": "keyboard_type", "message": "fallback_no_strict"}
             result: Dict[str, Any] = {
                 "status": "typed",
-                "matched_text": best.get("text"),
-                "matched_term": best_term,
-                "center": {"x": cx, "y": cy},
-                "bounds": best.get("bounds"),
-                "click_result": click_result,
+                "matched_text": locate_result.get("candidate", {}).get("text"),
+                "matched_term": term,
+                "center": type_result.get("center") or center,
+                "bounds": locate_result.get("bounds"),
+                "click_result": None,
                 "type_result": type_result,
+                "method": type_result.get("method"),
+                "locator": locate_result,
+                "message": type_result.get("message"),
                 "log": logs,
             }
+            if type_result.get("target_ref"):
+                result["target_ref"] = type_result.get("target_ref")
             if verify_targets:
                 verification = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
                 result["verification"] = verification
@@ -2316,6 +2647,24 @@ def _reject_window_match(locate_result: Dict[str, Any], query: str) -> None:
         raise ValueError(f"Refusing window match for interaction: '{query}' (kind=window)")
 
 
+def _preferred_window_hint() -> Dict[str, Any]:
+    """Return preferred window metadata from the current context, if any."""
+    snapshot = _get_active_window_snapshot() or {}
+    if not isinstance(snapshot, dict):
+        return {}
+    hwnd = snapshot.get("hwnd") or snapshot.get("handle")
+    try:
+        hwnd = int(hwnd) if hwnd is not None else None
+    except Exception:
+        hwnd = None
+    return {
+        "preferred_hwnd": hwnd,
+        "preferred_pid": snapshot.get("pid"),
+        "preferred_title": snapshot.get("title"),
+        "preferred_class": snapshot.get("class") or snapshot.get("class_name"),
+    }
+
+
 def _locate_from_params(
     query: str,
     params: Dict[str, Any],
@@ -2327,6 +2676,7 @@ def _locate_from_params(
     image_b64 = _encode_image_base64(screenshot_path) if (icon_templates or _use_vlm(params)) else None
     provider_name, provider_call = get_vlm_call()
     vlm_call = provider_call if _use_vlm(params) else None
+    preferred = _preferred_window_hint()
     result = locate_target(
         query=query,
         boxes=boxes,
@@ -2336,10 +2686,403 @@ def _locate_from_params(
         vlm_call=vlm_call,
         vlm_provider=provider_name,
         match_policy=match_policy,
+        preferred_hwnd=preferred.get("preferred_hwnd"),
+        preferred_pid=preferred.get("preferred_pid"),
+        preferred_title=preferred.get("preferred_title"),
     )
     if match_policy == MatchPolicy.CONTROL_ONLY:
         _reject_window_match(result, query)
     return result
+
+
+def _extract_target_ref_from_locator(locate_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize TargetRef from locator output (candidate/source/top-level)."""
+    if not isinstance(locate_result, dict):
+        return None
+    candidate = locate_result.get("candidate") or {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    source = candidate.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
+    target_ref = locate_result.get("target_ref") or candidate.get("target_ref") or source.get("target_ref")
+    runtime_id = locate_result.get("runtime_id") or candidate.get("runtime_id") or source.get("runtime_id")
+    locator_key = locate_result.get("locator_key") or candidate.get("locator_key") or source.get("locator_key")
+    if target_ref and isinstance(target_ref, dict):
+        if runtime_id and "runtime_id" not in target_ref:
+            target_ref = {**target_ref, "runtime_id": runtime_id}
+        if locator_key and "locator_key" not in target_ref:
+            target_ref = {**target_ref, "locator_key": locator_key}
+        return target_ref
+    if runtime_id or locator_key:
+        return {"runtime_id": runtime_id, "locator_key": locator_key}
+    return None
+
+
+def _rebind_with_meta(target_ref: Optional[Dict[str, Any]]) -> Tuple[Optional[Any], Dict[str, bool]]:
+    """Best-effort rebind with meta describing inputs used."""
+    meta = {"used_runtime_id": False, "used_locator_key": False, "success": False}
+    if not target_ref:
+        return None, meta
+    meta["used_runtime_id"] = bool(target_ref.get("runtime_id"))
+    meta["used_locator_key"] = bool(target_ref.get("locator_key"))
+    element = None
+    try:
+        element = rebind_element(target_ref, root=None)
+    except Exception:
+        element = None
+    meta["success"] = element is not None
+    return element, meta
+
+
+def _extract_center_from_locator(locate_result: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Return a normalized center dict from locator result."""
+    if not isinstance(locate_result, dict):
+        return None
+    center = locate_result.get("center") or {}
+    if center and center.get("x") is not None and center.get("y") is not None:
+        try:
+            return {"x": float(center.get("x")), "y": float(center.get("y"))}
+        except Exception:
+            pass
+    candidate = locate_result.get("candidate") or {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    candidate_center = candidate.get("center") or {}
+    if candidate_center and candidate_center.get("x") is not None and candidate_center.get("y") is not None:
+        try:
+            return {"x": float(candidate_center.get("x")), "y": float(candidate_center.get("y"))}
+        except Exception:
+            pass
+    bounds = locate_result.get("bounds") or candidate.get("bounds") or {}
+    if bounds and all(k in bounds for k in ("x", "y", "width", "height")):
+        try:
+            return {
+                "x": float(bounds["x"]) + float(bounds["width"]) / 2.0,
+                "y": float(bounds["y"]) + float(bounds["height"]) / 2.0,
+            }
+        except Exception:
+            pass
+    source = candidate.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
+    source_center = source.get("center") if isinstance(source, dict) else None
+    if source_center and source_center.get("x") is not None and source_center.get("y") is not None:
+        try:
+            return {"x": float(source_center.get("x")), "y": float(source_center.get("y"))}
+        except Exception:
+            pass
+    source_bbox = source.get("bbox") if isinstance(source, dict) else None
+    if source_bbox and all(k in source_bbox for k in ("x", "y", "width", "height")):
+        try:
+            return {
+                "x": float(source_bbox["x"]) + float(source_bbox["width"]) / 2.0,
+                "y": float(source_bbox["y"]) + float(source_bbox["height"]) / 2.0,
+            }
+        except Exception:
+            pass
+    return None
+
+
+def _validate_locator_center(center: Optional[Dict[str, float]], locate_result: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate click center to avoid defaulting to unsafe coordinates."""
+    if not center or center.get("x") is None or center.get("y") is None:
+        return False, "locate_missing_center"
+    try:
+        x = float(center.get("x"))
+        y = float(center.get("y"))
+    except Exception:
+        return False, "invalid_center"
+
+    bounds = locate_result.get("bounds") or (locate_result.get("candidate") or {}).get("bounds") or {}
+    if bounds:
+        try:
+            width = float(bounds.get("width", 0))
+            height = float(bounds.get("height", 0))
+            if width <= 0 or height <= 0:
+                return False, "invalid_bounds"
+        except Exception:
+            pass
+    if x == 0 and y == 0 and not bounds:
+        return False, "suspicious_origin_center"
+    try:
+        import pyautogui  # type: ignore
+
+        screen_w, screen_h = pyautogui.size()
+        if x < 0 or y < 0 or x >= screen_w or y >= screen_h:
+            return False, "center_out_of_bounds"
+    except Exception:
+        # If pyautogui is unavailable, rely on downstream mouse validation.
+        pass
+    return True, ""
+
+
+def _extract_control_type(locate_result: Dict[str, Any]) -> str:
+    """Return control_type string for heuristic pattern selection."""
+    if not isinstance(locate_result, dict):
+        return ""
+    candidate = locate_result.get("candidate") or {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    source = candidate.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
+    control_type = (
+        candidate.get("control_type")
+        or source.get("control_type")
+        or source.get("ControlTypeName")
+        or candidate.get("ControlTypeName")
+    )
+    return str(control_type or "").strip()
+
+
+def _click_pattern_sequence(control_type: str) -> List[Tuple[str, Callable]]:
+    """Return ordered UIA pattern attempts for click-like actions."""
+    ctype = (control_type or "").lower()
+    if ctype in {"checkboxcontrol", "checkbox", "switch"}:
+        return [("TogglePattern", try_toggle)]
+    if ctype in {"tabitemcontrol", "tabitem", "listitemcontrol", "listitem", "treeitemcontrol", "treeitem"}:
+        return [("SelectionItemPattern", try_select), ("InvokePattern", try_invoke)]
+    if ctype in {"hyperlinkcontrol", "hyperlink", "buttoncontrol", "button"}:
+        return [("InvokePattern", try_invoke)]
+    return [("InvokePattern", try_invoke), ("SelectionItemPattern", try_select), ("TogglePattern", try_toggle)]
+
+
+class InteractionStrategyError(RuntimeError):
+    """Raised when all interaction strategies fail."""
+
+    def __init__(
+        self,
+        reason: str,
+        rebind_meta: Dict[str, bool],
+        target_ref: Optional[Dict[str, Any]],
+        locator: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(reason)
+        self.rebind_meta = rebind_meta
+        self.target_ref = target_ref
+        self.locator = locator
+
+
+def _execute_click_strategies(locate_result: Dict[str, Any], button: str = "left") -> Dict[str, Any]:
+    """
+    Deterministic click execution with UIA patterns first, then focus+click.
+    """
+    reasons: List[str] = []
+    target_ref = _extract_target_ref_from_locator(locate_result)
+    element, rebind_meta = _rebind_with_meta(target_ref)
+    control_type = _extract_control_type(locate_result)
+    center = _extract_center_from_locator(locate_result)
+    pattern_used: Optional[str] = None
+
+    if element:
+        for pattern_name, func in _click_pattern_sequence(control_type):
+            ok, detail = func(element)
+            if ok:
+                message = {
+                    "ok": True,
+                    "status": "invoked",
+                    "method": "uia_pattern",
+                    "pattern": pattern_name,
+                    "rebind": rebind_meta,
+                    "reason": detail,
+                }
+                return {
+                    "status": "success",
+                    "method": "uia_pattern",
+                    "pattern": pattern_name,
+                    "locator": locate_result,
+                    "target_ref": target_ref,
+                    "message": message,
+                    "reason": detail,
+                    "center": center,
+                }
+            reasons.append(f"{pattern_name}:{detail}")
+    elif target_ref:
+        reasons.append("rebind_failed")
+
+    focus_detail: Optional[str] = None
+    if element:
+        focus_ok, focus_detail = try_focus(element)
+        if focus_ok:
+            reasons.append("focus:ok")
+        elif focus_detail:
+            reasons.append(f"focus:{focus_detail}")
+    elif target_ref:
+        focus_detail = "rebind_missing_for_focus"
+        reasons.append(f"focus:{focus_detail}")
+
+    if not center:
+        raise InteractionStrategyError(f"click_failed:no_center; reasons={'|'.join(reasons)}", rebind_meta, target_ref, locate_result)
+    valid_center, center_reason = _validate_locator_center(center, locate_result)
+    if not valid_center:
+        raise InteractionStrategyError(f"click_failed:{center_reason}", rebind_meta, target_ref, locate_result)
+
+    click_reason = MOUSE.click({"x": center["x"], "y": center["y"], "button": button})
+    click_status = "success"
+    if isinstance(click_reason, str) and click_reason.lower().startswith("error"):
+        click_status = "error"
+        reasons.append(click_reason)
+        raise InteractionStrategyError(f"click_failed:{'|'.join(reasons)}", rebind_meta, target_ref, locate_result)
+    method_label = "focus_then_click" if (locate_result.get("method") == "uia") else (
+        "ocr_then_click" if locate_result.get("method") == "ocr" else "focus_then_click"
+    )
+    message = {
+        "ok": True,
+        "status": click_status,
+        "method": method_label,
+        "pattern": pattern_used,
+        "rebind": rebind_meta,
+        "reason": click_reason,
+    }
+    return {
+        "status": "success",
+        "method": method_label,
+        "locator": locate_result,
+        "center": center,
+        "target_ref": target_ref,
+        "reason": click_reason,
+        "message": message,
+    }
+
+
+def _set_clipboard_text(text: str) -> Tuple[bool, str]:
+    """Set clipboard content using available mechanisms without new deps."""
+    try:
+        import pyperclip  # type: ignore
+
+        pyperclip.copy(text)
+        return True, "pyperclip"
+    except Exception as exc:  # noqa: BLE001
+        last_error = f"pyperclip:{exc}"
+    else:  # pragma: no cover
+        last_error = "unknown_clipboard_error"
+    try:
+        import tkinter  # type: ignore
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        root.destroy()
+        return True, "tkinter"
+    except Exception as exc:  # noqa: BLE001
+        last_error = f"tkinter:{exc}"
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Value @'{text}'@"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return True, "powershell"
+            last_error = f"powershell:exit:{proc.returncode}:{proc.stderr.strip()}"
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"powershell:{exc}"
+    return False, last_error or "clipboard_unavailable"
+
+
+def _type_with_strategies(
+    value: str, locate_result: Dict[str, Any], button: str = "left", auto_enter: bool = True
+) -> Dict[str, Any]:
+    """
+    Deterministic typing: ValuePattern, clipboard paste, then keyboard typing.
+    """
+    reasons: List[str] = []
+    target_ref = _extract_target_ref_from_locator(locate_result)
+    element, rebind_meta = _rebind_with_meta(target_ref)
+    center = _extract_center_from_locator(locate_result)
+    if center:
+        valid_center, center_reason = _validate_locator_center(center, locate_result)
+        if not valid_center:
+            raise InteractionStrategyError(center_reason, rebind_meta, target_ref, locate_result)
+
+    if element:
+        ok, detail = try_set_value(element, value)
+        if ok:
+            message = {
+                "ok": True,
+                "status": "set_value",
+                "method": "uia_value",
+                "pattern": "ValuePattern",
+                "rebind": rebind_meta,
+                "reason": detail,
+            }
+            return {
+                "status": "success",
+                "method": "uia_value",
+                "locator": locate_result,
+                "target_ref": target_ref,
+                "message": message,
+                "center": center,
+            }
+        reasons.append(f"ValuePattern:{detail}")
+    elif target_ref:
+        reasons.append("rebind_failed")
+
+    focus_ok = False
+    focus_reason: Optional[str] = None
+    if element:
+        focus_ok, focus_reason = try_focus(element)
+    elif center:
+        click_reason = MOUSE.click({"x": center["x"], "y": center["y"], "button": button})
+        focus_reason = click_reason if isinstance(click_reason, str) else str(click_reason)
+        focus_ok = not (isinstance(click_reason, str) and click_reason.lower().startswith("error"))
+    if focus_reason and not focus_ok:
+        reasons.append(f"focus:{focus_reason}")
+
+    if focus_ok and (element is not None or target_ref):
+        clipboard_ok, clipboard_detail = _set_clipboard_text(value)
+        if clipboard_ok:
+            try:
+                paste_reason = input.key_press({"keys": ["ctrl", "v"], "post_delay": 0.0})
+            except Exception as exc:  # noqa: BLE001
+                paste_reason = f"error:paste_failed:{exc}"
+            if isinstance(paste_reason, str) and paste_reason.lower().startswith("error"):
+                reasons.append(f"paste:{paste_reason}")
+            else:
+                message = {
+                    "ok": True,
+                    "status": "pasted",
+                    "method": "clipboard_paste",
+                    "pattern": None,
+                    "rebind": rebind_meta,
+                    "reason": paste_reason,
+                }
+                return {
+                    "status": "success",
+                    "method": "clipboard_paste",
+                    "locator": locate_result,
+                    "target_ref": target_ref,
+                    "message": message,
+                    "center": center,
+                }
+        else:
+            reasons.append(f"clipboard:{clipboard_detail}")
+
+    type_reason = input.type_text({"text": value, "auto_enter": auto_enter})
+    if isinstance(type_reason, str) and type_reason.lower().startswith("error"):
+        reasons.append(type_reason)
+        raise InteractionStrategyError(f"type_failed:{'|'.join(reasons)}", rebind_meta, target_ref, locate_result)
+    message = {
+        "ok": True,
+        "status": "typed",
+        "method": "keyboard_type",
+        "pattern": None,
+        "rebind": rebind_meta,
+        "reason": type_reason,
+    }
+    return {
+        "status": "success",
+        "method": "keyboard_type",
+        "locator": locate_result,
+        "target_ref": target_ref,
+        "message": message,
+        "center": center,
+    }
 
 
 def _run_region_ocr(image_path: Path, bounds: Dict[str, float], padding: int = 40) -> List[OcrBox]:
@@ -3490,6 +4233,7 @@ def _capture_observation(capture_screenshot: bool, capture_ocr: bool) -> Dict[st
         return observation
 
     try:
+        observation["foreground"] = _foreground_snapshot()
         screenshot_path = capture_screen()
         observation.update({"captured": True, "screenshot_path": str(screenshot_path), "capture_enabled": True})
         if capture_ocr:
@@ -4370,6 +5114,7 @@ def run_steps(
     # Per-run toggle for VLM usage; restore after run to avoid affecting other calls.
     context_token = CURRENT_CONTEXT.set(context)
     base_vlm_token = VLM_DISABLED.set(not base_allow_vlm)
+    active_window_token = ACTIVE_WINDOW.set(None)
 
     steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
     task_record = None
@@ -4694,6 +5439,7 @@ def run_steps(
     finally:
         CURRENT_CONTEXT.reset(context_token)
         VLM_DISABLED.reset(base_vlm_token)
+        ACTIVE_WINDOW.reset(active_window_token)
         if task_token is not None:
             try:
                 CURRENT_TASK_ID.reset(task_token)

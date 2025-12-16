@@ -1,0 +1,33 @@
+{
+  "task": "Commit4.3 smoke: activate notepad and click 文件",
+  "steps": [
+    {
+      "action": "activate_window",
+      "params": {
+        "target": "Notepad",
+        "title_keywords": ["记事本", "无标题", "Notepad"],
+        "class_keywords": ["Notepad"],
+        "strict": true
+      }
+    },
+    {
+      "action": "wait_until",
+      "params": {
+        "condition": "ui_stable",
+        "timeout": 2,
+        "poll_interval": 0.2,
+        "stable_samples": 1,
+        "stability_duration": 0.2,
+        "require": true
+      }
+    },
+    {
+      "action": "click",
+      "params": {
+        "text": "文件",
+        "visual_description": "记事本左上角菜单栏 文件",
+        "strict_foreground": true
+      }
+    }
+  ]
+}

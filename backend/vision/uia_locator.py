@@ -143,11 +143,78 @@ def _is_control_allowed(control: Any, policy: MatchPolicy) -> bool:
     return _is_interactive_control(control)
 
 
+def _resolve_preferred_root(
+    preferred_hwnd: Optional[int],
+    preferred_pid: Optional[int],
+    preferred_title: Optional[str],
+    query_norm: str,
+) -> Any:
+    """
+    Return a preferred root element from hwnd or pid.
+
+    Raises ValueError when a preferred root is provided but cannot be resolved.
+    """
+    if preferred_hwnd is not None:
+        try:
+            hwnd_int = int(preferred_hwnd)
+            ctrl = auto.ControlFromHandle(hwnd_int)
+            if ctrl:
+                try:
+                    return ctrl.GetTopLevelControl()
+                except Exception:
+                    return ctrl
+        except Exception:
+            pass
+        raise ValueError("preferred_root_unavailable:hwnd")
+
+    if preferred_pid is not None:
+        try:
+            desktop = auto.GetRootControl()
+            if desktop:
+                best = None
+                best_score = -1.0
+                for win in desktop.GetChildren():
+                    try:
+                        if getattr(win, "ProcessId", None) != int(preferred_pid):
+                            continue
+                        score = 0.0
+                        try:
+                            name = str(getattr(win, "Name", "") or "").lower()
+                            if preferred_title:
+                                if preferred_title.lower() == name:
+                                    score += 2.0
+                                elif preferred_title.lower() in name or name in preferred_title.lower():
+                                    score += 1.2
+                            if query_norm and query_norm in name:
+                                score += 1.0
+                        except Exception:
+                            pass
+                        if getattr(win, "IsOffscreen", False):
+                            score -= 0.2
+                        if score > best_score:
+                            best_score = score
+                            best = win
+                    except Exception:
+                        continue
+                if best:
+                    try:
+                        return best.GetTopLevelControl()
+                    except Exception:
+                        return best
+        except Exception:
+            pass
+        raise ValueError("preferred_root_unavailable:pid")
+    return None
+
+
 def find_element(
     query: str,
     root=None,
     timeout: float = 1.0,
     policy: Union[MatchPolicy, str] = MatchPolicy.HYBRID,
+    preferred_hwnd: Optional[int] = None,
+    preferred_pid: Optional[int] = None,
+    preferred_title: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Hybrid UIA locator with policy-aware window/control selection.
@@ -155,9 +222,11 @@ def find_element(
     1) WINDOW_FIRST/HYBRID: search top-level windows without visibility filtering.
     2) Search controls inside the foreground window (visible only).
     3) Allow caller to pass a custom root for scoped search.
+    4) Prefer an explicit hwnd/pid root when provided.
     """
     policy_enum = _normalize_policy(policy)
     query_norm = str(query).strip().lower()
+    preferred_root = None
     with auto.UIAutomationInitializerInThread(debug=False):
         start_ts = time.time()
         print(
@@ -165,13 +234,26 @@ def find_element(
         )
         window_hit: Optional[Dict[str, Any]] = None
 
-        # Strategy 3: explicit root
-        if root:
+        # Strategy 4/3: preferred or explicit root
+        if preferred_hwnd is not None or preferred_pid is not None:
+            preferred_root = _resolve_preferred_root(preferred_hwnd, preferred_pid, preferred_title, query_norm)
+        search_root = preferred_root or root
+        if search_root:
+            root_hwnd = getattr(search_root, "NativeWindowHandle", None)
+            root_cls = getattr(search_root, "ClassName", None) or getattr(search_root, "ControlTypeName", "")
             print(
-                f"[DEBUG] ({time.time():.3f}) Search Root Identified (explicit): "
-                f"{getattr(root, 'Name', '(unknown)')}"
+                f"[DEBUG] ({time.time():.3f}) Search Root Identified: "
+                f"{getattr(search_root, 'Name', '(unknown)')} ({root_cls}) [hwnd={root_hwnd}]"
+                f"{' (preferred)' if preferred_root else ' (explicit)'}"
             )
-            return _search_in_root(root, query_norm, policy_enum)
+            if policy_enum != MatchPolicy.CONTROL_ONLY and query_norm and getattr(search_root, "Name", None):
+                name_norm = str(getattr(search_root, "Name", "") or "").strip().lower()
+                if query_norm in name_norm and not _is_window_control_excluded(search_root, policy_enum):
+                    return _pack_result(search_root, kind="window", method="uia", score=1.0)
+            try:
+                return _search_in_root(search_root, query_norm, policy_enum)
+            except Exception as exc:
+                raise ValueError(f"uia_root_search_failed:{exc}") from exc
 
         # Strategy 1: top-level windows (only when allowed)
         if policy_enum != MatchPolicy.CONTROL_ONLY:
@@ -231,60 +313,53 @@ def find_element(
 
 
 def _search_in_root(root, query_norm: str, policy: MatchPolicy) -> Optional[Dict[str, Any]]:
-    """Search visible controls under a given root."""
-    condition = auto.PropertyCondition(auto.UIA_IsOffscreenPropertyId, False)
+    """Search visible controls under a given root without relying on PropertyCondition."""
+    try:
+        children = list(root.GetChildren())
+    except Exception:
+        children = []
+    stack = children[:]
+    seen = set()
+    print(f"[DEBUG] ({time.time():.3f}) _search_in_root query='{query_norm}' start children={len(stack)}")
 
-    target_types = [
-        auto.ControlType.ButtonControl,
-        auto.ControlType.EditControl,
-        auto.ControlType.MenuItemControl,
-        auto.ControlType.TabItemControl,
-        auto.ControlType.TextControl,
-        auto.ControlType.HyperlinkControl,
-        auto.ControlType.ListItemControl,
-        auto.ControlType.TreeItemControl,
-        auto.ControlType.CheckBoxControl,
-        auto.ControlType.RadioButtonControl,
-        auto.ControlType.ComboBoxControl,
-        getattr(auto.ControlType, "DataItemControl", None),
-    ]
-    target_types = [t for t in target_types if t is not None]
-
-    type_condition = auto.OrCondition(
-        *[auto.PropertyCondition(auto.UIA_ControlTypePropertyId, t) for t in target_types]
-    )
-    final_condition = auto.AndCondition(condition, type_condition)
-
-    elements = root.FindAll(auto.TreeScope.Descendants, final_condition)
-    print(
-        f"[DEBUG] ({time.time():.3f}) _search_in_root query='{query_norm}' "
-        f"elements={len(elements) if elements else 0}"
-    )
-
-    for element in elements:
+    while stack:
+        element = stack.pop(0)
         try:
-            if not _is_control_allowed(element, policy):
+            handle = getattr(element, "NativeWindowHandle", None)
+            if handle and handle in seen:
                 continue
-            name = str(element.Name).strip()
+            if handle:
+                seen.add(handle)
+            if getattr(element, "IsOffscreen", False):
+                pass
+            if not _is_control_allowed(element, policy):
+                # Still traverse its children for nested matches.
+                try:
+                    stack.extend(list(element.GetChildren()))
+                except Exception:
+                    pass
+                continue
+            name = str(getattr(element, "Name", "") or "").strip()
             if not name:
+                try:
+                    stack.extend(list(element.GetChildren()))
+                except Exception:
+                    pass
                 continue
             ctype = getattr(element, "ControlTypeName", "")
             name_l = name.lower()
             if query_norm in name_l:
                 rect = getattr(element, "BoundingRectangle", None)
-                rect_str = (
-                    f"{rect.left},{rect.top},{rect.right},{rect.bottom}" if rect else "n/a"
-                )
+                rect_str = f"{rect.left},{rect.top},{rect.right},{rect.bottom}" if rect else "n/a"
                 print(
                     f"[MATCH] ({time.time():.3f}) Found: Name='{name}', "
                     f"ControlType='{ctype}', BBox={rect_str}"
                 )
                 return _pack_result(element, kind="control", method="uia", score=1.0)
-            elif name and (query_norm[:3] in name_l or name_l[:3] in query_norm):
-                print(
-                    f"[DEBUG] ({time.time():.3f}) Partial Match (Ignored): "
-                    f"Found '{name}' while looking for '{query_norm}'"
-                )
+            try:
+                stack.extend(list(element.GetChildren()))
+            except Exception:
+                continue
         except Exception:
             continue
 
@@ -340,14 +415,37 @@ def _pack_result(
         runtime_id = element.GetRuntimeId() if hasattr(element, "GetRuntimeId") else getattr(element, "RuntimeId", None)
     except Exception:
         runtime_id = None
+    if runtime_id:
+        try:
+            runtime_id = [int(x) for x in runtime_id]
+        except Exception:
+            runtime_id = None
     try:
         automation_id = getattr(element, "AutomationId", None)
     except Exception:
         automation_id = None
     try:
+        class_name = getattr(element, "ClassName", None)
+    except Exception:
+        class_name = None
+    try:
         handle = element.NativeWindowHandle
     except Exception:
         handle = None
+    try:
+        pid = getattr(element, "ProcessId", None)
+    except Exception:
+        pid = None
+    locator_key = {
+        "name": getattr(element, "Name", None),
+        "automation_id": automation_id,
+        "control_type": getattr(element, "ControlTypeName", None),
+        "class_name": class_name,
+    }
+    locator_key = {k: v for k, v in locator_key.items() if v not in (None, "")}
+    target_ref = None
+    if runtime_id or locator_key:
+        target_ref = {"runtime_id": runtime_id, "locator_key": locator_key or None}
 
     result: Dict[str, Any] = {
         "method": method,
@@ -357,9 +455,13 @@ def _pack_result(
         "rect": rect_payload,
         "runtime_id": runtime_id,
         "automation_id": automation_id,
+        "pid": pid,
+        "locator_key": locator_key or None,
         "handle": handle,
         "score": score,
     }
+    if target_ref:
+        result["target_ref"] = target_ref
     if bbox:
         result["bbox"] = bbox
     if center:
