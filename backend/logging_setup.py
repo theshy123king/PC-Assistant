@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +18,63 @@ def _safe_mkdir(path: Path) -> None:
     except Exception:
         # Ignore failures; logging will fall back to stderr.
         pass
+
+
+def _flag_from_env(var: str, default: bool) -> bool:
+    value = os.getenv(var)
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "none"}
+
+
+class _TeeStream:
+    def __init__(self, stream: object, logger: logging.Logger, level: int) -> None:
+        self._stream = stream
+        self._logger = logger
+        self._level = level
+        self._buffer = ""
+
+    def write(self, message: object) -> int:
+        if message is None:
+            return 0
+        if isinstance(message, bytes):
+            text = message.decode(errors="replace")
+        else:
+            text = str(message)
+        if text:
+            self._buffer += text
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                line = line.rstrip("\r")
+                if line.strip():
+                    self._logger.log(self._level, line)
+        if hasattr(self._stream, "write"):
+            try:
+                return int(self._stream.write(text))
+            except Exception:
+                return len(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer.strip():
+            self._logger.log(self._level, self._buffer.rstrip("\r"))
+        self._buffer = ""
+        if hasattr(self._stream, "flush"):
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        if hasattr(self._stream, "isatty"):
+            try:
+                return bool(self._stream.isatty())
+            except Exception:
+                return False
+        return False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
 
 
 def setup_logging() -> None:
@@ -81,3 +139,11 @@ def setup_logging() -> None:
         for h in handlers:
             logger.addHandler(h)
         logger.propagate = False
+
+    if _flag_from_env("BACKEND_CAPTURE_STDIO", True):
+        stdout_logger = logging.getLogger("backend.stdout")
+        stderr_logger = logging.getLogger("backend.stderr")
+        stdout_logger.setLevel(logging.INFO)
+        stderr_logger.setLevel(logging.ERROR)
+        sys.stdout = _TeeStream(sys.stdout, stdout_logger, logging.INFO)
+        sys.stderr = _TeeStream(sys.stderr, stderr_logger, logging.ERROR)

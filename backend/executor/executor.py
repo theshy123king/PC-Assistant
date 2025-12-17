@@ -2520,9 +2520,25 @@ def handle_browser_input(step: ActionStep) -> Any:
     }
 
 
+def _build_vlm_read_prompt(query: str) -> str:
+    return "\n\n".join(
+        [
+            (
+                "You are looking at a screenshot of a browser. "
+                f"User Query: '{query}' (e.g., 'first search result title')"
+            ),
+            "Instructions:",
+            "Identify the specific visual element described by the user.",
+            "Read the text content of that element EXACTLY as it appears on screen.",
+            "Do NOT include accompanying text like URLs, dates, or descriptions.",
+            "Do NOT output markdown or explanations. Output ONLY the raw text string.",
+        ]
+    )
+
+
 def handle_browser_extract_text(step: ActionStep) -> Any:
     """
-    Locate-then-read extractor: locate target region (VLM/UIA/icon) then OCR inside it.
+    Locate-then-read extractor: locate target region then OCR inside it, or use VLM direct read.
     """
     params = step.params or {}
     targets = _extract_targets(params)
@@ -2538,6 +2554,71 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
 
     logs: List[str] = []
     last_candidates: List[Dict[str, Any]] = []
+
+    strategy_hint = str(params.get("strategy_hint", "")).lower().strip()
+    if strategy_hint == "vlm_read":
+        if VLM_DISABLED.get():
+            return {"status": "error", "reason": "vlm_disabled", "log": logs}
+        query = str(
+            params.get("text")
+            or params.get("query")
+            or params.get("label")
+            or (targets[0] if targets else "")
+        ).strip()
+        if not query:
+            return {"status": "error", "reason": "missing_query", "log": logs}
+        provider_name, provider_call = get_vlm_call()
+        last_error: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            logs.append(f"attempt:{attempt}")
+            try:
+                screenshot_path = capture_screen()
+                logs.append(f"screenshot:{screenshot_path}")
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"screenshot failed: {exc}"
+                logs.append(f"vlm_error:{last_error}")
+                continue
+            image_b64 = _encode_image_base64(Path(screenshot_path))
+            if not image_b64:
+                last_error = "image_encode_failed"
+                logs.append(f"vlm_error:{last_error}")
+                continue
+            prompt = _build_vlm_read_prompt(query)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    ],
+                }
+            ]
+            try:
+                reply = provider_call(prompt, messages)
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"vlm_call_failed:{exc}"
+                logs.append(f"vlm_error:{last_error}")
+                continue
+            matched_text = (reply or "").strip()
+            if matched_text:
+                return {
+                    "status": "success",
+                    "matched_text": matched_text,
+                    "matched_term": query,
+                    "method": "vlm_read",
+                    "provider": provider_name,
+                    "log": logs,
+                }
+            last_error = "empty_vlm_reply"
+            logs.append(f"vlm_error:{last_error}")
+        return {
+            "status": "error",
+            "reason": last_error or "vlm_read_failed",
+            "matched_term": query,
+            "method": "vlm_read",
+            "provider": provider_name,
+            "log": logs,
+        }
 
     for attempt in range(1, attempts + 1):
         logs.append(f"attempt:{attempt}")
