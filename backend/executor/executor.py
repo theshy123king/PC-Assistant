@@ -2538,9 +2538,73 @@ def _build_vlm_read_prompt(query: str) -> str:
 
 def handle_browser_extract_text(step: ActionStep) -> Any:
     """
-    Locate-then-read extractor: locate target region then OCR inside it, or use VLM direct read.
+    Extract text from browser. Supports two modes:
+    1. VLM Direct Read (strategy_hint="vlm_read"): Sends screenshot to VLM to read specific content.
+    2. OCR/Locator (default): Finds a label (e.g. "Price") and extracts text near it.
     """
     params = step.params or {}
+
+    # === [Commit 4.8] 新增 VLM 直读分支 ===
+    # 只要 strategy_hint 包含 'vlm' 且是 'read' 意图，就优先尝试直读
+    hint = str(params.get("strategy_hint", "")).lower()
+    if "vlm_read" in hint or ("vlm" in hint and "read" in hint):
+        target_desc = params.get("text") or params.get("target") or params.get("visual_description")
+        if not target_desc:
+            return {"status": "error", "reason": "text/target/visual_description required for vlm_read"}
+
+        # 1. 截图
+        try:
+            screenshot_path = capture_screen()
+        except Exception as exc:
+            return {"status": "error", "reason": f"screenshot failed: {exc}"}
+
+        # 2. 构造直读 Prompt (严格约束模式)
+        prompt = (
+            f"You are looking at a screenshot of a browser.\n"
+            f"User Query: '{target_desc}'\n"
+            f"Instructions:\n"
+            f"1. Identify the specific visual element described by the user.\n"
+            f"2. Read the text content of that element EXACTLY as it appears on screen.\n"
+            f"3. Do NOT include accompanying text like URLs, dates, or descriptions.\n"
+            f"4. Do NOT output markdown or explanations. Output ONLY the raw text string."
+        )
+
+        # 3. 调用 VLM (复用现有的 VLM 配置)
+        provider_name, provider_call = get_vlm_call()
+        if not provider_call:
+            return {"status": "error", "reason": "No VLM provider configured (VLM_DISABLED?)"}
+
+        try:
+            print(f"[EXECUTOR] VLM Direct Read: {target_desc} using {provider_name}")
+            # image_base64 转换
+            image_b64 = _encode_image_base64(Path(screenshot_path))
+
+            # 构造符合接口的消息结构
+            messages = [
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+                ]}
+            ]
+
+            # 直接调用 provider
+            vlm_response = provider_call(prompt, messages)
+
+            # 清理结果 (去掉可能存在的引号或换行)
+            cleaned_text = vlm_response.strip().strip('"').strip("'").strip()
+
+            return {
+                "status": "success",
+                "matched_text": cleaned_text,
+                "matched_term": target_desc,
+                "method": "vlm_direct_read",
+                "log": [f"vlm_provider:{provider_name}", f"prompt:{target_desc}"]
+            }
+
+        except Exception as exc:
+            return {"status": "error", "reason": f"vlm_read failed: {exc}"}
+
+    # === [旧逻辑] OCR/Locator 分支 (保持不变) ===
     targets = _extract_targets(params)
     if not targets:
         return "error: 'text' param is required"
@@ -2554,71 +2618,6 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
 
     logs: List[str] = []
     last_candidates: List[Dict[str, Any]] = []
-
-    strategy_hint = str(params.get("strategy_hint", "")).lower().strip()
-    if strategy_hint == "vlm_read":
-        if VLM_DISABLED.get():
-            return {"status": "error", "reason": "vlm_disabled", "log": logs}
-        query = str(
-            params.get("text")
-            or params.get("query")
-            or params.get("label")
-            or (targets[0] if targets else "")
-        ).strip()
-        if not query:
-            return {"status": "error", "reason": "missing_query", "log": logs}
-        provider_name, provider_call = get_vlm_call()
-        last_error: Optional[str] = None
-        for attempt in range(1, attempts + 1):
-            logs.append(f"attempt:{attempt}")
-            try:
-                screenshot_path = capture_screen()
-                logs.append(f"screenshot:{screenshot_path}")
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"screenshot failed: {exc}"
-                logs.append(f"vlm_error:{last_error}")
-                continue
-            image_b64 = _encode_image_base64(Path(screenshot_path))
-            if not image_b64:
-                last_error = "image_encode_failed"
-                logs.append(f"vlm_error:{last_error}")
-                continue
-            prompt = _build_vlm_read_prompt(query)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    ],
-                }
-            ]
-            try:
-                reply = provider_call(prompt, messages)
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"vlm_call_failed:{exc}"
-                logs.append(f"vlm_error:{last_error}")
-                continue
-            matched_text = (reply or "").strip()
-            if matched_text:
-                return {
-                    "status": "success",
-                    "matched_text": matched_text,
-                    "matched_term": query,
-                    "method": "vlm_read",
-                    "provider": provider_name,
-                    "log": logs,
-                }
-            last_error = "empty_vlm_reply"
-            logs.append(f"vlm_error:{last_error}")
-        return {
-            "status": "error",
-            "reason": last_error or "vlm_read_failed",
-            "matched_term": query,
-            "method": "vlm_read",
-            "provider": provider_name,
-            "log": logs,
-        }
 
     for attempt in range(1, attempts + 1):
         logs.append(f"attempt:{attempt}")
@@ -2634,74 +2633,39 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
         except Exception as exc:  # noqa: BLE001
             return f"error: ocr failed: {exc}"
 
-        locate_result: Dict[str, Any] = {}
-        try:
-            locate_result = _locate_from_params(
-                targets[0], params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
-            )
-        except ValueError as exc:
-            return {"status": "error", "reason": str(exc)}
-
-        if locate_result.get("status") != "success":
-            logs.append(f"locate_failed:{locate_result.get('reason')}")
-            continue
-
-        bounds = locate_result.get("bounds") or (locate_result.get("candidate") or {}).get("bounds") or {}
-        if not bounds:
-            logs.append("locate_success_no_bounds")
-            continue
-
-        def _overlap_ratio(a: Dict[str, float], b: Dict[str, float]) -> float:
-            try:
-                ax1, ay1 = float(a["x"]), float(a["y"])
-                ax2, ay2 = ax1 + float(a["width"]), ay1 + float(a["height"])
-                bx1, by1 = float(b["x"]), float(b["y"])
-                bx2, by2 = bx1 + float(b["width"]), by1 + float(b["height"])
-            except Exception:
-                return 0.0
-            inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-            inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
-            inter_area = inter_w * inter_h
-            area_b = max(0.0, (bx2 - bx1) * (by2 - by1))
-            if area_b <= 0:
-                return 0.0
-            return inter_area / area_b
-
-        region_text_boxes: List[Dict[str, Any]] = []
-        for box in boxes:
-            if not isinstance(box, OcrBox):
+        best = None
+        best_term = None
+        for term in targets:
+            ranked = rank_text_candidates(term, boxes)
+            if ranked:
+                last_candidates.extend(ranked[:5])
+            if not ranked:
                 continue
-            b_bounds = {"x": box.x, "y": box.y, "width": box.width, "height": box.height}
-            if _overlap_ratio(bounds, b_bounds) >= 0.2:
-                region_text_boxes.append(
-                    {
-                        "text": box.text or "",
-                        "x": box.x,
-                        "y": box.y,
-                        "width": box.width,
-                        "height": box.height,
-                    }
-                )
+            top = ranked[0]
+            if not best or top.get("high_enough") and not best.get("high_enough"):
+                best = top
+                best_term = term
+            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
+                best = top
+                best_term = term
+            if top.get("high_enough"):
+                break
 
-        region_text_boxes.sort(key=lambda b: (b["y"], b["x"]))
-        extracted_text = " ".join([b["text"] for b in region_text_boxes if b.get("text")])
-
-        if extracted_text:
-            center = locate_result.get("center") or {}
+        if best and (best.get("high_enough") or best.get("medium_enough")):
+            center = best.get("center") or {}
+            bounds = best.get("bounds") or {}
             result = {
                 "status": "ok",
-                "matched_text": extracted_text,
-                "matched_term": targets[0],
+                "matched_text": best.get("text"),
+                "matched_term": best_term,
                 "center": {"x": center.get("x"), "y": center.get("y")},
                 "bounds": bounds,
-                "locator": locate_result,
                 "full_text": full_text,
                 "log": logs,
-                "candidates": region_text_boxes[:50],
             }
+            if last_candidates:
+                result["candidates"] = last_candidates[:10]
             return result
-
-        logs.append("no_text_in_region")
 
         logs.append("no_match_found")
 
