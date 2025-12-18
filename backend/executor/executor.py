@@ -4578,56 +4578,203 @@ def _normalize_handler_status(message: Any, default_status: str = "success") -> 
 
 
 def _verify_step_outcome(
-    action: str, status: str, message: Any, attempt: int, max_attempts: int, verify_mode: str = "auto"
+    step: ActionStep,
+    status: str,
+    message: Any,
+    attempt: int,
+    max_attempts: int,
+    expected_window: Optional[Dict[str, Any]],
+    before_obs: Dict[str, Any],
+    after_obs: Dict[str, Any],
+    work_dir: Optional[str],
+    verify_mode: str = "auto",
 ) -> Dict[str, Any]:
     """
-    Normalize the outcome of a handler call into a retry/complete/failed decision.
+    Verification logic with bounded retries and structured evidence.
     """
     verify_mode = (verify_mode or "auto").lower()
     if verify_mode not in {"auto", "never", "always"}:
         verify_mode = "auto"
 
-    # If verification is disabled, honor handler status only.
+    decision = "success"
+    reason = "handler_success"
+    verifier = "none"
+    expected: Dict[str, Any] = {}
+    actual: Dict[str, Any] = {}
+    evidence: Dict[str, Any] = {"before": before_obs, "after": after_obs}
+    action = step.action
+
+    def _retry_or_fail() -> str:
+        return "retry" if attempt < max_attempts else "failed"
+
+    if action == "wait_until" and status in {"error", "failed"}:
+        return {
+            "decision": "failed",
+            "reason": "verification_failed",
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": "wait_until",
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": False,
+        }
+
+    if status in {"error", "failed"}:
+        decision = _retry_or_fail()
+        reason = "handler_error"
+        return {
+            "decision": decision,
+            "reason": reason,
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": decision == "retry",
+        }
+
     if verify_mode == "never":
-        decision = "success" if status not in {"error", "failed"} else ("retry" if attempt < max_attempts else "failed")
         return {
             "decision": decision,
             "reason": "verification_skipped",
             "status": status,
             "attempt": attempt,
             "max_attempts": max_attempts,
-            "verified": None,
-            "action": action,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": False,
+        }
+
+    action = step.action
+    params = step.params or {}
+
+    # Classification
+    ui_actions = INPUT_ACTIONS - {"browser_extract_text"}
+    read_only_actions = {"browser_extract_text", "list_windows", "get_active_window", "read_file", "open_file", "list_files"}
+    file_actions = RISKY_FILE_ACTIONS | {"create_folder"}
+
+    if action in ui_actions:
+        verifier = "ui_target"
+        if not expected_window:
+            decision = "failed"
+            reason = "missing_expected"
+        else:
+            expected = {"target": expected_window}
+            decision = "success"
+            reason = "verified_target_hint"
+        return {
+            "decision": decision,
+            "reason": reason,
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
             "should_retry": decision == "retry",
         }
 
-    decision = "success"
-    reason = "handler_success"
-    verified_flag = None
+    if action in file_actions:
+        verifier = "file_state"
+        path = params.get("path") or params.get("source")
+        dest = params.get("destination_dir") or params.get("destination")
+        expected["path"] = path
+        expected["destination"] = dest
+        try:
+            if action == "delete_file":
+                actual["exists"] = Path(path).exists() if path else None
+                ok = path and not Path(path).exists()
+            elif action in {"move_file", "copy_file"} and dest:
+                target = Path(dest) / Path(path or "").name if path else None
+                actual["exists_at_dest"] = target.exists() if target else None
+                ok = bool(target and target.exists())
+            elif action == "rename_file" and dest:
+                target = Path(path).with_name(dest) if path else None
+                actual["exists_new_name"] = target.exists() if target else None
+                ok = bool(target and target.exists())
+            elif action == "write_file":
+                actual["exists"] = Path(path).exists() if path else None
+                ok = bool(path and Path(path).exists())
+            elif action == "create_folder":
+                actual["exists"] = Path(path).exists() if path else None
+                ok = bool(path and Path(path).exists())
+            else:
+                ok = True
+            if ok:
+                decision = "success"
+                reason = "verified_file_state"
+            else:
+                decision = _retry_or_fail()
+                reason = "verification_failed"
+        except Exception as exc:  # noqa: BLE001
+            decision = "failed"
+            reason = f"verification_error:{exc}"
+        return {
+            "decision": decision,
+            "reason": reason,
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": decision == "retry",
+        }
 
-    if isinstance(message, dict):
-        verified_flag = message.get("verified")
+    if action == "wait_until":
+        verifier = "wait_until"
+        decision = "success" if status not in {"error", "failed"} else "failed"
+        reason = "verified" if decision == "success" else "verification_failed"
+        return {
+            "decision": decision,
+            "reason": reason,
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": False,
+        }
 
-    if status in {"error", "failed"}:
-        decision = "retry" if attempt < max_attempts else "failed"
-        reason = "handler_error"
-    elif verified_flag is False:
-        decision = "retry" if attempt < max_attempts else "failed"
-        reason = "verification_failed"
-    elif verified_flag is True:
-        reason = "verified"
-    elif status == "noop":
-        reason = "noop"
+    if action in read_only_actions:
+        verifier = "read_only"
+        decision = "success" if status not in {"error", "failed"} else "failed"
+        reason = "verified" if decision == "success" else "verification_failed"
+        return {
+            "decision": decision,
+            "reason": reason,
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": False,
+        }
 
+    # Default
     return {
         "decision": decision,
         "reason": reason,
         "status": status,
         "attempt": attempt,
         "max_attempts": max_attempts,
-        "verified": verified_flag,
-        "action": action,
-        "should_retry": decision == "retry",
+        "verifier": verifier,
+        "expected": expected,
+        "actual": actual,
+        "evidence": evidence,
+        "should_retry": False,
     }
 
 
@@ -5316,7 +5463,6 @@ INPUT_ACTIONS = {
     "hotkey",
     "browser_click",
     "browser_input",
-    "browser_extract_text",
     "open_app",
     "adjust_volume",
 }
@@ -5567,6 +5713,9 @@ def run_steps(
             if work_dir and step.action in FILE_PATH_ACTIONS:
                 step.params = dict(step.params or {})
                 step.params.setdefault("base_dir", work_dir)
+            expected_window = None
+            if step.action in INPUT_ACTIONS:
+                expected_window = last_focus_target or _extract_focus_hints(step)
             executed_steps += 1
             handler = TEST_MODE_HANDLERS.get(step.action) if use_stub_handlers else None
             if handler is None:
@@ -5616,7 +5765,7 @@ def run_steps(
             risk_info = _score_risk(step, work_dir, last_focus_target)
 
             if not dry_run and step.action in INPUT_ACTIONS:
-                expected = last_focus_target or _extract_focus_hints(step)
+                expected = expected_window
                 if not expected:
                     entry = {
                         "step_index": idx,
@@ -5756,11 +5905,15 @@ def run_steps(
                     )
                     normalized_status, normalized_reason = _normalize_handler_status(message, handler_status)
                     verification = _verify_step_outcome(
-                        step.action,
+                        step,
                         normalized_status,
                         message,
                         attempt,
                         step_feedback["max_attempts"],
+                        expected_window if step.action in INPUT_ACTIONS else None,
+                        before_obs,
+                        after_obs,
+                        work_dir,
                         verify_mode=step_feedback.get("verify_mode", "auto"),
                     )
 
@@ -5791,11 +5944,14 @@ def run_steps(
 
                     if verification["decision"] == "success":
                         step_status = "success"
+                        last_message = verification.get("reason") or last_message
                         break
                     if verification["decision"] == "retry":
+                        last_message = verification.get("reason") or last_message
                         continue
 
                     step_status = "error"
+                    last_message = verification.get("reason") or last_message
                     break
             finally:
                 VLM_DISABLED.reset(step_vlm_token)
@@ -5811,6 +5967,7 @@ def run_steps(
                 "attempts": attempt_logs,
                 "verification": last_verification,
                 "feedback": step_feedback,
+                "reason": last_verification.get("reason") if last_verification else normalized_reason,
             }
             if attempt_logs:
                 entry["observations"] = attempt_logs[-1].get("observation")
