@@ -473,6 +473,29 @@ ALLOWED_ROOTS = [
     )
     if str(root).strip()
 ]
+SYSTEM_FORBIDDEN_DIRS = [
+    os.path.abspath(os.path.expandvars(path))
+    for path in [
+        r"C:\Windows",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+        r"%WINDIR%",
+        r"%SYSTEMROOT%",
+    ]
+]
+USER_SENSITIVE_DIRS = [
+    os.path.abspath(os.path.expandvars(path))
+    for path in [
+        r"%USERPROFILE%\AppData",
+        r"%USERPROFILE%\AppData\Local",
+        r"%USERPROFILE%\AppData\Roaming",
+        r"%USERPROFILE%\Desktop",
+        r"%USERPROFILE%\Documents",
+        r"%USERPROFILE%\Pictures",
+        r"%USERPROFILE%\Downloads",
+    ]
+]
 
 
 def _add_allowed_root(path: str) -> None:
@@ -489,6 +512,72 @@ def _add_allowed_root(path: str) -> None:
         except Exception:
             continue
     ALLOWED_ROOTS.append(resolved)
+
+
+def _normalize_case(path_value: str) -> str:
+    try:
+        return path_value.casefold()
+    except Exception:
+        return path_value.lower()
+
+
+def _normalize_path_candidate(path_value: str, base_dir: Optional[str]) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    Normalize a user-provided path string into an absolute, resolved path.
+
+    Returns (normalized_path, error_reason, had_traversal_hint).
+    """
+    if not path_value or not isinstance(path_value, str):
+        return None, "invalid_path", False
+    if "*" in path_value or "?" in path_value:
+        return None, "wildcard_blocked", False
+    had_traversal = ".." in Path(path_value).parts
+    try:
+        expanded = os.path.expanduser(path_value)
+        if not os.path.isabs(expanded):
+            if base_dir:
+                expanded = os.path.join(base_dir, expanded)
+            else:
+                expanded = os.path.abspath(expanded)
+        abs_path = os.path.abspath(expanded)
+        # Resolve symlinks/junctions if possible but allow non-existent targets.
+        resolved = Path(abs_path).resolve(strict=False)
+        return str(resolved), None, had_traversal
+    except Exception:
+        return None, "normalize_error", had_traversal
+
+
+def _is_under_any_root(path_value: str, roots: List[str]) -> bool:
+    for root in roots:
+        try:
+            common = os.path.commonpath([path_value, root])
+            if common == root:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_forbidden_path(path_value: str, allowed_roots: List[str]) -> bool:
+    # If already under allowed root, do not treat as forbidden.
+    if _is_under_any_root(path_value, allowed_roots):
+        return False
+    lower_path = _normalize_case(path_value)
+    forbidden_bases = [*SYSTEM_FORBIDDEN_DIRS, *USER_SENSITIVE_DIRS]
+    for base in forbidden_bases:
+        try:
+            if _normalize_case(base) and _normalize_case(path_value).startswith(_normalize_case(base)):
+                return True
+        except Exception:
+            continue
+    # Block drive roots (e.g., C:\) unless explicitly allowed.
+    drive, tail = os.path.splitdrive(path_value)
+    if drive and not tail.strip("\\/"):
+        return True
+    # Block UNC unless explicitly allowed via roots.
+    if path_value.startswith("\\\\") and not _is_under_any_root(path_value, allowed_roots):
+        return True
+    return False
 OCR_PREVIEW_LIMIT = 1200
 OCR_CAPTURE_ACTIONS = {
     "browser_click",
@@ -4625,6 +4714,105 @@ def _normalize_handler_status(message: Any, default_status: str = "success") -> 
     return status, reason
 
 
+def _evaluate_file_guardrails(
+    step: ActionStep,
+    work_dir: Optional[str],
+    dry_run: bool,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Enforce file path guardrails for mutation and read-only actions.
+    """
+    action = step.action
+    params = step.params or {}
+    roots = list(allowed_roots or ALLOWED_ROOTS)
+    if work_dir:
+        _add_allowed_root(work_dir)
+        if work_dir not in roots:
+            roots.append(os.path.abspath(work_dir))
+
+    def _decision(allow: bool, reason: str, original: Optional[str], normalized: Optional[str], rule: str) -> Dict[str, Any]:
+        return {
+            "allow": allow,
+            "reason": reason,
+            "rule": rule,
+            "original_path": original,
+            "normalized_path": normalized,
+            "allowed_roots": roots,
+        }
+
+    mutation_actions = {"write_file", "delete_file", "move_file", "copy_file", "rename_file", "create_folder"}
+    read_actions = {"read_file", "open_file", "list_files"}
+    relevant_actions = mutation_actions | read_actions
+    if action not in relevant_actions:
+        return _decision(True, "not_applicable", None, None, "skip")
+
+    # Collect source/target paths.
+    primary = params.get("path") or params.get("source")
+    destination = params.get("destination") or params.get("destination_dir") or params.get("new_name")
+
+    # Normalize primary
+    norm_primary, err_primary, had_traversal = _normalize_path_candidate(primary, work_dir)
+    if err_primary:
+        return _decision(False, err_primary if err_primary != "normalize_error" else "path_not_allowed", primary, None, err_primary)
+
+    # Wildcard already handled above.
+    if had_traversal and norm_primary and not _is_under_any_root(norm_primary, roots):
+        return _decision(False, "traversal_detected", primary, norm_primary, "traversal_detected")
+
+    if _is_forbidden_path(norm_primary, roots):
+        return _decision(False, "forbidden_path", primary, norm_primary, "forbidden_path")
+
+    # Destination normalization for move/copy/rename.
+    norm_dest = None
+    if action in {"move_file", "copy_file", "rename_file"} and destination:
+        norm_dest, err_dest, had_traversal_dest = _normalize_path_candidate(destination, work_dir)
+        if err_dest:
+            return _decision(False, err_dest if err_dest != "normalize_error" else "path_not_allowed", destination, None, err_dest)
+        if had_traversal_dest and norm_dest and not _is_under_any_root(norm_dest, roots):
+            return _decision(False, "traversal_detected", destination, norm_dest, "traversal_detected")
+        if _is_forbidden_path(norm_dest, roots):
+            return _decision(False, "forbidden_path", destination, norm_dest, "forbidden_path")
+
+    is_mutation = action in mutation_actions
+
+    # Allowed roots enforcement for mutations
+    if is_mutation:
+        if not _is_under_any_root(norm_primary, roots):
+            return _decision(False, "path_not_allowed", primary, norm_primary, "path_not_allowed")
+        if norm_dest and not _is_under_any_root(norm_dest, roots):
+            return _decision(False, "path_not_allowed", destination, norm_dest, "path_not_allowed")
+
+    else:
+        # Read-only policy: allow outside roots unless forbidden
+        if _is_forbidden_path(norm_primary, roots):
+            return _decision(False, "forbidden_path", primary, norm_primary, "forbidden_path")
+
+    # Symlink/junction escape: resolved path outside roots even if apparent path is under root.
+    if is_mutation and norm_primary and not _is_under_any_root(norm_primary, roots):
+        return _decision(False, "symlink_escape", primary, norm_primary, "symlink_escape")
+    if is_mutation and norm_dest and not _is_under_any_root(norm_dest, roots):
+        return _decision(False, "symlink_escape", destination, norm_dest, "symlink_escape")
+
+    # Overwrite guard (runtime only)
+    if not dry_run:
+        try:
+            overwrite_flag = _coerce_bool(params.get("overwrite"), False)
+        except Exception:
+            overwrite_flag = False
+        if action in {"write_file", "rename_file", "move_file", "copy_file"}:
+            target_path = norm_dest if action in {"move_file", "copy_file"} else norm_primary
+            if target_path and _is_under_any_root(target_path, roots):
+                try:
+                    if Path(target_path).exists() and not overwrite_flag:
+                        return _decision(False, "overwrite_blocked", target_path, target_path, "overwrite_blocked")
+                except Exception:
+                    # If stat fails, err on side of blocking overwrite.
+                    return _decision(False, "overwrite_blocked", target_path, target_path, "overwrite_blocked")
+
+    return _decision(True, "allow", primary, norm_primary, "allow")
+
+
 def _verify_step_outcome(
     step: ActionStep,
     status: str,
@@ -6215,6 +6403,73 @@ def run_steps(
                     try:
                         context.record_step_result(entry)
                         context.add_error(entry["message"], risk_info)
+                    except Exception:
+                        pass
+                overall_status = "error"
+                break
+
+            # File guardrails (mutation + read)
+            file_guard = _evaluate_file_guardrails(step, work_dir, dry_run, allowed_roots=ALLOWED_ROOTS)
+            if not file_guard.get("allow"):
+                reason_code = file_guard.get("reason") or "path_not_allowed"
+                evidence = _build_evidence(
+                    request_id,
+                    idx,
+                    0,
+                    step.action,
+                    "error",
+                    reason_code,
+                    "gate",
+                    before_obs=None,
+                    after_obs=None,
+                    foreground=None,
+                    file_check={
+                        "original_path": file_guard.get("original_path"),
+                        "normalized_path": file_guard.get("normalized_path"),
+                        "allowed_roots": file_guard.get("allowed_roots"),
+                        "rule": file_guard.get("rule"),
+                        "decision": "deny",
+                    },
+                    dry_run=dry_run,
+                )
+                entry = {
+                    "step_index": idx,
+                    "action": step.action,
+                    "params": step.params,
+                    "status": "error",
+                    "reason": reason_code,
+                    "message": reason_code.replace("_", " "),
+                    "request_id": request_id,
+                    "timestamp": now_iso_utc(),
+                    "duration_ms": 0.0,
+                    "evidence": evidence,
+                    "attempts": [
+                        {
+                            "attempt": 0,
+                            "status": "error",
+                            "reason": reason_code,
+                            "message": reason_code.replace("_", " "),
+                            "verification": {
+                                "decision": "failed",
+                                "reason": reason_code,
+                                "status": "error",
+                                "attempt": 0,
+                                "max_attempts": 0,
+                                "verifier": "file_guard",
+                                "expected": {},
+                                "actual": {},
+                                "evidence": evidence,
+                                "should_retry": False,
+                            },
+                            "evidence": evidence,
+                        }
+                    ],
+                }
+                logs.append(entry)
+                if context:
+                    try:
+                        context.record_step_result(entry)
+                        context.add_error(entry["message"], {"file_guard": file_guard})
                     except Exception:
                         pass
                 overall_status = "error"
