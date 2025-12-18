@@ -40,7 +40,7 @@ def test_run_steps_allows_delete_with_confirm():
         )
         ctx = TaskContext(user_instruction="delete ok", max_replans=0)
 
-        result = executor.run_steps(plan, context=ctx, allow_replan=False, max_retries=0)
+        result = executor.run_steps(plan, context=ctx, allow_replan=False, max_retries=0, consent_token=True)
 
         assert result["overall_status"] == "success"
         assert not victim.exists()

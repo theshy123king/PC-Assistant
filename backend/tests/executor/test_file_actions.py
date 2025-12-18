@@ -107,6 +107,7 @@ def test_rewrite_save_pattern_to_write_file():
             capture_observations=False,
             max_retries=0,
             capture_ocr=False,
+            consent_token=True,
         )
         assert result["overall_status"] in {"success", "replanned"}
         assert target.exists()

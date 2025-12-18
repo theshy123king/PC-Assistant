@@ -1294,6 +1294,7 @@ async def resume_task(task_id: str, payload: dict | None = None):
         raise HTTPException(status_code=404, detail="task not found")
     if record.status != TaskStatus.AWAITING_USER:
         raise HTTPException(status_code=400, detail="task not awaiting user")
+    request_id = payload.get("request_id") if isinstance(payload, dict) else None
     try:
         plan = ActionPlan.model_validate(record.plan)
     except Exception as exc:  # noqa: BLE001

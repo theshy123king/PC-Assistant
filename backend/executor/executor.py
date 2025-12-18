@@ -222,6 +222,51 @@ def _set_last_focus_target(context, target: Optional[Dict[str, Any]]) -> None:
             pass
 
 
+def _build_evidence(
+    request_id: Optional[str],
+    step_index: int,
+    attempt: int,
+    action: str,
+    status: str,
+    reason: str,
+    capture_phase: str,
+    before_obs: Optional[Dict[str, Any]] = None,
+    after_obs: Optional[Dict[str, Any]] = None,
+    foreground: Optional[Dict[str, Any]] = None,
+    verifier: Optional[str] = None,
+    expected: Optional[Dict[str, Any]] = None,
+    actual: Optional[Dict[str, Any]] = None,
+    risk: Optional[Dict[str, Any]] = None,
+    focus_expected: Optional[Dict[str, Any]] = None,
+    focus_actual: Optional[Dict[str, Any]] = None,
+    file_check: Optional[Dict[str, Any]] = None,
+    text_result: Optional[Any] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "step_index": step_index,
+        "attempt": attempt,
+        "action": action,
+        "status": status,
+        "reason": reason,
+        "timestamp": now_iso_utc(),
+        "capture_phase": capture_phase,
+        "before_obs_ref": before_obs,
+        "after_obs_ref": after_obs,
+        "foreground": foreground,
+        "verifier": verifier,
+        "expected": expected,
+        "actual": actual,
+        "risk": risk,
+        "focus_expected": focus_expected,
+        "focus_actual": focus_actual,
+        "file_check": file_check,
+        "text_result": text_result,
+        "dry_run": dry_run,
+    }
+
+
 def _is_path_under(base_dir: Optional[str], path_value: Optional[str]) -> bool:
     if not base_dir or not path_value:
         return False
@@ -2394,6 +2439,8 @@ def handle_browser_click(step: ActionStep) -> Any:
     """
     params = step.params or {}
     targets = _extract_targets(params)
+    hint = str(params.get("strategy_hint", "")).lower()
+    params_summary = dict(params)
     debug = {
         "branch": "ocr_locator",
         "strategy_hint": hint,
@@ -2568,6 +2615,7 @@ def handle_browser_input(step: ActionStep) -> Any:
     auto_enter = _coerce_bool(params.get("auto_enter"), True)
     preferred = _preferred_window_hint()
     strict_fg = _coerce_bool(params.get("strict_foreground"), False)
+    hint = str(params.get("strategy_hint", "")).lower()
     if strict_fg and not preferred:
         preferred = _get_active_window_snapshot() or {}
     pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
@@ -4588,6 +4636,8 @@ def _verify_step_outcome(
     after_obs: Dict[str, Any],
     work_dir: Optional[str],
     verify_mode: str = "auto",
+    request_id: Optional[str] = None,
+    step_index: int = 0,
 ) -> Dict[str, Any]:
     """
     Verification logic with bounded retries and structured evidence.
@@ -4601,20 +4651,46 @@ def _verify_step_outcome(
     verifier = "none"
     expected: Dict[str, Any] = {}
     actual: Dict[str, Any] = {}
-    evidence: Dict[str, Any] = {"before": before_obs, "after": after_obs}
     action = step.action
+    foreground = after_obs.get("foreground") if isinstance(after_obs, dict) else None
+    text_result = None
 
     def _retry_or_fail() -> str:
         return "retry" if attempt < max_attempts else "failed"
 
+    params = step.params or {}
+
+    # Classification
+    ui_actions = INPUT_ACTIONS - {"browser_extract_text"}
+    read_only_actions = {"browser_extract_text", "list_windows", "get_active_window", "read_file", "open_file", "list_files"}
+    file_actions = RISKY_FILE_ACTIONS | {"create_folder"}
+
     if action == "wait_until" and status in {"error", "failed"}:
+        verifier = "wait_until"
+        reason = "verification_failed"
+        decision = "failed"
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+        )
         return {
-            "decision": "failed",
-            "reason": "verification_failed",
+            "decision": decision,
+            "reason": reason,
             "status": status,
             "attempt": attempt,
             "max_attempts": max_attempts,
-            "verifier": "wait_until",
+            "verifier": verifier,
             "expected": expected,
             "actual": actual,
             "evidence": evidence,
@@ -4624,6 +4700,22 @@ def _verify_step_outcome(
     if status in {"error", "failed"}:
         decision = _retry_or_fail()
         reason = "handler_error"
+        verifier = "none"
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+        )
         return {
             "decision": decision,
             "reason": reason,
@@ -4638,9 +4730,25 @@ def _verify_step_outcome(
         }
 
     if verify_mode == "never":
+        reason = "verification_skipped"
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+        )
         return {
             "decision": decision,
-            "reason": "verification_skipped",
+            "reason": reason,
             "status": status,
             "attempt": attempt,
             "max_attempts": max_attempts,
@@ -4651,14 +4759,6 @@ def _verify_step_outcome(
             "should_retry": False,
         }
 
-    action = step.action
-    params = step.params or {}
-
-    # Classification
-    ui_actions = INPUT_ACTIONS - {"browser_extract_text"}
-    read_only_actions = {"browser_extract_text", "list_windows", "get_active_window", "read_file", "open_file", "list_files"}
-    file_actions = RISKY_FILE_ACTIONS | {"create_folder"}
-
     if action in ui_actions:
         verifier = "ui_target"
         if not expected_window:
@@ -4668,6 +4768,23 @@ def _verify_step_outcome(
             expected = {"target": expected_window}
             decision = "success"
             reason = "verified_target_hint"
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+            focus_expected=expected_window,
+            focus_actual=foreground,
+        )
         return {
             "decision": decision,
             "reason": reason,
@@ -4716,6 +4833,22 @@ def _verify_step_outcome(
         except Exception as exc:  # noqa: BLE001
             decision = "failed"
             reason = f"verification_error:{exc}"
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+            file_check=actual,
+        )
         return {
             "decision": decision,
             "reason": reason,
@@ -4733,6 +4866,21 @@ def _verify_step_outcome(
         verifier = "wait_until"
         decision = "success" if status not in {"error", "failed"} else "failed"
         reason = "verified" if decision == "success" else "verification_failed"
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+        )
         return {
             "decision": decision,
             "reason": reason,
@@ -4750,6 +4898,24 @@ def _verify_step_outcome(
         verifier = "read_only"
         decision = "success" if status not in {"error", "failed"} else "failed"
         reason = "verified" if decision == "success" else "verification_failed"
+        if isinstance(message, dict) and "text" in message:
+            text_result = message.get("text")
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+            text_result=text_result,
+        )
         return {
             "decision": decision,
             "reason": reason,
@@ -4763,7 +4929,21 @@ def _verify_step_outcome(
             "should_retry": False,
         }
 
-    # Default
+    evidence = _build_evidence(
+        request_id,
+        step_index,
+        attempt,
+        action,
+        status,
+        reason,
+        "verify",
+        before_obs,
+        after_obs,
+        foreground,
+        verifier=verifier,
+        expected=expected,
+        actual=actual,
+    )
     return {
         "decision": decision,
         "reason": reason,
@@ -5617,6 +5797,20 @@ def run_steps(
     if dry_run:
         for idx, step in enumerate(steps):
             risk_info = _score_risk(step, work_dir, last_focus_target)
+            evidence = _build_evidence(
+                request_id,
+                idx,
+                0,
+                getattr(step, "action", None),
+                "skipped",
+                "dry_run",
+                "preflight",
+                before_obs=None,
+                after_obs=None,
+                foreground=last_focus_target,
+                risk=risk_info,
+                dry_run=True,
+            )
             entry = {
                 "step_index": idx,
                 "action": getattr(step, "action", None),
@@ -5626,6 +5820,28 @@ def run_steps(
                 "timestamp": now_iso_utc(),
                 "duration_ms": 0.0,
                 "risk": risk_info,
+                "evidence": evidence,
+                "attempts": [
+                    {
+                        "attempt": 0,
+                        "status": "skipped",
+                        "reason": "dry_run",
+                        "message": "dry_run: no side effects executed",
+                        "verification": {
+                            "decision": "success",
+                            "reason": "dry_run",
+                            "status": "skipped",
+                            "attempt": 0,
+                            "max_attempts": 0,
+                            "verifier": "none",
+                            "expected": {},
+                            "actual": {},
+                            "evidence": evidence,
+                            "should_retry": False,
+                        },
+                        "evidence": evidence,
+                    }
+                ],
             }
             logs.append(entry)
             if context:
@@ -5767,6 +5983,21 @@ def run_steps(
             if not dry_run and step.action in INPUT_ACTIONS:
                 expected = expected_window
                 if not expected:
+                    evidence = _build_evidence(
+                        request_id,
+                        idx,
+                        0,
+                        step.action,
+                        "error",
+                        "no_target_hint",
+                        "gate",
+                        before_obs=None,
+                        after_obs=None,
+                        foreground=None,
+                        focus_expected=None,
+                        focus_actual=None,
+                        risk=risk_info,
+                    )
                     entry = {
                         "step_index": idx,
                         "action": step.action,
@@ -5779,6 +6010,28 @@ def run_steps(
                         "duration_ms": 0.0,
                         "expected_window": None,
                         "actual_window": None,
+                        "evidence": evidence,
+                        "attempts": [
+                            {
+                                "attempt": 0,
+                                "status": "error",
+                                "reason": "no_target_hint",
+                                "message": "no target hint for focus safety",
+                                "verification": {
+                                    "decision": "failed",
+                                    "reason": "no_target_hint",
+                                    "status": "error",
+                                    "attempt": 0,
+                                    "max_attempts": 0,
+                                    "verifier": "focus_gate",
+                                    "expected": {},
+                                    "actual": {},
+                                    "evidence": evidence,
+                                    "should_retry": False,
+                                },
+                                "evidence": evidence,
+                            }
+                        ],
                     }
                     logs.append(entry)
                     if context:
@@ -5791,6 +6044,21 @@ def run_steps(
                     break
                 actual_window = window_provider.get_foreground_window()
                 if not _window_matches(expected, actual_window):
+                    evidence = _build_evidence(
+                        request_id,
+                        idx,
+                        0,
+                        step.action,
+                        "error",
+                        "foreground_mismatch",
+                        "gate",
+                        before_obs=None,
+                        after_obs=None,
+                        foreground=actual_window,
+                        focus_expected=expected,
+                        focus_actual=actual_window,
+                        risk=risk_info,
+                    )
                     entry = {
                         "step_index": idx,
                         "action": step.action,
@@ -5803,6 +6071,28 @@ def run_steps(
                         "duration_ms": 0.0,
                         "expected_window": expected,
                         "actual_window": actual_window,
+                        "evidence": evidence,
+                        "attempts": [
+                            {
+                                "attempt": 0,
+                                "status": "error",
+                                "reason": "foreground_mismatch",
+                                "message": "foreground window mismatch",
+                                "verification": {
+                                    "decision": "failed",
+                                    "reason": "foreground_mismatch",
+                                    "status": "error",
+                                    "attempt": 0,
+                                    "max_attempts": 0,
+                                    "verifier": "focus_gate",
+                                    "expected": {"target": expected},
+                                    "actual": {"foreground": actual_window},
+                                    "evidence": evidence,
+                                    "should_retry": False,
+                                },
+                                "evidence": evidence,
+                            }
+                        ],
                     }
                     logs.append(entry)
                     if context:
@@ -5815,6 +6105,19 @@ def run_steps(
                     break
 
             if risk_info["level"] == RISK_BLOCK:
+                evidence = _build_evidence(
+                    request_id,
+                    idx,
+                    0,
+                    step.action,
+                    "error",
+                    "blocked",
+                    "gate",
+                    before_obs=None,
+                    after_obs=None,
+                    foreground=None,
+                    risk=risk_info,
+                )
                 entry = {
                     "step_index": idx,
                     "action": step.action,
@@ -5826,6 +6129,28 @@ def run_steps(
                     "request_id": request_id,
                     "timestamp": now_iso_utc(),
                     "duration_ms": 0.0,
+                    "evidence": evidence,
+                    "attempts": [
+                        {
+                            "attempt": 0,
+                            "status": "error",
+                            "reason": "blocked",
+                            "message": risk_info["reason"],
+                            "verification": {
+                                "decision": "failed",
+                                "reason": "blocked",
+                                "status": "error",
+                                "attempt": 0,
+                                "max_attempts": 0,
+                                "verifier": "risk_gate",
+                                "expected": {},
+                                "actual": {},
+                                "evidence": evidence,
+                                "should_retry": False,
+                            },
+                            "evidence": evidence,
+                        }
+                    ],
                 }
                 logs.append(entry)
                 if context:
@@ -5838,6 +6163,19 @@ def run_steps(
                 break
 
             if risk_info["level"] == RISK_HIGH and not consent_token:
+                evidence = _build_evidence(
+                    request_id,
+                    idx,
+                    0,
+                    step.action,
+                    "error",
+                    "needs_consent",
+                    "gate",
+                    before_obs=None,
+                    after_obs=None,
+                    foreground=None,
+                    risk=risk_info,
+                )
                 entry = {
                     "step_index": idx,
                     "action": step.action,
@@ -5849,6 +6187,28 @@ def run_steps(
                     "request_id": request_id,
                     "timestamp": now_iso_utc(),
                     "duration_ms": 0.0,
+                    "evidence": evidence,
+                    "attempts": [
+                        {
+                            "attempt": 0,
+                            "status": "error",
+                            "reason": "needs_consent",
+                            "message": "consent required for high-risk action",
+                            "verification": {
+                                "decision": "failed",
+                                "reason": "needs_consent",
+                                "status": "error",
+                                "attempt": 0,
+                                "max_attempts": 0,
+                                "verifier": "risk_gate",
+                                "expected": {},
+                                "actual": {},
+                                "evidence": evidence,
+                                "should_retry": False,
+                            },
+                            "evidence": evidence,
+                        }
+                    ],
                 }
                 logs.append(entry)
                 if context:
@@ -5915,6 +6275,8 @@ def run_steps(
                         after_obs,
                         work_dir,
                         verify_mode=step_feedback.get("verify_mode", "auto"),
+                        request_id=request_id,
+                        step_index=idx,
                     )
 
                     attempt_logs.append(
@@ -5929,6 +6291,7 @@ def run_steps(
                                 "after": after_obs if step_feedback["capture_after"] else {"capture_enabled": False},
                             },
                             "verification": verification,
+                            "evidence": verification.get("evidence"),
                         }
                     )
                     last_message = message
@@ -5969,6 +6332,8 @@ def run_steps(
                 "feedback": step_feedback,
                 "reason": last_verification.get("reason") if last_verification else normalized_reason,
             }
+            if last_verification:
+                entry["evidence"] = last_verification.get("evidence")
             if attempt_logs:
                 entry["observations"] = attempt_logs[-1].get("observation")
 
