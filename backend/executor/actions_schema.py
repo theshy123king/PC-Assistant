@@ -36,7 +36,9 @@ Supported actions and expected params:
 - browser_extract_text: {"text": "<label>", "variants": ["Alt"]}.
 """
 
-from typing import Any, Dict, List, Literal, Optional
+from copy import deepcopy
+from itertools import zip_longest
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -429,3 +431,130 @@ def validate_action_plan(plan: Dict[str, Any]) -> ActionPlan:
         return ActionPlan.model_validate(plan)
     except ValidationError as exc:  # noqa: BLE001
         raise ValueError(f"Invalid action plan: {exc}") from exc
+
+
+class PlanValidationError(ValueError):
+    """Structured validation failure for action plans."""
+
+    def __init__(self, errors: List[Dict[str, Any]]):
+        super().__init__("Invalid action plan")
+        self.errors = errors
+
+
+def _format_validation_errors(exc: ValidationError, original_plan: Any) -> List[Dict[str, Any]]:
+    """Convert pydantic ValidationError into structured step-level errors."""
+    orig_steps: List[dict] = []
+    if isinstance(original_plan, ActionPlan):
+        try:
+            orig_steps = [s.model_dump() for s in original_plan.steps]
+        except Exception:
+            orig_steps = []
+    elif isinstance(original_plan, dict):
+        steps = original_plan.get("steps")
+        if isinstance(steps, list):
+            orig_steps = [s for s in steps if isinstance(s, dict)]
+
+    formatted: List[Dict[str, Any]] = []
+    for err in exc.errors():
+        loc = list(err.get("loc", []))
+        field = None
+        step_index = None
+        if "steps" in loc:
+            steps_pos = loc.index("steps")
+            if steps_pos + 1 < len(loc) and isinstance(loc[steps_pos + 1], int):
+                step_index = loc[steps_pos + 1]
+                for token in reversed(loc[steps_pos + 2 :]):
+                    if isinstance(token, str):
+                        field = token
+                        break
+        if field is None and loc:
+            tail = loc[-1]
+            if isinstance(tail, str):
+                field = tail
+        action = None
+        if step_index is not None and 0 <= step_index < len(orig_steps):
+            action = orig_steps[step_index].get("action")
+        formatted.append(
+            {
+                "step_index": step_index,
+                "action": action,
+                "field": field,
+                "reason": err.get("msg", ""),
+            }
+        )
+    return formatted
+
+
+def _collect_normalization_warnings(original_plan: Any, validated_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Capture conservative normalization warnings (aliases/defaults only)."""
+    warnings: List[Dict[str, Any]] = []
+    orig_steps: List[dict] = []
+    if isinstance(original_plan, ActionPlan):
+        try:
+            orig_steps = [s.model_dump() for s in original_plan.steps]
+        except Exception:
+            orig_steps = []
+    elif isinstance(original_plan, dict):
+        steps = original_plan.get("steps")
+        if isinstance(steps, list):
+            orig_steps = [s for s in steps if isinstance(s, dict)]
+
+    validated_steps = validated_plan.get("steps", []) if isinstance(validated_plan, dict) else []
+    for idx, (orig, val) in enumerate(zip_longest(orig_steps, validated_steps, fillvalue={})):
+        if not isinstance(val, dict):
+            continue
+        action = val.get("action") if isinstance(val, dict) else None
+        orig_params = orig.get("params", {}) if isinstance(orig, dict) else {}
+        val_params = val.get("params", {}) if isinstance(val, dict) else {}
+        recorded_defaults: set[str] = set()
+
+        if isinstance(orig_params, dict) and "destination" in orig_params and "destination_dir" in val_params:
+            warnings.append(
+                {
+                    "step_index": idx,
+                    "action": action,
+                    "field": "destination",
+                    "reason": "normalized_to_destination_dir",
+                }
+            )
+            recorded_defaults.add("destination_dir")
+        if isinstance(orig_params, dict) and "name" in orig_params and "path" not in orig_params and "path" in val_params:
+            warnings.append(
+                {
+                    "step_index": idx,
+                    "action": action,
+                    "field": "name",
+                    "reason": "normalized_to_path",
+                }
+            )
+            recorded_defaults.add("path")
+
+        if isinstance(orig_params, dict) and isinstance(val_params, dict):
+            for key in val_params:
+                if key not in orig_params and key not in recorded_defaults:
+                    warnings.append(
+                        {
+                            "step_index": idx,
+                            "action": action,
+                            "field": key,
+                            "reason": "default_applied",
+                        }
+                    )
+    return warnings
+
+
+def validate_plan_with_warnings(plan: Any) -> Tuple[ActionPlan, List[Dict[str, Any]]]:
+    """
+    Validate a plan and return the normalized ActionPlan plus normalization warnings.
+
+    Normalization is limited to schema-defined behaviors (aliases/defaults). All sources
+    (LLM output, cached plans, heuristics) should pass through this gate.
+    """
+    original = deepcopy(plan)
+    try:
+        validated = ActionPlan.model_validate(plan)
+    except ValidationError as exc:  # noqa: BLE001
+        raise PlanValidationError(_format_validation_errors(exc, original))
+
+    warnings = _collect_normalization_warnings(original, validated.model_dump())
+    return validated, warnings

@@ -26,7 +26,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Protocol
 from urllib.parse import quote_plus, urlparse
 
 from PIL import Image
@@ -77,6 +77,28 @@ MAX_STEPS = 10
 LAST_WINDOW_TITLE: Optional[str] = None
 LAST_OPEN_APP_CONTEXT: Dict[str, Any] = {}
 MOUSE = mouse.controller
+
+# Risk levels
+RISK_LOW = "low"
+RISK_MEDIUM = "medium"
+RISK_HIGH = "high"
+RISK_BLOCK = "block"
+
+
+class WindowProvider(Protocol):
+    def get_foreground_window(self) -> Dict[str, Any]: ...
+
+
+class _DefaultWindowProvider:
+    def get_foreground_window(self) -> Dict[str, Any]:
+        info = get_foreground_info()
+        return {
+            "hwnd": info.get("hwnd"),
+            "pid": info.get("pid"),
+            "title": info.get("title"),
+            "class": info.get("class_name"),
+            "class_name": info.get("class_name"),
+        }
 
 
 def _flag_from_env(var: str, default: bool) -> bool:
@@ -139,6 +161,127 @@ def _foreground_snapshot() -> Dict[str, Any]:
         "class": info.get("class_name"),
         "class_name": info.get("class_name"),
     }
+
+
+def _extract_focus_hints(step: ActionStep) -> Optional[Dict[str, Any]]:
+    params = step.params or {}
+    title = params.get("title") or params.get("target") or params.get("label")
+    keywords = params.get("title_keywords") or []
+    class_keywords = params.get("class_keywords") or []
+    strict = params.get("strict_foreground")
+    hints = {
+        "title": title,
+        "title_keywords": keywords if isinstance(keywords, list) else [],
+        "class_keywords": class_keywords if isinstance(class_keywords, list) else [],
+        "strict_foreground": strict,
+    }
+    has_hint = any(
+        [
+            hints["title"],
+            hints["title_keywords"],
+            hints["class_keywords"],
+        ]
+    )
+    return hints if has_hint else None
+
+
+def _window_matches(expected: Dict[str, Any], actual: Dict[str, Any]) -> bool:
+    if not actual:
+        return False
+    # Prefer stable identifiers.
+    if expected.get("hwnd") and actual.get("hwnd") and expected["hwnd"] == actual["hwnd"]:
+        return True
+    if expected.get("pid") and actual.get("pid") and expected["pid"] == actual["pid"]:
+        return True
+    expected_class = (expected.get("class") or expected.get("class_name") or "").lower()
+    actual_class = (actual.get("class") or actual.get("class_name") or "").lower()
+    if expected_class and actual_class and expected_class in actual_class:
+        return True
+    exp_keywords = [str(k).lower() for k in expected.get("class_keywords") or []]
+    if exp_keywords and actual_class and any(k in actual_class for k in exp_keywords):
+        return True
+    exp_title = (expected.get("title") or "").lower()
+    actual_title = (actual.get("title") or "").lower()
+    if exp_title and exp_title in actual_title:
+        return True
+    exp_title_keywords = [str(k).lower() for k in expected.get("title_keywords") or []]
+    if exp_title_keywords and actual_title and any(k in actual_title for k in exp_title_keywords):
+        return True
+    return False
+
+
+def _set_last_focus_target(context, target: Optional[Dict[str, Any]]) -> None:
+    if context is None:
+        return
+    try:
+        context.last_focus_target = target
+    except Exception:
+        try:
+            setattr(context, "last_focus_target", target)
+        except Exception:
+            pass
+
+
+def _is_path_under(base_dir: Optional[str], path_value: Optional[str]) -> bool:
+    if not base_dir or not path_value:
+        return False
+    try:
+        base = Path(base_dir).resolve()
+        target = Path(path_value).resolve()
+        return base in target.parents or base == target
+    except Exception:
+        return False
+
+
+def _score_risk(step: ActionStep, work_dir: Optional[str], last_focus_target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Rule-based risk scoring."""
+    action = step.action
+    params = step.params or {}
+    tags: List[str] = []
+
+    # Default level.
+    level = RISK_LOW
+    reason = "ok"
+
+    if action in RISKY_FILE_ACTIONS:
+        tags.append("file_op")
+        path_candidates = [
+            params.get("path"),
+            params.get("source"),
+            params.get("destination_dir"),
+            params.get("destination"),
+            params.get("new_name"),
+        ]
+        in_scope = any(_is_path_under(work_dir, p) for p in path_candidates)
+        if not in_scope or action == "delete_file":
+            level = RISK_HIGH
+            reason = "file_op_high_risk"
+        else:
+            level = RISK_MEDIUM
+            reason = "file_op_in_scope"
+    elif action in RISKY_INPUT_ACTIONS:
+        tags.append("input")
+        if not last_focus_target:
+            level = RISK_HIGH
+            reason = "input_no_focus_context"
+        else:
+            level = RISK_MEDIUM
+            reason = "input_with_focus_context"
+    elif action == "open_app":
+        tags.append("app_launch")
+        target = (params.get("target") or "").lower()
+        risky_targets = {"powershell", "cmd", "regedit", "taskmgr"}
+        if any(t in target for t in risky_targets):
+            level = RISK_HIGH
+            reason = "app_launch_sensitive"
+        else:
+            level = RISK_MEDIUM
+            reason = "app_launch"
+    else:
+        level = RISK_LOW
+        reason = "low_risk"
+
+    return {"level": level, "reason": reason, "tags": tags}
 
 
 def _foreground_matches(preferred: Dict[str, Any], current: Dict[str, Any]) -> bool:
@@ -1150,6 +1293,7 @@ def handle_open_url(step: ActionStep) -> Any:
     Open an HTTP/HTTPS URL with the system default browser.
     """
     params = step.params or {}
+    params_summary = _summarize_browser_extract_params(params)
     raw_url = params.get("url") or params.get("target")
     raw_browser = params.get("browser") or params.get("app")
     verify_targets = _normalize_target_list(params.get("verify_text"))
@@ -2159,6 +2303,21 @@ def _extract_targets(params: Dict[str, Any]) -> List[str]:
     return deduped
 
 
+def _summarize_browser_extract_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    summary = {
+        "text": params.get("text"),
+        "target": params.get("target"),
+        "visual_description": params.get("visual_description"),
+        "query": params.get("query"),
+        "label": params.get("label"),
+        "variants": params.get("variants"),
+        "strategy_hint": params.get("strategy_hint"),
+        "prefer_top_line": params.get("prefer_top_line"),
+        "attempts": params.get("attempts"),
+    }
+    return {key: value for key, value in summary.items() if value is not None}
+
+
 def _wait_for_ocr_targets(targets: List[str], attempts: int = 2, delay: float = 0.8) -> Dict[str, Any]:
     """
     Capture + OCR loop to find any of the target strings. Returns success flag and match details.
@@ -2235,8 +2394,14 @@ def handle_browser_click(step: ActionStep) -> Any:
     """
     params = step.params or {}
     targets = _extract_targets(params)
+    debug = {
+        "branch": "ocr_locator",
+        "strategy_hint": hint,
+        "params": params_summary,
+        "targets": targets,
+    }
     if not targets:
-        return "error: 'text' param is required"
+        return {"status": "error", "reason": "text param is required", "debug": debug}
 
     button = params.get("button", "left")
     attempts = params.get("attempts", 2)
@@ -2245,6 +2410,7 @@ def handle_browser_click(step: ActionStep) -> Any:
     except Exception:
         attempts = 2
     attempts = max(1, min(5, attempts))
+    debug["attempts"] = attempts
     verify_targets = _normalize_target_list(params.get("verify_text"))
     verify_attempts = params.get("verify_attempts", 2)
     verify_targets = _normalize_target_list(params.get("verify_text"))
@@ -2374,6 +2540,7 @@ def handle_browser_click(step: ActionStep) -> Any:
         "reason": "text_not_found",
         "targets": targets,
         "log": logs,
+        "debug": debug,
     }
 
 
@@ -2413,6 +2580,7 @@ def handle_browser_input(step: ActionStep) -> Any:
 
     logs: List[str] = []
     last_candidates: List[Dict[str, Any]] = []
+    logs.append(f"strategy_hint:{hint}")
 
     for attempt in range(1, attempts + 1):
         logs.append(f"attempt:{attempt}")
@@ -2520,18 +2688,23 @@ def handle_browser_input(step: ActionStep) -> Any:
     }
 
 
-def _build_vlm_read_prompt(query: str) -> str:
+def _build_vlm_read_prompt(target_desc: str, search_query: Optional[str] = None) -> str:
+    context_line = (
+        f"The page shows search results for query: '{search_query}'."
+        if search_query
+        else "The page shows search results in a browser."
+    )
     return "\n\n".join(
         [
-            (
-                "You are looking at a screenshot of a browser. "
-                f"User Query: '{query}' (e.g., 'first search result title')"
-            ),
+            "You are looking at a screenshot of a browser.",
+            context_line,
+            f"User Target: '{target_desc}' (e.g., 'first search result title').",
             "Instructions:",
-            "Identify the specific visual element described by the user.",
-            "Read the text content of that element EXACTLY as it appears on screen.",
-            "Do NOT include accompanying text like URLs, dates, or descriptions.",
-            "Do NOT output markdown or explanations. Output ONLY the raw text string.",
+            "1) Focus on the main search results list (below the search box).",
+            "2) Ignore browser UI, tabs, address bar, search box, suggestions, ads, and side panels.",
+            "3) Identify the FIRST main organic result title and read it EXACTLY as shown.",
+            "4) Return ONLY that title text (no URL, no extra words, no quotes, no markdown).",
+            "5) Keep the answer under 120 characters.",
         ]
     )
 
@@ -2543,41 +2716,84 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
     2. OCR/Locator (default): Finds a label (e.g. "Price") and extracts text near it.
     """
     params = step.params or {}
+    params_summary = _summarize_browser_extract_params(params)
 
     # === [Commit 4.8] 新增 VLM 直读分支 ===
     # 只要 strategy_hint 包含 'vlm' 且是 'read' 意图，就优先尝试直读
     hint = str(params.get("strategy_hint", "")).lower()
     if "vlm_read" in hint or ("vlm" in hint and "read" in hint):
-        target_desc = params.get("text") or params.get("target") or params.get("visual_description")
+        target_desc = None
+        target_desc_source = None
+        for key in ("visual_description", "target", "text", "query", "label"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                target_desc = value.strip()
+                target_desc_source = key
+                break
+        debug = {
+            "branch": "vlm_read",
+            "strategy_hint": hint,
+            "params": params_summary,
+            "target_desc_source": target_desc_source,
+        }
         if not target_desc:
-            return {"status": "error", "reason": "text/target/visual_description required for vlm_read"}
+            return {
+                "status": "error",
+                "reason": "visual_description/target/text required for vlm_read",
+                "debug": debug,
+            }
 
         # 1. 截图
         try:
             screenshot_path = capture_screen()
         except Exception as exc:
-            return {"status": "error", "reason": f"screenshot failed: {exc}"}
+            return {"status": "error", "reason": f"screenshot failed: {exc}", "debug": debug}
+        debug.update({"screenshot_path": str(screenshot_path), "target_desc": target_desc})
 
         # 2. 构造直读 Prompt (严格约束模式)
-        prompt = (
-            f"You are looking at a screenshot of a browser.\n"
-            f"User Query: '{target_desc}'\n"
-            f"Instructions:\n"
-            f"1. Identify the specific visual element described by the user.\n"
-            f"2. Read the text content of that element EXACTLY as it appears on screen.\n"
-            f"3. Do NOT include accompanying text like URLs, dates, or descriptions.\n"
-            f"4. Do NOT output markdown or explanations. Output ONLY the raw text string."
-        )
+        search_query = None
+        for key in ("text", "query", "label"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                search_query = value.strip()
+                break
+
+        prompt = _build_vlm_read_prompt(target_desc, search_query)
+        debug["prompt"] = prompt
+        if search_query:
+            debug["search_query"] = search_query
 
         # 3. 调用 VLM (复用现有的 VLM 配置)
         provider_name, provider_call = get_vlm_call()
         if not provider_call:
-            return {"status": "error", "reason": "No VLM provider configured (VLM_DISABLED?)"}
+            debug["vlm_provider"] = provider_name
+            return {"status": "error", "reason": "No VLM provider configured (VLM_DISABLED?)", "debug": debug}
 
         try:
             print(f"[EXECUTOR] VLM Direct Read: {target_desc} using {provider_name}")
-            # image_base64 转换
+            # image_base64 转换（可选裁剪顶部区域以聚焦首条搜索结果）
+            prefer_top = bool(params.get("prefer_top_line")) or ("first" in target_desc.lower()) or ("第一" in target_desc)
             image_b64 = _encode_image_base64(Path(screenshot_path))
+            crop_info = None
+            if prefer_top and image_b64:
+                try:
+                    with Image.open(screenshot_path) as img:
+                        width, height = img.size
+                        top = int(height * 0.18)
+                        bottom = int(height * 0.55)
+                        if bottom - top > 20:
+                            cropped = img.crop((0, top, width, bottom))
+                            buf = BytesIO()
+                            cropped.save(buf, format="PNG")
+                            image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                            crop_info = {"top": top, "bottom": bottom, "width": width, "height": height}
+                except Exception as exc:  # noqa: BLE001
+                    debug["crop_error"] = str(exc)
+
+            debug["vlm_provider"] = provider_name
+            debug["image_base64_ok"] = bool(image_b64)
+            if crop_info:
+                debug["crop"] = crop_info
 
             # 构造符合接口的消息结构
             messages = [
@@ -2598,16 +2814,23 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
                 "matched_text": cleaned_text,
                 "matched_term": target_desc,
                 "method": "vlm_direct_read",
-                "log": [f"vlm_provider:{provider_name}", f"prompt:{target_desc}"]
+                "log": [f"vlm_provider:{provider_name}", f"prompt:{target_desc}"],
+                "debug": debug,
             }
 
         except Exception as exc:
-            return {"status": "error", "reason": f"vlm_read failed: {exc}"}
+            return {"status": "error", "reason": f"vlm_read failed: {exc}", "debug": debug}
 
     # === [旧逻辑] OCR/Locator 分支 (保持不变) ===
     targets = _extract_targets(params)
+    debug = {
+        "branch": "ocr_locator",
+        "strategy_hint": hint,
+        "params": params_summary,
+        "targets": targets,
+    }
     if not targets:
-        return "error: 'text' param is required"
+        return {"status": "error", "reason": "text param is required", "debug": debug}
 
     attempts = params.get("attempts", 2)
     try:
@@ -2615,9 +2838,11 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
     except Exception:
         attempts = 2
     attempts = max(1, min(5, attempts))
+    debug["attempts"] = attempts
 
     logs: List[str] = []
     last_candidates: List[Dict[str, Any]] = []
+    logs.append(f"strategy_hint:{hint}")
 
     for attempt in range(1, attempts + 1):
         logs.append(f"attempt:{attempt}")
@@ -2625,13 +2850,15 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
             screenshot_path = capture_screen()
             logs.append(f"screenshot:{screenshot_path}")
         except Exception as exc:  # noqa: BLE001
-            return f"error: screenshot failed: {exc}"
+            debug["attempt"] = attempt
+            return {"status": "error", "reason": f"screenshot failed: {exc}", "debug": debug}
 
         try:
             full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
             logs.append(f"ocr_boxes:{len(boxes)}")
         except Exception as exc:  # noqa: BLE001
-            return f"error: ocr failed: {exc}"
+            debug["attempt"] = attempt
+            return {"status": "error", "reason": f"ocr failed: {exc}", "debug": debug}
 
         best = None
         best_term = None
@@ -2654,14 +2881,17 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
         if best and (best.get("high_enough") or best.get("medium_enough")):
             center = best.get("center") or {}
             bounds = best.get("bounds") or {}
+            debug["attempt"] = attempt
             result = {
                 "status": "ok",
+                "method": "ocr_locator",
                 "matched_text": best.get("text"),
                 "matched_term": best_term,
                 "center": {"x": center.get("x"), "y": center.get("y")},
                 "bounds": bounds,
                 "full_text": full_text,
                 "log": logs,
+                "debug": debug,
             }
             if last_candidates:
                 result["candidates"] = last_candidates[:10]
@@ -2675,6 +2905,7 @@ def handle_browser_extract_text(step: ActionStep) -> Any:
         "targets": targets,
         "log": logs,
         "candidates": last_candidates,
+        "debug": debug,
     }
 
 
@@ -5073,6 +5304,26 @@ INTERACTIVE_ACTIONS = {
     "browser_extract_text",
 }
 
+INPUT_ACTIONS = {
+    "click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "drag",
+    "scroll",
+    "type_text",
+    "key_press",
+    "hotkey",
+    "browser_click",
+    "browser_input",
+    "browser_extract_text",
+    "open_app",
+    "adjust_volume",
+}
+
+RISKY_FILE_ACTIONS = {"delete_file", "move_file", "copy_file", "rename_file", "write_file"}
+RISKY_INPUT_ACTIONS = {"type_text", "key_press", "hotkey", "browser_input"}
+
 
 def _stub_handler(step: ActionStep) -> Dict[str, Any]:
     """Return a success result without touching the real UI."""
@@ -5107,6 +5358,10 @@ def run_steps(
     work_dir: Optional[str] = None,
     task_id: Optional[str] = None,
     start_index: int = 0,
+    dry_run: bool = False,
+    window_provider: Optional[WindowProvider] = None,
+    request_id: Optional[str] = None,
+    consent_token: bool = False,
 ) -> Dict[str, Any]:
     """
     Execute an ActionPlan with a global observe-execute-observe-verify loop and optional replanning.
@@ -5119,6 +5374,7 @@ def run_steps(
       generate additional follow-up steps appended to the remaining plan, up to max_replans.
     """
     logs: List[dict] = []
+    plan_rewrites: List[Dict[str, Any]] = []
     if context is None:
         try:
             from backend.executor.task_context import TaskContext
@@ -5165,6 +5421,7 @@ def run_steps(
     base_verify_mode = (verify_mode_override or "auto").lower()
     if base_verify_mode not in {"auto", "never", "always"}:
         base_verify_mode = "auto"
+    window_provider = window_provider or _DefaultWindowProvider()
 
     base_feedback_config = {
         "capture_before": base_capture_before,
@@ -5197,6 +5454,7 @@ def run_steps(
     active_window_token = ACTIVE_WINDOW.set(None)
 
     steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
+    last_focus_target = getattr(context, "last_focus_target", None)
     task_record = None
     task_token = CURRENT_TASK_ID.set(task_id) if task_id else None
     if task_id:
@@ -5210,9 +5468,46 @@ def run_steps(
             CURRENT_TASK_ID.set(task_id)
         except Exception:
             pass
+    if dry_run:
+        for idx, step in enumerate(steps):
+            risk_info = _score_risk(step, work_dir, last_focus_target)
+            entry = {
+                "step_index": idx,
+                "action": getattr(step, "action", None),
+                "params": getattr(step, "params", {}),
+                "status": "skipped",
+                "message": "dry_run: no side effects executed",
+                "timestamp": now_iso_utc(),
+                "duration_ms": 0.0,
+                "risk": risk_info,
+            }
+            logs.append(entry)
+            if context:
+                try:
+                    context.record_step_result(entry)
+                except Exception:
+                    pass
+        summary = _build_execution_summary(logs, context)
+        result = {"overall_status": "dry_run", "logs": logs, "summary": summary}
+        if context:
+            result["context"] = context.to_dict()
+            if hasattr(context, "set_summary"):
+                try:
+                    context.set_summary(summary)
+                except Exception:
+                    pass
+        if task_record:
+            update_task(
+                task_id,
+                status=TaskStatus.COMPLETED,
+                step_index=0,
+                last_error=None,
+                context_snapshot=_build_context_snapshot(context),
+            )
+            result["task_id"] = task_id
+        return result
     # Rewrite UI save patterns to direct write_file when possible.
     steps, rewrite_log = _rewrite_save_pattern(steps, base_dir=work_dir)
-    plan_rewrites: List[Dict[str, Any]] = []
     if rewrite_log:
         plan_rewrites.append(rewrite_log)
     # Allow additional steps when replanning to avoid premature truncation.
@@ -5318,6 +5613,104 @@ def run_steps(
                 overall_status = "unsafe"
                 break
 
+            risk_info = _score_risk(step, work_dir, last_focus_target)
+
+            if not dry_run and step.action in INPUT_ACTIONS:
+                expected = last_focus_target or _extract_focus_hints(step)
+                if not expected:
+                    entry = {
+                        "step_index": idx,
+                        "action": step.action,
+                        "params": step.params,
+                        "status": "error",
+                        "reason": "no_target_hint",
+                        "message": "no target hint for focus safety",
+                        "request_id": request_id,
+                        "timestamp": now_iso_utc(),
+                        "duration_ms": 0.0,
+                        "expected_window": None,
+                        "actual_window": None,
+                    }
+                    logs.append(entry)
+                    if context:
+                        try:
+                            context.record_step_result(entry)
+                            context.add_error(entry["message"])
+                        except Exception:
+                            pass
+                    overall_status = "error"
+                    break
+                actual_window = window_provider.get_foreground_window()
+                if not _window_matches(expected, actual_window):
+                    entry = {
+                        "step_index": idx,
+                        "action": step.action,
+                        "params": step.params,
+                        "status": "error",
+                        "reason": "foreground_mismatch",
+                        "message": "foreground window mismatch",
+                        "request_id": request_id,
+                        "timestamp": now_iso_utc(),
+                        "duration_ms": 0.0,
+                        "expected_window": expected,
+                        "actual_window": actual_window,
+                    }
+                    logs.append(entry)
+                    if context:
+                        try:
+                            context.record_step_result(entry)
+                            context.add_error(entry["message"], {"expected_window": expected, "actual_window": actual_window})
+                        except Exception:
+                            pass
+                    overall_status = "error"
+                    break
+
+            if risk_info["level"] == RISK_BLOCK:
+                entry = {
+                    "step_index": idx,
+                    "action": step.action,
+                    "params": step.params,
+                    "status": "error",
+                    "reason": "blocked",
+                    "message": risk_info["reason"],
+                    "risk": risk_info,
+                    "request_id": request_id,
+                    "timestamp": now_iso_utc(),
+                    "duration_ms": 0.0,
+                }
+                logs.append(entry)
+                if context:
+                    try:
+                        context.record_step_result(entry)
+                        context.add_error(entry["message"], risk_info)
+                    except Exception:
+                        pass
+                overall_status = "error"
+                break
+
+            if risk_info["level"] == RISK_HIGH and not consent_token:
+                entry = {
+                    "step_index": idx,
+                    "action": step.action,
+                    "params": step.params,
+                    "status": "error",
+                    "reason": "needs_consent",
+                    "message": "consent required for high-risk action",
+                    "risk": risk_info,
+                    "request_id": request_id,
+                    "timestamp": now_iso_utc(),
+                    "duration_ms": 0.0,
+                }
+                logs.append(entry)
+                if context:
+                    try:
+                        context.record_step_result(entry)
+                        context.add_error(entry["message"], risk_info)
+                    except Exception:
+                        pass
+                overall_status = "error"
+                break
+
             step_feedback = _build_step_feedback_config(step, base_feedback_config)
             attempt_logs: List[Dict[str, Any]] = []
             combined_duration_ms = 0.0
@@ -5413,14 +5806,25 @@ def run_steps(
                 "params": step.params,
                 "status": step_status,
                 "message": last_message,
-            "timestamp": now_iso_utc(),
-            "duration_ms": combined_duration_ms,
-            "attempts": attempt_logs,
-            "verification": last_verification,
-            "feedback": step_feedback,
-        }
+                "timestamp": now_iso_utc(),
+                "duration_ms": combined_duration_ms,
+                "attempts": attempt_logs,
+                "verification": last_verification,
+                "feedback": step_feedback,
+            }
             if attempt_logs:
                 entry["observations"] = attempt_logs[-1].get("observation")
+
+            if (
+                not dry_run
+                and step_status == "success"
+                and step.action in {"activate_window", "fuzzy_switch_window", "switch_window"}
+            ):
+                new_focus = window_provider.get_foreground_window()
+                last_focus_target = new_focus
+                _set_last_focus_target(context, new_focus)
+            if dry_run:
+                entry["risk"] = risk_info
 
             replan_successful = False
             replan_log: Dict[str, Any] = {}

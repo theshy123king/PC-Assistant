@@ -20,6 +20,8 @@ def test_web_search_rewrite_falls_back_to_user_text():
     assert "bing.com" in parsed.netloc
     qs = parse_qs(parsed.query)
     assert unquote_plus(qs["q"][0]) == "Python 教程"
+    extract_params = steps[2]["params"]
+    assert extract_params["strategy_hint"] == "vlm_read"
     assert rewritten.get("_rewrite_reason") == "visual_web_search_v3_cleaned"
 
 

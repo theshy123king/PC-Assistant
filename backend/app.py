@@ -12,7 +12,12 @@ from pydantic import BaseModel
 from PIL import Image
 
 from backend.executor import executor
-from backend.executor.actions_schema import ActionPlan, ActionStep, validate_action_plan
+from backend.executor.actions_schema import (
+    ActionPlan,
+    ActionStep,
+    PlanValidationError,
+    validate_plan_with_warnings,
+)
 from backend.executor.apps import get_cached_alias
 from backend.executor.task_context import TaskContext
 from backend.executor.task_registry import get_task, update_task, TaskStatus
@@ -52,6 +57,33 @@ class AIQueryRequest(BaseModel):
 
 
 app = FastAPI()
+
+
+def _respond_invalid_plan(request_id: str, errors: list[dict], provider: str | None = None) -> dict:
+    """Build a structured invalid-plan response."""
+    base = {
+        "error": "invalid action plan",
+        "request_id": request_id,
+        "validation_errors": errors,
+    }
+    if provider:
+        base["provider"] = provider
+    return base
+
+
+def _validate_plan(plan_data: dict | ActionPlan, request_id: str) -> tuple[ActionPlan | None, list[dict] | None, list[dict]]:
+    """
+    Validate and normalize a plan, returning (plan, warnings, errors).
+
+    Errors are structured per step; warnings capture conservative normalization (aliases/defaults).
+    """
+    try:
+        plan, warnings = validate_plan_with_warnings(plan_data)
+        return plan, warnings, []
+    except PlanValidationError as exc:
+        return None, None, exc.errors
+    except Exception as exc:  # noqa: BLE001
+        return None, None, [{"step_index": None, "action": None, "field": None, "reason": str(exc)}]
 
 
 def _provider_available(name: str) -> bool:
@@ -392,7 +424,7 @@ def _maybe_rewrite_web_search(user_text: str, plan_data: dict) -> dict:
                 "text": query,
                 "target": "第一条搜索结果标题",
                 "visual_description": "What is the title of the first main search result? Return ONLY the title text.",
-                "strategy_hint": "vlm",
+                "strategy_hint": "vlm_read",
                 "prefer_top_line": True,
             },
         },
@@ -569,21 +601,31 @@ async def ai_plan(payload: AIQueryRequest):
 
     cached_plan = _cached_open_plan(payload.text)
     if cached_plan:
-        context.record_plan(cached_plan.model_dump())
+        plan, warnings, errors = _validate_plan(cached_plan, request_id)
+        if errors:
+            log_event(
+                "ai_plan.invalid_plan",
+                request_id,
+                {"provider": "alias_cache", "errors": errors},
+            )
+            return _respond_invalid_plan(request_id, errors, provider="alias_cache")
+        context.record_plan(plan.model_dump())
         log_event(
             "ai_plan.cached",
             request_id,
             {
                 "provider": "alias_cache",
                 "user_text": payload.text,
-                "plan": summarize_plan(cached_plan.model_dump()),
+                "plan": summarize_plan(plan.model_dump()),
+                "normalization_warnings": warnings,
             },
         )
         return {
             "provider": "alias_cache",
             "status": "success",
-            "plan": cached_plan.model_dump(),
+            "plan": plan.model_dump(),
             "raw": "alias_cache",
+            "normalization_warnings": warnings,
             "context": context.to_dict(),
             "request_id": request_id,
         }
@@ -603,33 +645,26 @@ async def ai_plan(payload: AIQueryRequest):
                 "context": context.to_dict(),
                 "request_id": request_id,
             }
-        try:
-            plan = validate_action_plan(plan_data)
-        except Exception as exc:  # noqa: BLE001
+        plan, warnings, errors = _validate_plan(plan_data, request_id)
+        if errors:
             log_event(
                 "ai_plan.invalid_plan",
                 request_id,
-                {"error": str(exc), "raw_plan": sanitize_payload(plan_data)},
+                {"error": errors, "raw_plan": sanitize_payload(plan_data)},
             )
-            return {
-                "provider": provider,
-                "status": "error",
-                "message": f"invalid action plan: {exc}",
-                "raw": plan_data,
-                "context": context.to_dict(),
-                "request_id": request_id,
-            }
+            return _respond_invalid_plan(request_id, errors, provider=provider)
         context.record_plan(plan.model_dump())
         log_event(
             "ai_plan.success",
             request_id,
-            {"provider": provider, "plan": summarize_plan(plan.model_dump())},
+            {"provider": provider, "plan": summarize_plan(plan.model_dump()), "normalization_warnings": warnings},
         )
         return {
             "provider": provider,
             "status": "success",
             "plan": plan.model_dump(),
             "raw": "test_planner",
+            "normalization_warnings": warnings,
             "context": context.to_dict(),
             "request_id": request_id,
         }
@@ -695,32 +730,29 @@ async def ai_plan(payload: AIQueryRequest):
     plan_dict = _normalize_workspace_paths(plan_dict, work_dir)
     plan_dict = _ensure_delete_confirm(plan_dict)
     plan_dict = _maybe_rewrite_web_search(payload.text, plan_dict)
-    try:
-        parsed = ActionPlan.model_validate(plan_dict)
-    except Exception as exc:  # noqa: BLE001
+    plan, warnings, errors = _validate_plan(plan_dict, request_id)
+    if errors:
         log_event(
             "ai_plan.invalid_plan",
             request_id,
-            {"provider": provider, "error": str(exc), "raw_reply": reply},
+            {"provider": provider, "errors": errors, "raw_reply": reply},
         )
-        return {
-            "provider": provider,
-            "status": "error",
-            "message": f"invalid action plan after normalization: {exc}",
-            "raw": reply,
-            "context": context.to_dict(),
-            "request_id": request_id,
-        }
-    context.record_plan(parsed)
+        return _respond_invalid_plan(request_id, errors, provider=provider)
+    context.record_plan(plan)
     log_event(
         "ai_plan.success",
         request_id,
-        {"provider": resolved_provider, "plan": summarize_plan(parsed.model_dump())},
+        {
+            "provider": resolved_provider,
+            "plan": summarize_plan(plan.model_dump()),
+            "normalization_warnings": warnings,
+        },
     )
     return {
         "provider": resolved_provider,
         "status": "success",
-        "plan": parsed.model_dump(),
+        "plan": plan.model_dump(),
+        "normalization_warnings": warnings,
         "raw": reply,
         "context": context.to_dict(),
         "request_id": request_id,
@@ -734,24 +766,41 @@ async def ai_execute_plan(payload: dict):
     Does not call any LLMs.
     """
     request_id = generate_request_id()
+    consent_token = bool(payload.get("consent_token")) if isinstance(payload, dict) else False
+    dry_run = bool(payload.get("dry_run")) if isinstance(payload, dict) else False
     work_dir = _resolve_work_dir(payload.get("work_dir")) if isinstance(payload, dict) else None
     log_event(
         "ai_execute_plan.start",
         request_id,
         {"work_dir": work_dir, "plan": summarize_plan(payload if isinstance(payload, dict) else {})},
     )
-    try:
-        plan = validate_action_plan(payload)
-    except Exception as exc:  # noqa: BLE001
+    plan, warnings, errors = _validate_plan(payload, request_id)
+    if errors:
         log_event(
             "ai_execute_plan.invalid_plan",
             request_id,
-            {"error": str(exc)},
+            {"errors": errors},
         )
-        return {"error": f"invalid action plan: {exc}", "request_id": request_id}
+        return _respond_invalid_plan(request_id, errors)
+    if dry_run:
+        return {
+            "plan": plan.model_dump(),
+            "normalization_warnings": warnings,
+            "dry_run": True,
+            "mode": "dry_run",
+            "note": "dry_run: no side effects executed",
+            "request_id": request_id,
+        }
 
     task_id = generate_request_id()
-    result = await asyncio.to_thread(executor.run_steps, plan, work_dir=work_dir, task_id=task_id)
+    result = await asyncio.to_thread(
+        executor.run_steps,
+        plan,
+        work_dir=work_dir,
+        task_id=task_id,
+        request_id=request_id,
+        consent_token=consent_token,
+    )
     log_event(
         "ai_execute_plan.finished",
         request_id,
@@ -783,6 +832,7 @@ async def ai_run(payload: dict):
     dry_run = bool(payload.get("dry_run"))
     provider = (payload.get("provider") or "deepseek").lower()
     work_dir = _resolve_work_dir(payload.get("work_dir"))
+    consent_token = bool(payload.get("consent_token"))
     context = TaskContext(user_instruction=user_text, screenshot_meta=screenshot_meta, ocr_text=ocr_text or "", work_dir=work_dir)
 
     log_event(
@@ -811,48 +861,68 @@ async def ai_run(payload: dict):
 
     cached_plan = _cached_open_plan(user_text)
     if cached_plan:
+        plan, warnings, errors = _validate_plan(cached_plan, request_id)
+        if errors:
+            log_event(
+                "ai_run.invalid_plan",
+                request_id,
+                {"provider": "alias_cache", "errors": errors},
+            )
+            return _respond_invalid_plan(request_id, errors, provider="alias_cache")
         if dry_run:
             log_event(
                 "ai_run.cached",
                 request_id,
-                {"provider": "alias_cache", "plan": summarize_plan(cached_plan.model_dump()), "dry_run": True},
+                {
+                    "provider": "alias_cache",
+                    "plan": summarize_plan(plan.model_dump()),
+                    "dry_run": True,
+                    "normalization_warnings": warnings,
+                },
             )
             return {
                 "provider": "alias_cache",
                 "user_text": user_text,
                 "raw_reply": "alias_cache",
-                "plan": cached_plan.model_dump(),
-                "plan_after_injection": cached_plan.model_dump(),
+                "plan": plan.model_dump(),
+                "plan_after_injection": plan.model_dump(),
+                "normalization_warnings": warnings,
                 "execution": None,
                 "dry_run": True,
+                "mode": "dry_run",
+                "note": "dry_run: no side effects executed",
                 "context": context.to_dict(),
                 "request_id": request_id,
             }
         task_id = generate_request_id()
         exec_result = await asyncio.to_thread(
             executor.run_steps,
-            cached_plan,
+            plan,
             context=context,
             planner_provider="alias_cache",
             work_dir=work_dir,
             task_id=task_id,
+            request_id=request_id,
+            consent_token=consent_token,
         )
         log_event(
             "ai_run.cached",
             request_id,
             {
                 "provider": "alias_cache",
-                "plan": summarize_plan(cached_plan.model_dump()),
-            "execution": summarize_execution(exec_result),
-            "dry_run": False,
-        },
-    )
+                "plan": summarize_plan(plan.model_dump()),
+                "execution": summarize_execution(exec_result),
+                "normalization_warnings": warnings,
+                "dry_run": False,
+            },
+        )
         return {
             "provider": "alias_cache",
             "user_text": user_text,
             "raw_reply": "alias_cache",
-            "plan": cached_plan.model_dump(),
-            "plan_after_injection": cached_plan.model_dump(),
+            "plan": plan.model_dump(),
+            "plan_after_injection": plan.model_dump(),
+            "normalization_warnings": warnings,
             "execution": exec_result,
             "context": context.to_dict(),
             "request_id": request_id,
@@ -930,20 +1000,20 @@ async def ai_run(payload: dict):
             0, {"action": "click", "params": {"x": manual_click["x"], "y": manual_click["y"]}}
         )
 
-    try:
-        plan = validate_action_plan(plan_data)
-    except Exception as exc:  # noqa: BLE001
-        context.add_error(f"invalid action plan: {exc}")
+    plan, warnings, errors = _validate_plan(plan_data, request_id)
+    if errors:
+        context.add_error("invalid action plan")
         log_event(
             "ai_run.invalid_plan",
             request_id,
-            {"provider": resolved_provider, "error": str(exc), "raw_reply": raw_reply},
+            {"provider": resolved_provider, "errors": errors, "raw_reply": raw_reply},
         )
         return {
             "provider": resolved_provider,
             "user_text": user_text,
             "raw_reply": raw_reply,
-            "plan_error": f"invalid action plan: {exc}",
+            "plan_error": "invalid action plan",
+            "validation_errors": errors,
             "context": context.to_dict(),
             "request_id": request_id,
         }
@@ -951,7 +1021,12 @@ async def ai_run(payload: dict):
     log_event(
         "ai_run.plan_ready",
         request_id,
-        {"provider": resolved_provider, "plan": summarize_plan(plan.model_dump()), "dry_run": dry_run},
+        {
+            "provider": resolved_provider,
+            "plan": summarize_plan(plan.model_dump()),
+            "dry_run": dry_run,
+            "normalization_warnings": warnings,
+        },
     )
 
     if dry_run:
@@ -961,13 +1036,16 @@ async def ai_run(payload: dict):
             "raw_reply": raw_reply,
             "plan": plan.model_dump(),
             "plan_after_injection": plan_data,
+            "normalization_warnings": warnings,
             "execution": None,
             "dry_run": True,
+            "mode": "dry_run",
+            "note": "dry_run: no side effects executed",
             "context": context.to_dict(),
             "request_id": request_id,
         }
 
-    task_id = generate_request_id()
+        task_id = generate_request_id()
     exec_result = await asyncio.to_thread(
         executor.run_steps,
         plan,
@@ -975,6 +1053,8 @@ async def ai_run(payload: dict):
         planner_provider=resolved_provider,
         work_dir=work_dir,
         task_id=task_id,
+        request_id=request_id,
+        consent_token=consent_token,
     )
     log_event(
         "ai_run.finished",
@@ -1020,6 +1100,7 @@ async def ai_debug_run(payload: dict):
     debug_force_capture = bool(payload.get("debug_force_capture"))
     debug_disable_vlm = bool(payload.get("debug_disable_vlm"))
     work_dir = _resolve_work_dir(payload.get("work_dir"))
+    consent_token = bool(payload.get("consent_token"))
 
     context = TaskContext(
         user_instruction=user_text,
@@ -1057,9 +1138,17 @@ async def ai_debug_run(payload: dict):
 
     cached_plan = _cached_open_plan(user_text)
     if cached_plan:
+        plan, warnings, errors = _validate_plan(cached_plan, request_id)
+        if errors:
+            log_event(
+                "ai_debug_run.invalid_plan",
+                request_id,
+                {"provider": "alias_cache", "errors": errors},
+            )
+            return _respond_invalid_plan(request_id, errors, provider="alias_cache")
         exec_result = await asyncio.to_thread(
             executor.run_steps,
-            cached_plan,
+            plan,
             context=context,
             planner_provider="alias_cache",
             work_dir=work_dir,
@@ -1067,7 +1156,11 @@ async def ai_debug_run(payload: dict):
         log_event(
             "ai_debug_run.cached",
             request_id,
-            {"plan": summarize_plan(cached_plan.model_dump()), "execution": summarize_execution(exec_result)},
+            {
+                "plan": summarize_plan(plan.model_dump()),
+                "execution": summarize_execution(exec_result),
+                "normalization_warnings": warnings,
+            },
         )
         exec_result["request_id"] = request_id
         return exec_result
@@ -1132,21 +1225,14 @@ async def ai_debug_run(payload: dict):
     plan_dict = _normalize_workspace_paths(plan_dict, work_dir)
     plan_dict = _ensure_delete_confirm(plan_dict)
     plan_dict = _maybe_rewrite_web_search(user_text, plan_dict)
-    try:
-        plan_obj = ActionPlan.model_validate(plan_dict)
-    except Exception as exc:  # noqa: BLE001
+    plan_obj, warnings, errors = _validate_plan(plan_dict, request_id)
+    if errors:
         log_event(
             "ai_debug_run.invalid_plan",
             request_id,
-            {"provider": resolved_provider, "error": str(exc), "raw_reply": raw_reply},
+            {"provider": resolved_provider, "errors": errors, "raw_reply": raw_reply},
         )
-        return {
-            "error": f"invalid action plan: {exc}",
-            "provider": resolved_provider,
-            "raw": raw_reply,
-            "context": context.to_dict(),
-            "request_id": request_id,
-        }
+        return _respond_invalid_plan(request_id, errors, provider=resolved_provider)
     context.record_plan(plan_obj)
 
     task_id = generate_request_id()
@@ -1165,6 +1251,8 @@ async def ai_debug_run(payload: dict):
         capture_ocr=True if debug_force_capture else None,
         work_dir=work_dir,
         task_id=task_id,
+        request_id=request_id,
+        consent_token=consent_token,
     )
 
     log_event(
@@ -1176,6 +1264,7 @@ async def ai_debug_run(payload: dict):
             "execution": summarize_execution(exec_result),
             "step_logs": _summarize_logs(exec_result.get("logs")),
             "work_dir": work_dir,
+            "normalization_warnings": warnings,
         },
     )
     exec_result["request_id"] = request_id
@@ -1221,7 +1310,9 @@ async def resume_task(task_id: str, payload: dict | None = None):
         plan,
         context=context,
         task_id=task_id,
+        request_id=request_id,
         start_index=record.step_index,
+        consent_token=bool(payload.get("consent_token")) if isinstance(payload, dict) else False,
     )
     exec_result["task_id"] = task_id
     return exec_result
