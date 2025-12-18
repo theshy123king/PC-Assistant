@@ -454,6 +454,108 @@ function createExecutionSummaryCard(result) {
     return `<div class="bubble" style="background:#F0F7FF; color:#0F2744;">${lines.join("<br>")}</div>`;
 }
 
+function renderStatusBadge(status) {
+    const normalized = (status || "").toLowerCase();
+    const palette = {
+        success: { bg: "#E6FFFA", fg: "#0F5132" },
+        error: { bg: "#FFF5F5", fg: "#842029" },
+        unsafe: { bg: "#FFF5F5", fg: "#842029" },
+        skipped: { bg: "#F8F9FA", fg: "#6C757D" },
+        replanned: { bg: "#E7F1FF", fg: "#0D3B66" },
+        awaiting_user: { bg: "#FFF3CD", fg: "#664D03" },
+        dry_run: { bg: "#E7F1FF", fg: "#0D3B66" },
+    };
+    const colors = palette[normalized] || palette["success"];
+    const label = normalized || "unknown";
+    return `<span style="padding:2px 6px; border-radius:6px; background:${colors.bg}; color:${colors.fg}; font-size:12px;">${escapeHTML(
+        label
+    )}</span>`;
+}
+
+function createEvidenceCard(result) {
+    const execution = result.execution || result;
+    const logs = Array.isArray(execution?.logs) ? execution.logs : [];
+    if (!logs.length) return "";
+    const requestId = result.request_id || execution.request_id || "unknown";
+    const overall = execution.overall_status || result.overall_status || "unknown";
+
+    const rows = logs
+        .map((log) => {
+            const attempts = Array.isArray(log.attempts) ? log.attempts : [];
+            const isFailure = (log.status || "").toLowerCase() === "error" || (log.status || "").toLowerCase() === "unsafe";
+            const reason = log.reason || log.message || "";
+            const header = `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+                <div style="font-weight:600;">#${log.step_index ?? "?"} · ${escapeHTML(log.action || "unknown")}</div>
+                <div style="display:flex; gap:6px; align-items:center;">
+                    ${renderStatusBadge(log.status)}
+                    ${reason ? `<span style="font-size:12px; color:${isFailure ? "#842029" : "#555"};">${escapeHTML(reason)}</span>` : ""}
+                </div>
+            </div>`;
+
+            const attemptHtml = attempts
+                .map((att) => {
+                    const ev = att.evidence || att.verification?.evidence || log.evidence || {};
+                    const capturePhase = ev?.capture_phase || "verify";
+                    const vReason = att.verification?.reason || att.reason || ev?.reason || "";
+                    const vDecision = att.verification?.decision || "";
+                    const evidenceJson = escapeHTML(JSON.stringify(ev || {}, null, 2));
+                    const expectActual = [];
+                    if (ev?.expected) expectActual.push(`<div><strong>Expected</strong>: ${escapeHTML(JSON.stringify(ev.expected))}</div>`);
+                    if (ev?.actual) expectActual.push(`<div><strong>Actual</strong>: ${escapeHTML(JSON.stringify(ev.actual))}</div>`);
+                    const focusLine =
+                        ev?.focus_expected || ev?.focus_actual
+                            ? `<div style="font-size:12px; color:#555;">Focus: expected=${escapeHTML(
+                                  JSON.stringify(ev.focus_expected || {})
+                              )} · actual=${escapeHTML(JSON.stringify(ev.focus_actual || {}))}</div>`
+                            : "";
+                    const riskLine = ev?.risk
+                        ? `<div style="font-size:12px; color:#555;">Risk: ${escapeHTML(ev.risk.level || "")} (${escapeHTML(
+                              ev.risk.reason || ""
+                          )})</div>`
+                        : "";
+                    return `<details style="margin-top:8px; border:1px solid #EEE; border-radius:8px; padding:8px;" ${
+                        isFailure ? "open" : ""
+                    }>
+                        <summary style="cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                            <div style="font-weight:600;">Attempt ${att.attempt ?? "?"}</div>
+                            <div style="display:flex; gap:6px; align-items:center;">
+                                ${renderStatusBadge(att.status || vDecision || "unknown")}
+                                <span style="font-size:12px; color:#555;">${escapeHTML(vReason || att.reason || "")}</span>
+                                <span style="font-size:12px; color:#0D3B66;">${escapeHTML(capturePhase)}</span>
+                            </div>
+                        </summary>
+                        ${focusLine}
+                        ${riskLine}
+                        ${expectActual.join("")}
+                        <pre style="background:#0b1021; color:#e6f1ff; padding:8px; border-radius:6px; font-size:12px; overflow:auto; max-height:240px; margin-top:6px;">${evidenceJson}</pre>
+                    </details>`;
+                })
+                .join("");
+
+            // If no attempts but evidence on the log, show it once.
+            const logEvidence = !attempts.length && log.evidence ? `<pre style="background:#0b1021; color:#e6f1ff; padding:8px; border-radius:6px; font-size:12px; overflow:auto;">${escapeHTML(
+                JSON.stringify(log.evidence, null, 2)
+            )}</pre>` : "";
+
+            return `<div style="border:1px solid ${isFailure ? "#f3b8c0" : "#eee"}; background:${isFailure ? "#fff5f5" : "#fafafa"}; border-radius:10px; padding:10px; margin-top:10px;">
+                ${header}
+                ${attemptHtml || logEvidence || '<div style="font-size:12px; color:#777; margin-top:4px;">No attempt details.</div>'}
+            </div>`;
+        })
+        .join("");
+
+    return `<div class="bubble" style="background:#F8F8F8; color:var(--text-main);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <div style="font-weight:700;">Evidence & Attempts</div>
+            <div style="font-size:12px; color:#555;">Request: ${escapeHTML(requestId)} · Status: ${escapeHTML(overall)}</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; font-size:12px; margin-bottom:6px;">
+            <span style="padding:2px 6px; border-radius:6px; background:#eef2ff; color:#312e81;">Use this section to debug failures, focus gates, and consent blocks.</span>
+        </div>
+        ${rows}
+    </div>`;
+}
+
 function appendExecutionDetails(result) {
     const execution = result?.execution || result;
     const logs = Array.isArray(execution?.logs) ? execution.logs : [];
@@ -673,6 +775,10 @@ async function handleRun() {
             }
 
             appendExecutionDetails(result);
+            const evidenceCard = createEvidenceCard(result);
+            if (evidenceCard) {
+                appendAgentHTML(evidenceCard);
+            }
             
             // Show Summary / Execution Status
             if (result.execution) {
