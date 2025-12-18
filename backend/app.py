@@ -7,7 +7,8 @@ from urllib.parse import parse_qs, quote_plus, urlparse, unquote
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from PIL import Image
 
@@ -25,6 +26,12 @@ from backend.llm.action_parser import parse_action_plan
 from backend.llm.deepseek_client import call_deepseek
 from backend.llm.doubao_client import call_doubao
 from backend.llm.planner_prompt import PromptBundle, format_prompt
+from backend.contracts.plan_outcome import (
+    maybe_short_circuit_to_clarification,
+    ensure_plan_outcome,
+    build_plan_error,
+)
+from backend.observability.store import EvidenceStore
 try:
     import pygetwindow as gw
 except Exception:
@@ -41,6 +48,10 @@ from backend.logging_utils import (
     summarize_execution,
     summarize_plan,
 )
+try:
+    from sse_starlette.sse import EventSourceResponse
+except Exception:
+    EventSourceResponse = None  # type: ignore
 
 setup_logging()
 load_dotenv()
@@ -57,6 +68,16 @@ class AIQueryRequest(BaseModel):
 
 
 app = FastAPI()
+evidence_store = EvidenceStore(Path("logs") / "evidence")
+
+
+@app.on_event("startup")
+async def _init_observability() -> None:
+    try:
+        evidence_store.set_event_loop(asyncio.get_event_loop())
+    except RuntimeError:
+        loop = asyncio.get_running_loop()
+        evidence_store.set_event_loop(loop)
 
 
 def _respond_invalid_plan(request_id: str, errors: list[dict], provider: str | None = None) -> dict:
@@ -593,7 +614,7 @@ async def ai_plan(payload: AIQueryRequest):
     as an action plan, and return it without executing any actions.
     """
     request_id = generate_request_id()
-    context = TaskContext(user_instruction=payload.text)
+    context = TaskContext(user_instruction=payload.text, request_id=request_id, evidence_store=evidence_store)
     provider = (payload.provider or "deepseek").lower()
     work_dir = None
 
@@ -856,7 +877,14 @@ async def ai_run(payload: dict):
     provider = (payload.get("provider") or "deepseek").lower()
     work_dir = _resolve_work_dir(payload.get("work_dir"))
     consent_token = bool(payload.get("consent_token"))
-    context = TaskContext(user_instruction=user_text, screenshot_meta=screenshot_meta, ocr_text=ocr_text or "", work_dir=work_dir)
+    context = TaskContext(
+        user_instruction=user_text,
+        screenshot_meta=screenshot_meta,
+        ocr_text=ocr_text or "",
+        work_dir=work_dir,
+        request_id=request_id,
+        evidence_store=evidence_store,
+    )
 
     log_event(
         "ai_run.start",
@@ -880,6 +908,25 @@ async def ai_run(payload: dict):
         )
         return {"error": "user_text is required", "provider": provider, "request_id": request_id}
 
+    short = maybe_short_circuit_to_clarification(user_text)
+    if short:
+        log_event(
+            "ai_run.awaiting_user",
+            request_id,
+            {"provider": provider, "clarification": short.get("clarification")},
+        )
+        response = {
+            "provider": provider,
+            "user_text": user_text,
+            "plan_status": short.get("plan_status"),
+            "clarification": short.get("clarification"),
+            "plan": None,
+            "execution": None,
+            "context": context.to_dict(),
+            "request_id": request_id,
+        }
+        return response
+
     open_windows = _get_open_windows_summary()
 
     cached_plan = _cached_open_plan(user_text)
@@ -891,7 +938,9 @@ async def ai_run(payload: dict):
                 request_id,
                 {"provider": "alias_cache", "errors": errors},
             )
-            return _respond_invalid_plan(request_id, errors, provider="alias_cache")
+            response = _respond_invalid_plan(request_id, errors, provider="alias_cache")
+            response.update(build_plan_error("plan_validation_error", "invalid action plan", errors))
+            return response
         if dry_run:
             log_event(
                 "ai_run.cached",
@@ -999,7 +1048,7 @@ async def ai_run(payload: dict):
             request_id,
             {"provider": resolved_provider, "error": parsed, "raw_reply": raw_reply},
         )
-        return {
+        response = {
             "provider": resolved_provider,
             "user_text": user_text,
             "raw_reply": raw_reply,
@@ -1007,6 +1056,8 @@ async def ai_run(payload: dict):
             "context": context.to_dict(),
             "request_id": request_id,
         }
+        response.update(build_plan_error("plan_parse_error", str(parsed)))
+        return response
 
     plan_data = parsed.model_dump()
     plan_data = _maybe_enforce_open_app(user_text, plan_data)
@@ -1031,7 +1082,7 @@ async def ai_run(payload: dict):
             request_id,
             {"provider": resolved_provider, "errors": errors, "raw_reply": raw_reply},
         )
-        return {
+        response = {
             "provider": resolved_provider,
             "user_text": user_text,
             "raw_reply": raw_reply,
@@ -1040,6 +1091,10 @@ async def ai_run(payload: dict):
             "context": context.to_dict(),
             "request_id": request_id,
         }
+        response.update(build_plan_error("plan_validation_error", "invalid action plan", errors))
+        return response
+
+    outcome = ensure_plan_outcome(user_text, plan.model_dump())
 
     log_event(
         "ai_run.plan_ready",
@@ -1049,6 +1104,7 @@ async def ai_run(payload: dict):
             "plan": summarize_plan(plan.model_dump()),
             "dry_run": dry_run,
             "normalization_warnings": warnings,
+            "plan_status": outcome.get("plan_status", "ok"),
         },
     )
 
@@ -1066,9 +1122,35 @@ async def ai_run(payload: dict):
             "note": "dry_run: no side effects executed",
             "context": context.to_dict(),
             "request_id": request_id,
+            "plan_status": outcome.get("plan_status", "ok"),
+            "clarification": outcome.get("clarification"),
         }
 
-        task_id = generate_request_id()
+    if outcome.get("plan_status") != "ok":
+        log_event(
+            "ai_run.awaiting_user",
+            request_id,
+            {
+                "provider": resolved_provider,
+                "plan": summarize_plan(plan.model_dump()),
+                "clarification": outcome.get("clarification"),
+            },
+        )
+        return {
+            "provider": resolved_provider,
+            "user_text": user_text,
+            "raw_reply": raw_reply,
+            "plan": plan.model_dump(),
+            "plan_after_injection": plan_data,
+            "normalization_warnings": warnings,
+            "execution": None,
+            "context": context.to_dict(),
+            "request_id": request_id,
+            "plan_status": outcome.get("plan_status"),
+            "clarification": outcome.get("clarification"),
+        }
+
+    task_id = generate_request_id()
     exec_result = await asyncio.to_thread(
         executor.run_steps,
         plan,
@@ -1088,6 +1170,7 @@ async def ai_run(payload: dict):
             "execution": summarize_execution(exec_result),
             "step_logs": _summarize_logs(exec_result.get("logs")),
             "work_dir": work_dir,
+            "plan_status": outcome.get("plan_status", "ok"),
         },
     )
     return {
@@ -1100,6 +1183,7 @@ async def ai_run(payload: dict):
         "context": context.to_dict(),
         "request_id": request_id,
         "task_id": task_id,
+        "plan_status": outcome.get("plan_status", "ok"),
     }
 
 
@@ -1131,6 +1215,8 @@ async def ai_debug_run(payload: dict):
         ocr_text=ocr_text or "",
         max_replans=max_replans,
         work_dir=work_dir,
+        request_id=request_id,
+        evidence_store=evidence_store,
     )
 
     log_event(
@@ -1302,6 +1388,36 @@ def _task_response(record):
     return data
 
 
+@app.get("/api/stream/{request_id}")
+async def stream_evidence(request_id: str, request: Request):
+    """
+    Server-Sent Events stream for lightweight execution events.
+    Respects Last-Event-ID header for replay.
+    """
+    last_event_id = request.headers.get("last-event-id") or request.headers.get("Last-Event-ID")
+    try:
+        after_seq = int(last_event_id) if last_event_id else 0
+    except ValueError:
+        after_seq = 0
+
+    async def event_generator():
+        async for ev in evidence_store.subscribe(request_id, after_seq=after_seq):
+            data = json.dumps(ev.model_dump(), ensure_ascii=False)
+            yield f"id: {ev.seq}\ndata: {data}\n\n"
+
+    if EventSourceResponse:
+        return EventSourceResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/api/artifact/{request_id}/{artifact_id}")
+async def get_artifact(request_id: str, artifact_id: str):
+    path = evidence_store.get_artifact_path(request_id, artifact_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return FileResponse(path)
+
+
 @app.get("/api/tasks/{task_id}/status")
 async def get_task_status(task_id: str):
     record = get_task(task_id)
@@ -1322,7 +1438,12 @@ async def resume_task(task_id: str, payload: dict | None = None):
         plan = ActionPlan.model_validate(record.plan)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"invalid stored plan: {exc}")
-    context = TaskContext(user_instruction=record.user_text, work_dir=(record.context_snapshot or {}).get("work_dir"))
+    context = TaskContext(
+        user_instruction=record.user_text,
+        work_dir=(record.context_snapshot or {}).get("work_dir"),
+        request_id=request_id,
+        evidence_store=evidence_store,
+    )
     context.record_plan(plan)
     try:
         context.step_results = list(record.step_results or [])

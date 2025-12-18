@@ -385,6 +385,7 @@ function appendAgentHTML(html) {
     div.innerHTML = html; // Assume html includes wrapper classes
     chatScroll.appendChild(div);
     scrollToBottom();
+    return div;
 }
 
 function createScreenshotCard(base64) {
@@ -399,12 +400,45 @@ function createPlanBubble(data) {
     if (data.plan_error) {
         return `<div class="bubble" style="color:#D32F2F; background:#FFEBEE; border:1px solid #FFCDD2;">⚠️ ${data.plan_error}</div>`;
     }
+    if (data.plan_status === "error" && data.plan_error) {
+        const detail = data.plan_error.detail
+            ? `<pre style="background:#0b1021; color:#e6f1ff; padding:8px; border-radius:6px; font-size:12px; overflow:auto; max-height:200px;">${escapeHTML(
+                  JSON.stringify(data.plan_error.detail, null, 2)
+              )}</pre>`
+            : "";
+        return `<div class="bubble" style="color:#D32F2F; background:#FFEBEE; border:1px solid #FFCDD2;">
+            <div style="font-weight:700;">${escapeHTML(data.plan_error.category || "Plan Error")}</div>
+            <div>${escapeHTML(data.plan_error.message || "")}</div>
+            ${detail}
+        </div>`;
+    }
+    if (data.plan_status === "awaiting_user" && data.clarification) {
+        const c = data.clarification || {};
+        const options = Array.isArray(c.options)
+            ? c.options
+                  .map(
+                      (opt) =>
+                          `<button class="pill-btn clarify-btn" data-clarify-value="${escapeHTML(opt.value)}" style="margin:4px 6px 0 0;">${escapeHTML(
+                              opt.label
+                          )}</button>`
+                  )
+                  .join("")
+            : "";
+        return `<div class="bubble" style="background:#F0F7FF; color:#0F2744; border:1px solid #cfe2ff;">
+            <div style="font-weight:700; margin-bottom:4px;">${escapeHTML(c.question || "Need clarification")}</div>
+            ${c.hint ? `<div style="font-size:12px; color:#555; margin-bottom:6px;">${escapeHTML(c.hint)}</div>` : ""}
+            <div style="display:flex; flex-wrap:wrap;">${options}</div>
+        </div>`;
+    }
     
     const planObj = data.plan || data.plan_after_injection || data;
     const steps = planObj.steps || [];
     
     if (steps.length === 0) {
-        return `<div class="bubble">No steps generated.</div>`;
+        if (!data.plan_status) {
+            return `<div class="bubble">No steps generated.</div>`;
+        }
+        return "";
     }
 
     const htmlSteps = steps.map(s => {
@@ -429,6 +463,26 @@ function createPlanBubble(data) {
 
 function createPlanCardWrapper(data) {
     return createPlanBubble(data);
+}
+
+function bindClarificationButtons(rootEl = document) {
+    const buttons = Array.from(rootEl.querySelectorAll(".clarify-btn"));
+    buttons.forEach((btn) => {
+        if (btn.dataset.bound === "1") return;
+        btn.dataset.bound = "1";
+        btn.addEventListener("click", async () => {
+            const value = btn.dataset.clarifyValue || btn.textContent || "";
+            if (!value) return;
+            btn.disabled = true;
+            inputEl.value = value;
+            setStatus("busy");
+            try {
+                await handleRun();
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    });
 }
 
 function createExecutionSummaryCard(result) {
@@ -767,7 +821,8 @@ async function handleRun() {
             logDuration();
         } else {
             // Show Plan
-            appendAgentHTML(createPlanCardWrapper(result));
+            const planEl = appendAgentHTML(createPlanCardWrapper(result));
+            bindClarificationButtons(planEl);
 
             const summaryCard = createExecutionSummaryCard(result);
             if (summaryCard) {

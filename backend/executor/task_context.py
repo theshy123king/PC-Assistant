@@ -10,11 +10,14 @@ from __future__ import annotations
 import hashlib
 import uuid
 from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING
 
 import uiautomation as auto
 
 from backend.executor.actions_schema import ActionPlan
 
+if TYPE_CHECKING:
+    from backend.observability.store import EvidenceStore
 
 class TaskContext:
     def __init__(
@@ -25,6 +28,8 @@ class TaskContext:
         feedback_config: Optional[Dict[str, Any]] = None,
         max_replans: Optional[int] = None,
         work_dir: Optional[str] = None,
+        request_id: Optional[str] = None,
+        evidence_store: Optional["EvidenceStore"] = None,
     ) -> None:
         self.user_instruction = user_instruction or ""
         self.action_plan: Optional[Dict[str, Any]] = None
@@ -45,6 +50,8 @@ class TaskContext:
         self.summary: Optional[Dict[str, Any]] = None
         self.work_dir: Optional[str] = work_dir
         self.active_window: Optional[Dict[str, Any]] = None
+        self.request_id: Optional[str] = request_id
+        self.evidence_store: Optional["EvidenceStore"] = evidence_store
 
     def record_plan(self, plan: ActionPlan | Dict[str, Any]) -> None:
         try:
@@ -156,6 +163,38 @@ class TaskContext:
                 return full_hash
         except Exception:
             return f"uia_error_{uuid.uuid4().hex}"
+
+    def emit_event(
+        self,
+        type: str,
+        payload: Dict[str, Any],
+        *,
+        step_index: Optional[int] = None,
+        attempt: Optional[int] = None,
+        artifact_bytes: Optional[bytes] = None,
+        artifact_kind: Optional[str] = None,
+        artifact_mime: Optional[str] = None,
+        artifact_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Lightweight helper to emit evidence events without blocking.
+        """
+        if not self.evidence_store or not self.request_id:
+            return
+        try:
+            self.evidence_store.emit_sync(
+                self.request_id,
+                type,
+                payload,
+                step_index=step_index,
+                attempt=attempt,
+                artifact_bytes=artifact_bytes,
+                artifact_kind=artifact_kind,
+                artifact_mime=artifact_mime,
+                artifact_meta=artifact_meta,
+            )
+        except Exception:
+            return
 
     def to_dict(self) -> Dict[str, Any]:
         return {
