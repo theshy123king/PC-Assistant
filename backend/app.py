@@ -66,6 +66,29 @@ def _respond_invalid_plan(request_id: str, errors: list[dict], provider: str | N
         "request_id": request_id,
         "validation_errors": errors,
     }
+    if errors:
+        primary = errors[0]
+        reason = primary.get("reason") or "plan_validation_error"
+        base["diagnostics_summary"] = {
+            "overall_status": "plan_validation_error",
+            "primary_failure_category": "plan_validation_error",
+            "primary_reason_code": reason,
+            "failed_step_index": primary.get("step_index"),
+            "action": primary.get("action"),
+            "attempt_count": 0,
+            "retry_exhausted": False,
+            "evidence_highlights": {
+                "focus_expected_title": None,
+                "focus_actual_title": None,
+                "risk_level": None,
+                "file_path": None,
+                "browser_url": None,
+                "browser_title": None,
+                "text_result": None,
+                "verifier_expected": None,
+                "verifier_actual": None,
+            },
+        }
     if provider:
         base["provider"] = provider
     return base

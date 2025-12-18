@@ -4720,6 +4720,101 @@ def _clip_text(value: Optional[str], limit: int = 300) -> Optional[str]:
     return value[:limit]
 
 
+def _map_reason_category(reason: Optional[str]) -> str:
+    reason = (reason or "").lower()
+    mapping = {
+        "foreground_mismatch": "focus_gate",
+        "no_target_hint": "focus_gate",
+        "needs_consent": "consent_gate",
+        "blocked": "consent_gate",
+        "path_not_allowed": "file_guardrail",
+        "forbidden_path": "file_guardrail",
+        "traversal_detected": "file_guardrail",
+        "symlink_escape": "file_guardrail",
+        "wildcard_blocked": "file_guardrail",
+        "overwrite_blocked": "file_guardrail",
+        "missing_expected_verify": "verification",
+        "verification_failed": "verification",
+        "verification_retry": "verification",
+        "handler_error": "handler",
+        "handler_exception": "handler",
+        "timeout": "timeout",
+        "dangerous_request": "unsafe_policy",
+        "confirm_required": "unsafe_policy",
+        "path_outside_workspace": "unsafe_policy",
+        "plan_validation_error": "plan_validation_error",
+    }
+    return mapping.get(reason, "handler" if reason.startswith("handler") else "verification" if reason.startswith("verification") else "unsafe_policy" if "unsafe" in reason else "handler")
+
+
+def _build_diagnostics_summary(logs: List[dict], overall_status: str) -> Optional[Dict[str, Any]]:
+    if not logs:
+        return None
+    priority = [
+        "plan_validation_error",
+        "file_guardrail",
+        "consent_gate",
+        "focus_gate",
+        "verification",
+        "handler",
+        "timeout",
+        "unsafe_policy",
+    ]
+
+    def pick_entry() -> Optional[dict]:
+        for category in priority:
+            for log in logs:
+                reason = log.get("reason") or (log.get("verification") or {}).get("reason") or (log.get("safety") or {}).get("code")
+                mapped = _map_reason_category(reason)
+                if mapped == category and (log.get("status") in {"error", "unsafe"} or mapped == "plan_validation_error"):
+                    return log
+        # fallback: first error/unsafe
+        for log in logs:
+            if log.get("status") in {"error", "unsafe"}:
+                return log
+        return None
+
+    entry = pick_entry()
+    if not entry:
+        return None
+
+    reason = entry.get("reason") or (entry.get("verification") or {}).get("reason") or (entry.get("safety") or {}).get("code")
+    category = _map_reason_category(reason)
+    attempts = entry.get("attempts") or []
+    attempt_count = len(attempts)
+    verification = entry.get("verification") or {}
+    retry_exhausted = False
+    if verification:
+        try:
+            retry_exhausted = verification.get("decision") != "success" and (verification.get("attempt") or 0) >= (
+                verification.get("max_attempts") or verification.get("attempt") or 0
+            )
+        except Exception:
+            retry_exhausted = False
+    evidence = entry.get("evidence") or verification.get("evidence") or {}
+    highlights = {
+        "focus_expected_title": _clip_text((evidence.get("focus_expected") or {}).get("title")),
+        "focus_actual_title": _clip_text((evidence.get("focus_actual") or {}).get("title")),
+        "risk_level": (evidence.get("risk") or {}).get("level"),
+        "file_path": evidence.get("file_check", {}).get("normalized_path") if isinstance(evidence.get("file_check"), dict) else None,
+        "browser_url": (evidence.get("actual") or {}).get("url"),
+        "browser_title": (evidence.get("actual") or {}).get("title"),
+        "text_result": _clip_text(evidence.get("text_result")),
+        "verifier_expected": evidence.get("expected"),
+        "verifier_actual": evidence.get("actual"),
+    }
+    return {
+        "overall_status": overall_status,
+        "primary_failure_category": category,
+        "primary_reason_code": reason,
+        "failed_step_index": entry.get("step_index"),
+        "action": entry.get("action"),
+        "attempt_count": attempt_count,
+        "retry_exhausted": bool(retry_exhausted),
+        "evidence_highlights": highlights,
+    }
+
+
 def _evaluate_file_guardrails(
     step: ActionStep,
     work_dir: Optional[str],
@@ -6266,7 +6361,10 @@ def run_steps(
                 except Exception:
                     pass
         summary = _build_execution_summary(logs, context)
+        diagnostics = _build_diagnostics_summary(logs, "dry_run")
         result = {"overall_status": "dry_run", "logs": logs, "summary": summary}
+        if diagnostics:
+            result["diagnostics_summary"] = diagnostics
         if context:
             result["context"] = context.to_dict()
             if hasattr(context, "set_summary"):
@@ -6314,7 +6412,11 @@ def run_steps(
                 context.add_error(entry["message"], {"code": "dangerous_request", "term": dangerous_term})
             except Exception:
                 pass
-        return {"overall_status": "unsafe", "logs": logs, "context": context.to_dict() if context else None}
+        diagnostics = _build_diagnostics_summary(logs, "unsafe")
+        result = {"overall_status": "unsafe", "logs": logs, "context": context.to_dict() if context else None}
+        if diagnostics:
+            result["diagnostics_summary"] = diagnostics
+        return result
 
     # Pre-validate all planned steps for safety before execution starts.
     for pre_idx, pre_step in enumerate(steps):
@@ -6337,7 +6439,11 @@ def run_steps(
                     context.add_error(entry["message"], safety_check)
                 except Exception:
                     pass
-            return {"overall_status": "unsafe", "logs": logs, "context": context.to_dict() if context else None}
+            diagnostics = _build_diagnostics_summary(logs, "unsafe")
+            result = {"overall_status": "unsafe", "logs": logs, "context": context.to_dict() if context else None}
+            if diagnostics:
+                result["diagnostics_summary"] = diagnostics
+            return result
 
     try:
         while idx < len(steps) and executed_steps < max_total_steps:
@@ -6942,6 +7048,9 @@ def run_steps(
         result["plan_rewrites"] = plan_rewrites
     summary = _build_execution_summary(logs, context)
     result["summary"] = summary
+    diagnostics = _build_diagnostics_summary(logs, overall_status)
+    if diagnostics:
+        result["diagnostics_summary"] = diagnostics
     if context and hasattr(context, "set_summary"):
         try:
             context.set_summary(summary)
