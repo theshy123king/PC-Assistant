@@ -4714,6 +4714,12 @@ def _normalize_handler_status(message: Any, default_status: str = "success") -> 
     return status, reason
 
 
+def _clip_text(value: Optional[str], limit: int = 300) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return value[:limit]
+
+
 def _evaluate_file_guardrails(
     step: ActionStep,
     work_dir: Optional[str],
@@ -4852,6 +4858,7 @@ def _verify_step_outcome(
     ui_actions = INPUT_ACTIONS - {"browser_extract_text"}
     read_only_actions = {"browser_extract_text", "list_windows", "get_active_window", "read_file", "open_file", "list_files"}
     file_actions = RISKY_FILE_ACTIONS | {"create_folder"}
+    browser_actions = {"open_url", "browser_click", "browser_input", "browser_extract_text", "browser_wait_for_text", "browser_scroll"}
 
     if action == "wait_until" and status in {"error", "failed"}:
         verifier = "wait_until"
@@ -4884,6 +4891,227 @@ def _verify_step_outcome(
             "evidence": evidence,
             "should_retry": False,
         }
+
+    if action in browser_actions:
+        verifier = "browser"
+        params = step.params or {}
+        expected_url = params.get("expected_url") or params.get("url")
+        expected_title = params.get("expected_title") or params.get("title")
+        verify_text = params.get("verify_text") or params.get("verify_targets") or []
+        if isinstance(verify_text, str):
+            verify_text = [verify_text]
+        verify_text = [str(t) for t in verify_text if t]
+        if action == "browser_wait_for_text" and not verify_text and params.get("text"):
+            verify_text = [params.get("text")]
+        expected_value = params.get("value") if action == "browser_input" else None
+        actual_url = None
+        actual_title = None
+        actual_text = None
+        actual_value = None
+        if isinstance(message, dict):
+            actual_url = message.get("url") or message.get("current_url")
+            actual_title = message.get("title") or message.get("page_title")
+            actual_text = message.get("matched_text") or message.get("text") or message.get("full_text")
+            actual_value = message.get("value") or message.get("text") or message.get("matched_text")
+        expected: Dict[str, Any] = {}
+        actual: Dict[str, Any] = {}
+
+        def _build_browser_evidence(reason_code: str) -> Dict[str, Any]:
+            return _build_evidence(
+                request_id,
+                step_index,
+                attempt,
+                action,
+                status,
+                reason_code,
+                "verify",
+                before_obs,
+                after_obs,
+                foreground,
+                verifier=verifier,
+                expected=expected,
+                actual=actual,
+                text_result=_clip_text(actual_text),
+            )
+
+        def _retry_decision() -> str:
+            return "retry" if attempt < max_attempts else "failed"
+
+        # Common expected/actual snapshots
+        if expected_url:
+            expected["url_contains"] = expected_url
+        if expected_title:
+            expected["title_contains"] = expected_title
+        if verify_text:
+            expected["verify_text"] = verify_text
+        if expected_value:
+            expected["value_contains"] = expected_value
+        if actual_url:
+            actual["url"] = actual_url
+        if actual_title:
+            actual["title"] = actual_title
+        if actual_text:
+            actual["text"] = _clip_text(actual_text)
+        if actual_value:
+            actual["value"] = _clip_text(actual_value)
+
+        # Action-specific verification
+        if action == "open_url":
+            verifier = "browser_url"
+            if not expected_url and not expected_title:
+                decision = "failed"
+                reason = "missing_expected_verify"
+            else:
+                url_ok = bool(expected_url and actual_url and expected_url.lower() in actual_url.lower())
+                title_ok = bool(expected_title and actual_title and expected_title.lower() in actual_title.lower())
+                if url_ok or title_ok:
+                    decision = "success"
+                    reason = "verified"
+                else:
+                    # Retry if url/title missing or empty
+                    if (expected_url and not actual_url) or (expected_title and not actual_title):
+                        decision = _retry_decision()
+                        reason = "verification_retry"
+                    else:
+                        decision = "failed"
+                        reason = "verification_failed"
+            evidence = _build_browser_evidence(reason)
+            return {
+                "decision": decision,
+                "reason": reason,
+                "status": status,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "verifier": verifier,
+                "expected": expected,
+                "actual": actual,
+                "evidence": evidence,
+                "should_retry": decision == "retry",
+            }
+
+        if action in {"browser_click", "browser_input", "browser_wait_for_text"}:
+            verifier = "browser_text"
+            # enforce expected presence
+            has_expected = bool(verify_text) or bool(expected_url) or bool(expected_value)
+            if not has_expected:
+                decision = "failed"
+                reason = "missing_expected_verify"
+                evidence = _build_browser_evidence(reason)
+                return {
+                    "decision": decision,
+                    "reason": reason,
+                    "status": status,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "verifier": verifier,
+                    "expected": expected,
+                    "actual": actual,
+                    "evidence": evidence,
+                    "should_retry": False,
+                }
+            url_ok = bool(expected_url and actual_url and expected_url.lower() in actual_url.lower())
+            text_ok = False
+            if verify_text:
+                if actual_text:
+                    text_ok = any(t.lower() in str(actual_text).lower() for t in verify_text)
+                elif actual_title:
+                    text_ok = any(t.lower() in str(actual_title).lower() for t in verify_text)
+            value_ok = False
+            if expected_value:
+                if actual_value:
+                    value_ok = expected_value.lower() in str(actual_value).lower()
+                elif actual_text:
+                    value_ok = expected_value.lower() in str(actual_text).lower()
+            # Decide
+            if url_ok or text_ok or value_ok:
+                decision = "success"
+                reason = "verified"
+            else:
+                # Retry if we have missing actual signals
+                if (expected_url and not actual_url) or (verify_text and not actual_text and not actual_title) or (
+                    expected_value and not actual_value and not actual_text
+                ):
+                    decision = _retry_decision()
+                    reason = "verification_retry"
+                else:
+                    decision = "failed"
+                    reason = "verification_failed"
+            evidence = _build_browser_evidence(reason)
+            return {
+                "decision": decision,
+                "reason": reason,
+                "status": status,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "verifier": verifier,
+                "expected": expected,
+                "actual": actual,
+                "evidence": evidence,
+                "should_retry": decision == "retry",
+            }
+
+        if action == "browser_extract_text":
+            verifier = "browser_extract"
+            must_contain = params.get("text") or params.get("keywords")
+            if isinstance(must_contain, str):
+                must_contain = [must_contain]
+            must_contain = [str(t) for t in must_contain] if must_contain else []
+            if must_contain:
+                expected["verify_text"] = must_contain
+            if not actual_text:
+                decision = _retry_decision()
+                reason = "verification_retry"
+            else:
+                if must_contain:
+                    matches = any(t.lower() in actual_text.lower() for t in must_contain)
+                    if matches:
+                        decision = "success"
+                        reason = "verified"
+                    else:
+                        decision = "failed"
+                        reason = "verification_failed"
+                else:
+                    decision = "success"
+                    reason = "verified"
+            evidence = _build_browser_evidence(reason)
+            return {
+                "decision": decision,
+                "reason": reason,
+                "status": status,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "verifier": verifier,
+                "expected": expected,
+                "actual": actual,
+                "evidence": evidence,
+                "should_retry": decision == "retry",
+            }
+
+        if action == "browser_scroll":
+            verifier = "browser_scroll"
+            if verify_text:
+                if actual_text and any(t.lower() in actual_text.lower() for t in verify_text):
+                    decision = "success"
+                    reason = "verified"
+                else:
+                    decision = _retry_decision()
+                    reason = "verification_retry" if decision == "retry" else "verification_failed"
+            else:
+                decision = "success"
+                reason = "verified"
+            evidence = _build_browser_evidence(reason)
+            return {
+                "decision": decision,
+                "reason": reason,
+                "status": status,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "verifier": verifier,
+                "expected": expected,
+                "actual": actual,
+                "evidence": evidence,
+                "should_retry": decision == "retry",
+            }
 
     if status in {"error", "failed"}:
         decision = _retry_or_fail()

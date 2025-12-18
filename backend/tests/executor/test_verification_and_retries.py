@@ -40,7 +40,7 @@ def test_browser_extract_text_single_attempt(monkeypatch):
     def fake_extract(step):
         nonlocal called
         called += 1
-        return {"status": "success", "text": "ok"}
+        return {"status": "success", "text": "status ok"}
 
     monkeypatch.setitem(executor.ACTION_HANDLERS, "browser_extract_text", fake_extract)
 
