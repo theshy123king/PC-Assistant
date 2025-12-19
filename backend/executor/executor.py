@@ -76,7 +76,7 @@ from backend.executor.runtime_context import (
     set_current_context,
 )
 from backend.executor.uia_rebind import rebind_element
-from backend.executor.dispatch import Dispatcher, handle_hotkey, handle_type
+from backend.executor.dispatch import Dispatcher, handle_click, handle_hotkey, handle_type
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -1579,100 +1579,6 @@ def handle_activate_window(step: ActionStep) -> Any:
 
 def handle_key_press(step: ActionStep) -> str:
     return input.key_press(step.params)
-
-
-def handle_click(step: ActionStep) -> str:
-    params = step.params or {}
-    button = params.get("button", "left")
-    strict_fg = _coerce_bool(params.get("strict_foreground"), False)
-    preferred_window = _get_active_window_snapshot() or (ACTIVE_WINDOW.get(None) or {})
-    if strict_fg and not preferred_window.get("hwnd"):
-        preferred_window = _foreground_snapshot()
-    preferred = preferred_window
-    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
-    try:
-        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
-    except Exception:
-        pref_hwnd = None
-    if strict_fg and not pref_hwnd:
-        return {"status": "error", "reason": "preferred_window_unavailable", "preferred": preferred}
-
-    x = params.get("x")
-    y = params.get("y")
-    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-        print(f"[EXEC] Clicking at ({x}, {y})")
-        result = MOUSE.click({"x": x, "y": y, "button": button})
-        return {"status": "success", "method": "absolute", "reason": result}
-
-    targets = _extract_targets(params)
-    if not targets:
-        return "error: 'x'/'y' or 'text/target/visual_description' is required"
-
-    logs: List[str] = []
-    if strict_fg:
-        fg_ok, fg_after, enforcement = _enforce_strict_foreground_once(preferred, logs=logs)
-        if not fg_ok:
-            _store_active_window(None)
-            return {
-                "status": "error",
-                "reason": "foreground_mismatch",
-                "foreground": fg_after,
-                "preferred": preferred,
-                "enforcement": enforcement,
-            }
-    else:
-        _ensure_foreground(preferred, strict_fg, logs=logs)
-
-    screenshot_path, fg_after, capture_err = _capture_for_interaction(preferred, strict_fg)
-    if capture_err:
-        return {"status": "error", "reason": capture_err, "foreground": fg_after, "preferred": preferred}
-
-    try:
-        _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "reason": f"ocr failed: {exc}"}
-
-    locate_result = None
-    for query in targets:
-        print(f"[EXEC] Trying variant: '{query}'")
-        try:
-            locate_result = _locate_from_params(
-                query, params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
-            )
-        except ValueError as exc:
-            return {"status": "error", "reason": str(exc)}
-        if locate_result.get("status") == "success":
-            break
-
-    if not locate_result or locate_result.get("status") != "success":
-        reason = (locate_result or {}).get("reason") if isinstance(locate_result, dict) else None
-        return {"status": "error", "reason": reason or "locate_failed", "locator": locate_result}
-    if strict_fg and locate_result.get("method") == "vlm":
-        return {"status": "error", "reason": "unverified_click_vlm_strict", "locator": locate_result}
-    center = _extract_center_from_locator(locate_result)
-    valid_center, center_reason = _validate_locator_center(center, locate_result)
-    if not valid_center:
-        return {"status": "error", "reason": center_reason, "locator": locate_result}
-    locate_result["center"] = center
-    try:
-        return _execute_click_strategies(locate_result, button=button)
-    except InteractionStrategyError as exc:
-        target_ref = getattr(exc, "target_ref", None) or _extract_target_ref_from_locator(locate_result)
-        rebind_meta = getattr(exc, "rebind_meta", {})
-        return {
-            "status": "error",
-            "reason": str(exc),
-            "locator": locate_result,
-            "target_ref": target_ref,
-            "message": {
-                "ok": False,
-                "status": "error",
-                "method": locate_result.get("method"),
-                "pattern": None,
-                "rebind": rebind_meta,
-                "reason": str(exc),
-            },
-        }
 
 
 def handle_move_file(step: ActionStep) -> Dict[str, Any]:
