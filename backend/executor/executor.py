@@ -4973,8 +4973,11 @@ def _verify_step_outcome(
             timeout_allowed = bool(message.get("timeout_allowed"))
             elapsed = message.get("elapsed")
             condition = message.get("condition")
+        structural_condition = (condition or "").lower() in {"window_exists", "process_exists", "foreground_matches", "title_contains"}
         expected = {"condition": condition} if condition else {}
         actual = {"met": met, "timed_out": timed_out, "elapsed": elapsed, "timeout_allowed": timeout_allowed}
+        if structural_condition:
+            actual["modality_used"] = "uia"
 
         if met and not timed_out:
             decision = "success"
@@ -5055,11 +5058,11 @@ def _verify_step_outcome(
         if found_window:
             decision = "success"
             reason = "verified"
-            actual = {"window": found_window}
+            actual = {"window": found_window, "modality_used": "uia"}
         else:
             decision = _retry_or_fail()
             reason = "verification_retry" if decision == "retry" else "verification_failed"
-            actual = {"window": None}
+            actual = {"window": None, "modality_used": "uia"}
 
         evidence = _build_evidence(
             request_id,
@@ -5596,6 +5599,12 @@ def _build_step_feedback_config(step: ActionStep, base_config: Dict[str, Any]) -
     run_ocr_after = _coerce_bool(
         params.get("run_ocr_after", feedback_overrides.get("run_ocr_after")), base_config.get("run_ocr_after", capture_ocr)
     )
+    # Structural wait_until should never trigger OCR/VLM by default.
+    if step.action == "wait_until":
+        condition = (params.get("condition") or "").lower()
+        if condition in {"window_exists", "process_exists", "foreground_matches", "title_contains"}:
+            capture_ocr = False
+            run_ocr_after = False
     max_retries = _coerce_nonnegative_int(
         params.get("max_retries", feedback_overrides.get("max_retries", base_config["max_retries"])),
         base_config["max_retries"],

@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -29,8 +28,7 @@ def make_snapshot(title, class_name="app", pid=222, hwnd=333):
     )
 
 
-@pytest.mark.anyio
-async def test_open_app_skips_focus_gate(monkeypatch):
+def test_open_app_skips_focus_gate(monkeypatch):
     # Mock handler to avoid real launch
     monkeypatch.setitem(ex.ACTION_HANDLERS, "open_app", lambda step: {"status": "success"})
     # Ensure window enumeration finds target for verification
@@ -38,20 +36,19 @@ async def test_open_app_skips_focus_gate(monkeypatch):
     wp = StubWindowProvider({"title": "Assistant", "pid": 1, "hwnd": 10, "class": "App"})
     plan = ActionPlan(task="open notepad", steps=[ActionStep(action="open_app", params={"target": "Notepad", "verify_timeout": 0.2})])
 
-    result = await asyncio.to_thread(run_steps, plan, window_provider=wp)
+    result = run_steps(plan, window_provider=wp)
     assert result["overall_status"] == "success"
     assert result["logs"][0]["status"] == "success"
     assert result["logs"][0].get("reason") != "foreground_mismatch"
 
 
-@pytest.mark.anyio
-async def test_open_app_verification_failure(monkeypatch):
+def test_open_app_verification_failure(monkeypatch):
     monkeypatch.setitem(ex.ACTION_HANDLERS, "open_app", lambda step: {"status": "success"})
     monkeypatch.setattr(ex, "_enum_top_windows", lambda: [])
     wp = StubWindowProvider({"title": "Assistant", "pid": 1, "hwnd": 10, "class": "App"})
     plan = ActionPlan(task="open unknown", steps=[ActionStep(action="open_app", params={"target": "GhostApp", "verify_timeout": 0.2})])
 
-    result = await asyncio.to_thread(run_steps, plan, window_provider=wp)
+    result = run_steps(plan, window_provider=wp)
     assert result["overall_status"] == "error"
     entry = result["logs"][0]
     assert entry["reason"] == "verification_failed"
