@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from backend.executor.actions_schema import ActionStep
+from backend.executor import input
 
 
 class Dispatcher:
@@ -63,4 +64,8 @@ def handle_hotkey(step: ActionStep) -> str:
         return f"error: failed to press hotkey: {exc}"
 
 
-__all__ = ["Dispatcher", "handle_hotkey"]
+def handle_type(step: ActionStep) -> str:
+    return input.type_text(step.params)
+
+
+__all__ = ["Dispatcher", "handle_hotkey", "handle_type"]

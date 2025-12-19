@@ -76,7 +76,7 @@ from backend.executor.runtime_context import (
     set_current_context,
 )
 from backend.executor.uia_rebind import rebind_element
-from backend.executor.dispatch import Dispatcher, handle_hotkey
+from backend.executor.dispatch import Dispatcher, handle_hotkey, handle_type
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -1575,10 +1575,6 @@ def handle_activate_window(step: ActionStep) -> Any:
         result.setdefault("status", "error")
         _store_active_window(None)
     return result
-
-
-def handle_type_text(step: ActionStep) -> str:
-    return input.type_text(step.params)
 
 
 def handle_key_press(step: ActionStep) -> str:
@@ -5441,7 +5437,7 @@ ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
     "open_url": handle_open_url,
     "switch_window": handle_switch_window,
     "activate_window": handle_activate_window,
-    "type_text": handle_type_text,
+    "type_text": handle_type,
     "key_press": handle_key_press,
     "click": handle_click,
     "move_file": handle_move_file,
