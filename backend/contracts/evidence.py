@@ -24,6 +24,7 @@ class EvidenceEvent(BaseModel):
     step_index: Optional[int] = None
     attempt: Optional[int] = None
     artifact: Optional[ArtifactRef] = None
+    plan_iteration: Optional[int] = 0
 
 
 __all__ = ["ArtifactRef", "EvidenceEvent"]

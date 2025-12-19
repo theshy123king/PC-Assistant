@@ -50,6 +50,7 @@ class EvidenceStore:
         artifact_kind: Optional[str] = None,
         artifact_mime: Optional[str] = None,
         artifact_meta: Optional[Dict[str, Any]] = None,
+        plan_iteration: Optional[int] = None,
     ) -> None:
         """
         Non-blocking event emission from synchronous producers (e.g., executor thread).
@@ -66,6 +67,7 @@ class EvidenceStore:
             "artifact_kind": artifact_kind,
             "artifact_mime": artifact_mime,
             "artifact_meta": artifact_meta or {},
+            "plan_iteration": plan_iteration,
         }
         try:
             self.ingress_q.put_nowait(item)
@@ -134,6 +136,9 @@ class EvidenceStore:
         artifact_kind: Optional[str] = item.get("artifact_kind")
         artifact_mime: Optional[str] = item.get("artifact_mime")
         artifact_meta: Dict[str, Any] = item.get("artifact_meta") or {}
+        plan_iteration = item.get("plan_iteration")
+        if plan_iteration is None:
+            plan_iteration = 0
 
         if artifact_bytes:
             artifact_id = artifact_meta.get("artifact_id") or uuid.uuid4().hex
@@ -159,6 +164,7 @@ class EvidenceStore:
             step_index=item.get("step_index"),
             attempt=item.get("attempt"),
             artifact=artifact_ref,
+            plan_iteration=plan_iteration,
         )
 
         req_dir = self.root_dir / request_id

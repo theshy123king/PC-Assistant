@@ -4974,7 +4974,16 @@ def _verify_step_outcome(
             elapsed = message.get("elapsed")
             condition = message.get("condition")
         structural_condition = (condition or "").lower() in {"window_exists", "process_exists", "foreground_matches", "title_contains"}
-        expected = {"condition": condition} if condition else {}
+        expected = {
+            "condition": condition,
+            "target": params.get("target"),
+            "timeout": params.get("timeout"),
+            "poll_interval": params.get("poll_interval"),
+            "stability_duration": params.get("stability_duration"),
+            "stable_samples": params.get("stable_samples"),
+            "require": params.get("require"),
+            "allow_timeout": params.get("allow_timeout"),
+        }
         actual = {"met": met, "timed_out": timed_out, "elapsed": elapsed, "timeout_allowed": timeout_allowed}
         if structural_condition:
             actual["modality_used"] = "uia"
@@ -5822,7 +5831,9 @@ def _rewrite_save_pattern(
     return rewritten, rewrite_log
 
 
-def _build_execution_summary(logs: List[Dict[str, Any]], context) -> Dict[str, Any]:
+def _build_execution_summary(
+    logs: List[Dict[str, Any]], context, final_status: Optional[str] = None, recovered_failures: int = 0
+) -> Dict[str, Any]:
     """
     Aggregate execution metrics for analytics/debugging.
     """
@@ -5833,6 +5844,8 @@ def _build_execution_summary(logs: List[Dict[str, Any]], context) -> Dict[str, A
     ocr_steps = 0
     icon_steps = 0
     vlm_steps = 0
+    uia_steps = 0
+    capture_steps = 0
     unsafe_steps = sum(1 for log in logs if log.get("status") == "unsafe")
     replan_count = getattr(context, "replan_count", 0) if context else 0
     failure_messages: List[str] = []
@@ -5847,8 +5860,22 @@ def _build_execution_summary(logs: List[Dict[str, Any]], context) -> Dict[str, A
         params = log.get("params") or {}
         if isinstance(params, dict) and params.get("target_icon"):
             icon_steps += 1
-        if feedback.get("allow_vlm"):
-            vlm_steps += 1
+        step_modalities: set = set()
+        step_capture = False
+        for att in attempts:
+            ev = att.get("evidence") or {}
+            modality = (ev.get("actual") or {}).get("modality_used") or ev.get("modality_used")
+            if modality:
+                step_modalities.add(modality)
+            if ev.get("before_obs_ref") or ev.get("after_obs_ref"):
+                step_capture = True
+        if step_modalities:
+            if "vlm" in step_modalities:
+                vlm_steps += 1
+            if "uia" in step_modalities:
+                uia_steps += 1
+        if step_capture:
+            capture_steps += 1
         if log.get("status") in {"error", "unsafe"}:
             reason = log.get("message")
             if isinstance(reason, dict):
@@ -5856,8 +5883,8 @@ def _build_execution_summary(logs: List[Dict[str, Any]], context) -> Dict[str, A
             failure_messages.append(str(reason or "unknown"))
 
     summary_text = (
-        f"Executed {total_steps} steps: {successes} succeeded, {failures} failed/unsafe, "
-        f"{retries} retries, {replan_count} replans. Modalities -> OCR:{ocr_steps}, icons:{icon_steps}, VLM:{vlm_steps}."
+        f"Final: {final_status or 'unknown'}. Executed {total_steps} steps: {successes} succeeded, {failures} failed/unsafe, "
+        f"{retries} retries, {replan_count} replans. Modalities -> UIA:{uia_steps}, OCR:{ocr_steps}, icons:{icon_steps}, VLM:{vlm_steps}, captures:{capture_steps}."
     )
 
     return {
@@ -5868,17 +5895,21 @@ def _build_execution_summary(logs: List[Dict[str, Any]], context) -> Dict[str, A
             "unsafe": unsafe_steps,
             "retries": retries,
         },
-        "replans": {
-            "count": replan_count,
-            "history": getattr(context, "replan_history", []) if context else [],
-        },
         "modalities": {
             "ocr_steps": ocr_steps,
             "icon_steps": icon_steps,
             "vlm_steps": vlm_steps,
+            "uia_steps": uia_steps,
+            "capture_steps": capture_steps,
         },
         "failures": failure_messages,
         "summary_text": summary_text,
+        "final_status": final_status,
+        "recovered_failures": recovered_failures,
+        "replans": {
+            "count": replan_count,
+            "history": getattr(context, "replan_history", []) if context else [],
+        },
     }
 
 
@@ -7140,6 +7171,10 @@ def run_steps(
                 if context and hasattr(context, "record_replan"):
                     try:
                         context.record_replan(replan_log)
+                        try:
+                            context.plan_iteration = getattr(context, "plan_iteration", 0) + 1
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 entry["replan"] = replan_log
@@ -7195,8 +7230,17 @@ def run_steps(
         result["context"] = context.to_dict()
     if plan_rewrites:
         result["plan_rewrites"] = plan_rewrites
-    summary = _build_execution_summary(logs, context)
+    replan_count = getattr(context, "replan_count", 0) if context else 0
+    if overall_status in {"success", "replanned"}:
+        final_status = "success_with_replan" if replan_count > 0 or overall_status == "replanned" else "success"
+    elif overall_status == "awaiting_user":
+        final_status = "awaiting_user"
+    else:
+        final_status = "failed"
+    recovered_failures = sum(1 for log in logs if log.get("status") in {"error", "unsafe"}) if final_status.startswith("success") else 0
+    summary = _build_execution_summary(logs, context, final_status=final_status, recovered_failures=recovered_failures)
     result["summary"] = summary
+    result["final_status"] = final_status
     diagnostics = _build_diagnostics_summary(logs, overall_status)
     if diagnostics:
         result["diagnostics_summary"] = diagnostics

@@ -30,6 +30,7 @@ class TaskContext:
         work_dir: Optional[str] = None,
         request_id: Optional[str] = None,
         evidence_store: Optional["EvidenceStore"] = None,
+        plan_iteration: int = 0,
     ) -> None:
         self.user_instruction = user_instruction or ""
         self.action_plan: Optional[Dict[str, Any]] = None
@@ -52,6 +53,7 @@ class TaskContext:
         self.active_window: Optional[Dict[str, Any]] = None
         self.request_id: Optional[str] = request_id
         self.evidence_store: Optional["EvidenceStore"] = evidence_store
+        self.plan_iteration: int = plan_iteration
 
     def record_plan(self, plan: ActionPlan | Dict[str, Any]) -> None:
         try:
@@ -192,6 +194,7 @@ class TaskContext:
                 artifact_kind=artifact_kind,
                 artifact_mime=artifact_mime,
                 artifact_meta=artifact_meta,
+                plan_iteration=getattr(self, "plan_iteration", 0),
             )
         except Exception:
             return

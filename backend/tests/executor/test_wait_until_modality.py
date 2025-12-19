@@ -55,3 +55,17 @@ def test_open_app_verification_modality(monkeypatch):
     ver = entry["attempts"][0]["verification"]
     assert ver["verifier"] == "open_app"
     assert ver["evidence"]["actual"].get("modality_used") == "uia"
+
+
+def test_structural_modality_counts(monkeypatch):
+    def fake_wait(step):
+        return {"status": "timeout", "ok": False, "condition": "window_exists", "elapsed": 0.01}
+
+    monkeypatch.setitem(ex.ACTION_HANDLERS, "wait_until", fake_wait)
+    monkeypatch.setattr(ex, "find_element", lambda *args, **kwargs: None)
+
+    plan = ActionPlan(task="wait", steps=[ActionStep(action="wait_until", params={"condition": "window_exists", "target": "Demo"})])
+    result = ex.run_steps(plan, work_dir=str(Path.cwd()), request_id="req-mod-3", consent_token=True)
+    mods = result["summary"]["modalities"]
+    assert mods["vlm_steps"] == 0
+    assert mods["uia_steps"] >= 1

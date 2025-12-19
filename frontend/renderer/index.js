@@ -75,6 +75,7 @@ let lastRestartAt = 0;
 const RESTART_COOLDOWN_MS = 30000;
 let evidenceEventSource = null;
 let evidenceRequestId = null;
+let evidenceLastPlan = null;
 
 function getApi() {
     if (window.api) return window.api;
@@ -503,6 +504,7 @@ function setEvidenceStatus(text) {
 
 function clearEvidence() {
     if (evidenceList) evidenceList.innerHTML = "";
+    evidenceLastPlan = null;
 }
 
 function stopEvidenceStream() {
@@ -562,6 +564,17 @@ function closeArtifactModal() {
 
 function renderEvidenceEvent(ev) {
     if (!evidenceList) return;
+    const planIter = Number.isFinite(ev.plan_iteration) ? ev.plan_iteration : 0;
+    if (evidenceLastPlan === null || planIter !== evidenceLastPlan) {
+        const header = document.createElement("div");
+        header.textContent = `Plan #${planIter}`;
+        header.style.fontWeight = "700";
+        header.style.fontSize = "12px";
+        header.style.color = "#0f2744";
+        header.style.marginTop = evidenceLastPlan === null ? "0" : "8px";
+        evidenceList.appendChild(header);
+        evidenceLastPlan = planIter;
+    }
     const row = document.createElement("div");
     row.className = "evidence-row";
 
@@ -636,12 +649,27 @@ function createExecutionSummaryCard(result) {
     if (!summary && (!rewrites || rewrites.length === 0)) return "";
 
     const lines = [];
+    const finalStatus = summary?.final_status || execution?.final_status || result.final_status || execution?.overall_status || result.overall_status;
+    const replansCount = summary?.replans?.count;
+    if (finalStatus) {
+        const replanNote = replansCount ? ` (after ${replansCount} replans)` : "";
+        lines.push(`Final: ${escapeHTML(finalStatus)}${replanNote}`);
+    }
     if (summary?.summary_text) {
         lines.push(summary.summary_text);
     }
     const failures = summary?.failures || [];
     if (failures.length) {
         lines.push(`Issues: ${failures.slice(0, 3).join(" | ")}`);
+    }
+    if (summary?.recovered_failures) {
+        lines.push(`Recovered failures: ${summary.recovered_failures}`);
+    }
+    const mods = summary?.modalities;
+    if (mods) {
+        lines.push(
+            `Modalities: UIA:${mods.uia_steps ?? 0} · OCR:${mods.ocr_steps ?? 0} · VLM:${mods.vlm_steps ?? 0} · Captures:${mods.capture_steps ?? 0}`
+        );
     }
     if (rewrites && rewrites.length) {
         const rewriteText = rewrites.map(r => `${r.pattern || "plan"}→${r.replacement || "rewrite"}`).join("; ");
