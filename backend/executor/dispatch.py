@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from backend.executor.actions_schema import ActionStep
+
 
 class Dispatcher:
     """
@@ -36,4 +38,29 @@ class Dispatcher:
         return handler(*args, **kwargs)
 
 
-__all__ = ["Dispatcher"]
+def handle_hotkey(step: ActionStep) -> str:
+    params = step.params or {}
+    keys = params.get("keys") or params.get("key")
+    normalized = []
+    if isinstance(keys, str):
+        normalized = [k for k in keys.split("+") if k]
+    elif isinstance(keys, (list, tuple)):
+        normalized = [str(k) for k in keys if k]
+    if not normalized:
+        return "error: 'keys' param is required (string or list)"
+    try:
+        import pyautogui  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return f"error: pyautogui unavailable: {exc}"
+
+    try:
+        if len(normalized) == 1:
+            pyautogui.press(normalized[0])
+            return f"pressed hotkey {normalized[0]}"
+        pyautogui.hotkey(*normalized)
+        return f"pressed hotkey {'+'.join(normalized)}"
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to press hotkey: {exc}"
+
+
+__all__ = ["Dispatcher", "handle_hotkey"]

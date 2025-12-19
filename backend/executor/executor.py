@@ -76,7 +76,7 @@ from backend.executor.runtime_context import (
     set_current_context,
 )
 from backend.executor.uia_rebind import rebind_element
-from backend.executor.dispatch import Dispatcher
+from backend.executor.dispatch import Dispatcher, handle_hotkey
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -2128,31 +2128,6 @@ def handle_drag(step: ActionStep) -> Dict[str, Any]:
         "locator": locator_meta,
     }
     return result
-
-
-def handle_hotkey(step: ActionStep) -> str:
-    params = step.params or {}
-    keys = params.get("keys") or params.get("key")
-    normalized = []
-    if isinstance(keys, str):
-        normalized = [k for k in keys.split("+") if k]
-    elif isinstance(keys, (list, tuple)):
-        normalized = [str(k) for k in keys if k]
-    if not normalized:
-        return "error: 'keys' param is required (string or list)"
-    try:
-        import pyautogui  # type: ignore
-    except Exception as exc:  # noqa: BLE001
-        return f"error: pyautogui unavailable: {exc}"
-
-    try:
-        if len(normalized) == 1:
-            pyautogui.press(normalized[0])
-            return f"pressed hotkey {normalized[0]}"
-        pyautogui.hotkey(*normalized)
-        return f"pressed hotkey {'+'.join(normalized)}"
-    except Exception as exc:  # noqa: BLE001
-        return f"error: failed to press hotkey: {exc}"
 
 
 def handle_list_windows(step: ActionStep) -> str:
