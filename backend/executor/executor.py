@@ -69,6 +69,7 @@ from backend.executor.task_registry import (
     get_task,
 )
 from backend.executor.uia_rebind import rebind_element
+from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
 from backend.utils.time_utils import now_iso_utc
 from backend.utils.win32_foreground import ensure_foreground, get_foreground_info
@@ -220,51 +221,6 @@ def _set_last_focus_target(context, target: Optional[Dict[str, Any]]) -> None:
             setattr(context, "last_focus_target", target)
         except Exception:
             pass
-
-
-def _build_evidence(
-    request_id: Optional[str],
-    step_index: int,
-    attempt: int,
-    action: str,
-    status: str,
-    reason: str,
-    capture_phase: str,
-    before_obs: Optional[Dict[str, Any]] = None,
-    after_obs: Optional[Dict[str, Any]] = None,
-    foreground: Optional[Dict[str, Any]] = None,
-    verifier: Optional[str] = None,
-    expected: Optional[Dict[str, Any]] = None,
-    actual: Optional[Dict[str, Any]] = None,
-    risk: Optional[Dict[str, Any]] = None,
-    focus_expected: Optional[Dict[str, Any]] = None,
-    focus_actual: Optional[Dict[str, Any]] = None,
-    file_check: Optional[Dict[str, Any]] = None,
-    text_result: Optional[Any] = None,
-    dry_run: bool = False,
-) -> Dict[str, Any]:
-    return {
-        "request_id": request_id,
-        "step_index": step_index,
-        "attempt": attempt,
-        "action": action,
-        "status": status,
-        "reason": reason,
-        "timestamp": now_iso_utc(),
-        "capture_phase": capture_phase,
-        "before_obs_ref": before_obs,
-        "after_obs_ref": after_obs,
-        "foreground": foreground,
-        "verifier": verifier,
-        "expected": expected,
-        "actual": actual,
-        "risk": risk,
-        "focus_expected": focus_expected,
-        "focus_actual": focus_actual,
-        "file_check": file_check,
-        "text_result": text_result,
-        "dry_run": dry_run,
-    }
 
 
 def _is_path_under(base_dir: Optional[str], path_value: Optional[str]) -> bool:
@@ -4998,7 +4954,7 @@ def _verify_step_outcome(
             decision = "failed"
             reason = "timeout" if timed_out else "condition_not_met"
 
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5073,7 +5029,7 @@ def _verify_step_outcome(
             reason = "verification_retry" if decision == "retry" else "verification_failed"
             actual = {"window": None, "modality_used": "uia"}
 
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5126,7 +5082,7 @@ def _verify_step_outcome(
         actual: Dict[str, Any] = {}
 
         def _build_browser_evidence(reason_code: str) -> Dict[str, Any]:
-            return _build_evidence(
+            return build_evidence(
                 request_id,
                 step_index,
                 attempt,
@@ -5326,7 +5282,7 @@ def _verify_step_outcome(
         decision = _retry_or_fail()
         reason = "handler_error"
         verifier = "none"
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5356,7 +5312,7 @@ def _verify_step_outcome(
 
     if verify_mode == "never":
         reason = "verification_skipped"
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5393,7 +5349,7 @@ def _verify_step_outcome(
             expected = {"target": expected_window}
             decision = "success"
             reason = "verified_target_hint"
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5458,7 +5414,7 @@ def _verify_step_outcome(
         except Exception as exc:  # noqa: BLE001
             decision = "failed"
             reason = f"verification_error:{exc}"
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5491,7 +5447,7 @@ def _verify_step_outcome(
         verifier = "wait_until"
         decision = "success" if status not in {"error", "failed"} else "failed"
         reason = "verified" if decision == "success" else "verification_failed"
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5525,7 +5481,7 @@ def _verify_step_outcome(
         reason = "verified" if decision == "success" else "verification_failed"
         if isinstance(message, dict) and "text" in message:
             text_result = message.get("text")
-        evidence = _build_evidence(
+        evidence = build_evidence(
             request_id,
             step_index,
             attempt,
@@ -5554,7 +5510,7 @@ def _verify_step_outcome(
             "should_retry": False,
         }
 
-    evidence = _build_evidence(
+    evidence = build_evidence(
         request_id,
         step_index,
         attempt,
@@ -6469,7 +6425,7 @@ def run_steps(
     if dry_run:
         for idx, step in enumerate(steps):
             risk_info = _score_risk(step, work_dir, last_focus_target)
-            evidence = _build_evidence(
+            evidence = build_evidence(
                 request_id,
                 idx,
                 0,
@@ -6667,7 +6623,7 @@ def run_steps(
             if not dry_run and step.action in INPUT_ACTIONS and needs_foreground:
                 expected = expected_window
                 if not expected:
-                    evidence = _build_evidence(
+                    evidence = build_evidence(
                         request_id,
                         idx,
                         0,
@@ -6728,7 +6684,7 @@ def run_steps(
                     break
                 actual_window = window_provider.get_foreground_window()
                 if not _window_matches(expected, actual_window):
-                    evidence = _build_evidence(
+                    evidence = build_evidence(
                         request_id,
                         idx,
                         0,
@@ -6792,21 +6748,18 @@ def run_steps(
                     foreground_snapshot = window_provider.get_foreground_window()
                 except Exception:
                     foreground_snapshot = None
-                if context and hasattr(context, "emit_event"):
-                    try:
-                        context.emit_event(
-                            "gate",
-                            {
-                                "reason": "focus_check_skipped",
-                                "action": step.action,
-                                "foreground": foreground_snapshot,
-                            },
-                        )
-                    except Exception:
-                        pass
+                emit_context_event(
+                    context,
+                    "gate",
+                    {
+                        "reason": "focus_check_skipped",
+                        "action": step.action,
+                        "foreground": foreground_snapshot,
+                    },
+                )
 
             if risk_info["level"] == RISK_BLOCK:
-                evidence = _build_evidence(
+                evidence = build_evidence(
                     request_id,
                     idx,
                     0,
@@ -6864,7 +6817,7 @@ def run_steps(
                 break
 
             if risk_info["level"] == RISK_HIGH and not consent_token:
-                evidence = _build_evidence(
+                evidence = build_evidence(
                     request_id,
                     idx,
                     0,
@@ -6925,7 +6878,7 @@ def run_steps(
             file_guard = _evaluate_file_guardrails(step, work_dir, dry_run, allowed_roots=ALLOWED_ROOTS)
             if not file_guard.get("allow"):
                 reason_code = file_guard.get("reason") or "path_not_allowed"
-                evidence = _build_evidence(
+                evidence = build_evidence(
                     request_id,
                     idx,
                     0,
