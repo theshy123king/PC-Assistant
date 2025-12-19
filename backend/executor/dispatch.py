@@ -68,36 +68,35 @@ def handle_type(step: ActionStep) -> str:
     return input.type_text(step.params)
 
 
-def handle_click(step: ActionStep) -> Any:
+def handle_click(step: ActionStep, *, provider: Any) -> Any:
     """
-    Basic click handler forwarded from executor. Imports heavy deps lazily to avoid
-    circular imports while preserving behavior.
+    Basic click handler. Dependencies are passed in via `provider` to avoid
+    importing executor from dispatch while keeping monkey-patching behavior.
     """
     from pathlib import Path
 
     from backend.vision.uia_locator import MatchPolicy
-    from backend.executor.executor import (
-        ACTIVE_WINDOW,
-        InteractionStrategyError,
-        MOUSE,
-        _capture_for_interaction,
-        _coerce_bool,
-        _enforce_strict_foreground_once,
-        _ensure_foreground,
-        _extract_center_from_locator,
-        _extract_target_ref_from_locator,
-        _extract_targets,
-        _foreground_snapshot,
-        _get_active_window_snapshot,
-        _locate_from_params,
-        _validate_locator_center,
-        _execute_click_strategies,
-        _store_active_window,
-        run_ocr_with_boxes,
-    )
 
     params = step.params or {}
     button = params.get("button", "left")
+    _coerce_bool = getattr(provider, "_coerce_bool")
+    _get_active_window_snapshot = getattr(provider, "_get_active_window_snapshot")
+    ACTIVE_WINDOW = getattr(provider, "ACTIVE_WINDOW")
+    _foreground_snapshot = getattr(provider, "_foreground_snapshot")
+    MOUSE = getattr(provider, "MOUSE")
+    _extract_targets = getattr(provider, "_extract_targets")
+    _enforce_strict_foreground_once = getattr(provider, "_enforce_strict_foreground_once")
+    _ensure_foreground = getattr(provider, "_ensure_foreground")
+    _capture_for_interaction = getattr(provider, "_capture_for_interaction")
+    run_ocr_with_boxes = getattr(provider, "run_ocr_with_boxes")
+    _locate_from_params = getattr(provider, "_locate_from_params")
+    _extract_center_from_locator = getattr(provider, "_extract_center_from_locator")
+    _validate_locator_center = getattr(provider, "_validate_locator_center")
+    _execute_click_strategies = getattr(provider, "_execute_click_strategies")
+    InteractionStrategyError = getattr(provider, "InteractionStrategyError")
+    _extract_target_ref_from_locator = getattr(provider, "_extract_target_ref_from_locator")
+    _store_active_window = getattr(provider, "_store_active_window")
+
     strict_fg = _coerce_bool(params.get("strict_foreground"), False)
     preferred_window = _get_active_window_snapshot() or (ACTIVE_WINDOW.get(None) or {})
     if strict_fg and not preferred_window.get("hwnd"):

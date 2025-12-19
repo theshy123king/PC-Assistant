@@ -14,6 +14,7 @@ import difflib
 import hashlib
 import json
 import os
+import sys
 import threading
 import shutil
 import subprocess
@@ -76,7 +77,7 @@ from backend.executor.runtime_context import (
     set_current_context,
 )
 from backend.executor.uia_rebind import rebind_element
-from backend.executor.dispatch import Dispatcher, handle_click, handle_hotkey, handle_type
+from backend.executor.dispatch import Dispatcher, handle_click as dispatch_handle_click, handle_hotkey, handle_type
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -1575,6 +1576,10 @@ def handle_activate_window(step: ActionStep) -> Any:
         result.setdefault("status", "error")
         _store_active_window(None)
     return result
+
+
+def handle_click(step: ActionStep) -> Any:
+    return dispatch_handle_click(step, provider=sys.modules[__name__])
 
 
 def handle_key_press(step: ActionStep) -> str:
