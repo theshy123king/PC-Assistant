@@ -76,6 +76,7 @@ from backend.executor.runtime_context import (
     set_current_context,
 )
 from backend.executor.uia_rebind import rebind_element
+from backend.executor.dispatch import Dispatcher
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -5715,6 +5716,7 @@ def run_steps(
     base_vlm_token = VLM_DISABLED.set(not base_allow_vlm)
     active_window_token = ACTIVE_WINDOW.set(None)
 
+    dispatcher = Dispatcher(ACTION_HANDLERS, TEST_MODE_HANDLERS, test_mode=use_stub_handlers)
     steps: List[ActionStep] = list(action_plan.steps[:MAX_STEPS])
     last_focus_target = getattr(context, "last_focus_target", None)
     task_record = None
@@ -5881,9 +5883,7 @@ def run_steps(
             if step.action in INPUT_ACTIONS and needs_foreground:
                 expected_window = last_focus_target or _extract_focus_hints(step)
             executed_steps += 1
-            handler = TEST_MODE_HANDLERS.get(step.action) if use_stub_handlers else None
-            if handler is None:
-                handler = ACTION_HANDLERS.get(step.action)
+            handler = dispatcher.get_handler(step.action)
             if not handler:
                 entry = {
                     "step_index": idx,
