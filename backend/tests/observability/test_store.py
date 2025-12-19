@@ -62,3 +62,51 @@ def test_evidence_store_persistence_and_subscribe(tmp_path: Path):
 
     loop.run_until_complete(asyncio.sleep(0))
     loop.close()
+
+
+def test_replay_skips_truncated_lines(tmp_path: Path):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    store = EvidenceStore(tmp_path)
+    store.set_event_loop(loop)
+
+    request_id = "req-replay"
+    req_dir = tmp_path / request_id
+    req_dir.mkdir(parents=True, exist_ok=True)
+    events_path = req_dir / "events.jsonl"
+
+    valid1 = {
+        "request_id": request_id,
+        "seq": 1,
+        "ts_ms": int(time.time() * 1000),
+        "type": "test",
+        "payload": {"k": "v1"},
+    }
+    valid2 = {
+        "request_id": request_id,
+        "seq": 2,
+        "ts_ms": int(time.time() * 1000),
+        "type": "test",
+        "payload": {"k": "v2"},
+    }
+
+    with events_path.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(valid1) + "\n")
+        f.write('{"bad_json": ')  # truncated/invalid
+        f.write("\n")
+        f.write(json.dumps(valid2) + "\n")
+
+    async def collect():
+        out = []
+        async for ev in store.subscribe(request_id, after_seq=0):
+            out.append(ev)
+            if len(out) >= 2:
+                break
+        return out
+
+    events = loop.run_until_complete(asyncio.wait_for(collect(), timeout=2))
+    assert len(events) == 2
+    assert [e.seq for e in events] == [1, 2]
+
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()

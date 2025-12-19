@@ -90,7 +90,10 @@ class EvidenceStore:
                         line = line.strip()
                         if not line:
                             continue
-                        data = json.loads(line)
+                        try:
+                            data = json.loads(line)
+                        except Exception:
+                            continue
                         try:
                             ev = EvidenceEvent(**data)
                         except Exception:
