@@ -314,6 +314,7 @@ class WaitUntilAction(BaseModel):
     stability_duration: float = 1.0
     stable_samples: int = 3
     require: bool = False
+    allow_timeout: bool = False
 
     @model_validator(mode="after")
     def _validate(self) -> "WaitUntilAction":

@@ -71,3 +71,36 @@ def test_wait_until_not_retried(monkeypatch):
     entry = result["logs"][0]
     assert result["overall_status"] == "error"
     assert len(entry["attempts"]) == 1
+
+
+def test_wait_until_timeout_fails_by_default(monkeypatch):
+    def fake_wait(step):
+        return {"status": "timeout", "ok": False, "condition": "ui_stable", "elapsed": 0.1}
+
+    monkeypatch.setitem(executor.ACTION_HANDLERS, "wait_until", fake_wait)
+
+    plan = ActionPlan(task="wait", steps=[ActionStep(action="wait_until", params={"condition": "ui_stable"})])
+    result = executor.run_steps(plan, work_dir=str(Path.cwd()), request_id="req-ver-4", consent_token=True)
+
+    entry = result["logs"][0]
+    assert result["overall_status"] == "error"
+    assert entry["reason"] == "timeout"
+    assert entry["status"] == "error"
+
+
+def test_wait_until_timeout_allowed_succeeds(monkeypatch):
+    def fake_wait(step):
+        return {"status": "timeout", "ok": False, "condition": "ui_stable", "elapsed": 0.1, "timeout_allowed": True}
+
+    monkeypatch.setitem(executor.ACTION_HANDLERS, "wait_until", fake_wait)
+
+    plan = ActionPlan(
+        task="wait",
+        steps=[ActionStep(action="wait_until", params={"condition": "ui_stable", "allow_timeout": True})],
+    )
+    result = executor.run_steps(plan, work_dir=str(Path.cwd()), request_id="req-ver-5", consent_token=True)
+
+    entry = result["logs"][0]
+    assert result["overall_status"] == "success"
+    assert entry["reason"] == "timeout_allowed"
+    assert entry["status"] == "success"

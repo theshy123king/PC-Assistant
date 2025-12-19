@@ -14,6 +14,13 @@ const statusText = document.getElementById("clickPickerStatus");
 const panelTitle = document.getElementById("panel-title");
 const modelOptions = document.getElementById("model-options");
 const modelButtons = modelOptions ? Array.from(modelOptions.querySelectorAll(".pill-btn")) : [];
+const evidencePanel = document.getElementById("evidence-panel");
+const evidenceList = document.getElementById("evidence-list");
+const evidenceStatus = document.getElementById("evidence-status");
+const evidenceClear = document.getElementById("evidence-clear");
+const artifactModal = document.getElementById("artifact-modal");
+const artifactBody = document.getElementById("artifact-body");
+const artifactClose = artifactModal ? artifactModal.querySelector(".modal-close") : null;
 const PROVIDER_LABELS = { deepseek: "DeepSeek", doubao: "Doubao", qwen: "Qwen" };
 const PROVIDER_STORAGE_KEY = "pc_assistant_provider";
 const modeOptions = document.getElementById("mode-options");
@@ -23,6 +30,7 @@ const MODE_LABELS = { execute: "Execute", chat: "Chat" };
 const DEFAULT_API_BASE = "http://127.0.0.1:5004";
 const API_BASE = (window.api && window.api.backendBaseUrl) || DEFAULT_API_BASE;
 const CHAT_TIMEOUT_MS = 45000;
+const EVIDENCE_PAYLOAD_LIMIT = 500;
 const log = (level, message) => {
     try {
         if (window.api && typeof window.api.log === "function") {
@@ -65,6 +73,8 @@ const HEALTH_BACKOFF_MAX = 15000;
 let healthFailures = 0;
 let lastRestartAt = 0;
 const RESTART_COOLDOWN_MS = 30000;
+let evidenceEventSource = null;
+let evidenceRequestId = null;
 
 function getApi() {
     if (window.api) return window.api;
@@ -485,6 +495,140 @@ function bindClarificationButtons(rootEl = document) {
     });
 }
 
+// --- Evidence Stream (Manual checklist near this block)
+// Manual check: run a task that emits evidence; verify seq increases, artifact buttons open image/JSON; start another run and old stream closes.
+function setEvidenceStatus(text) {
+    if (evidenceStatus) evidenceStatus.textContent = text;
+}
+
+function clearEvidence() {
+    if (evidenceList) evidenceList.innerHTML = "";
+}
+
+function stopEvidenceStream() {
+    if (evidenceEventSource) {
+        try {
+            evidenceEventSource.close();
+        } catch (err) {
+            // ignore
+        }
+    }
+    evidenceEventSource = null;
+    evidenceRequestId = null;
+    setEvidenceStatus("stopped");
+}
+
+function truncatePayload(payload) {
+    try {
+        const text = JSON.stringify(payload ?? {});
+        return text.length > EVIDENCE_PAYLOAD_LIMIT ? `${text.slice(0, EVIDENCE_PAYLOAD_LIMIT)}...` : text;
+    } catch (err) {
+        return "";
+    }
+}
+
+function openArtifactModal(requestId, artifact) {
+    if (!artifact || !artifactModal || !artifactBody) return;
+    artifactBody.textContent = "Loading artifact...";
+    artifactModal.style.display = "flex";
+    const url = `${API_BASE}/api/artifact/${encodeURIComponent(requestId)}/${encodeURIComponent(artifact.artifact_id)}`;
+    if (artifact.kind === "image") {
+        const img = document.createElement("img");
+        img.src = url;
+        img.alt = artifact.artifact_id || "artifact";
+        img.onload = () => {
+            artifactBody.innerHTML = "";
+            artifactBody.appendChild(img);
+        };
+        img.onerror = () => {
+            artifactBody.textContent = "Failed to load image artifact.";
+        };
+    } else {
+        fetch(url)
+            .then((res) => res.text())
+            .then((txt) => {
+                artifactBody.textContent = txt;
+            })
+            .catch(() => {
+                artifactBody.textContent = "Failed to load artifact.";
+            });
+    }
+}
+
+function closeArtifactModal() {
+    if (artifactModal) artifactModal.style.display = "none";
+    if (artifactBody) artifactBody.textContent = "";
+}
+
+function renderEvidenceEvent(ev) {
+    if (!evidenceList) return;
+    const row = document.createElement("div");
+    row.className = "evidence-row";
+
+    const meta = document.createElement("div");
+    meta.className = "evidence-meta";
+    const parts = [
+        `#${ev.seq}`,
+        ev.type || "",
+        typeof ev.step_index === "number" ? `step ${ev.step_index}` : "",
+        typeof ev.attempt === "number" ? `attempt ${ev.attempt}` : "",
+    ].filter(Boolean);
+    meta.textContent = parts.join(" · ");
+    row.appendChild(meta);
+
+    const payload = document.createElement("div");
+    payload.className = "evidence-payload";
+    payload.textContent = truncatePayload(ev.payload || {});
+    row.appendChild(payload);
+
+    if (ev.artifact && ev.artifact.artifact_id) {
+        const actions = document.createElement("div");
+        actions.className = "evidence-actions";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn-link";
+        btn.textContent = "View artifact";
+        btn.addEventListener("click", () => openArtifactModal(ev.request_id, ev.artifact));
+        actions.appendChild(btn);
+        row.appendChild(actions);
+    }
+
+    evidenceList.appendChild(row);
+    if (evidencePanel) {
+        evidencePanel.scrollTop = evidencePanel.scrollHeight;
+    }
+}
+
+function startEvidenceStream(requestId) {
+    if (!requestId) return;
+    if (typeof EventSource === "undefined") {
+        setEvidenceStatus("unsupported");
+        return;
+    }
+    if (evidenceEventSource) {
+        stopEvidenceStream();
+    }
+    evidenceRequestId = requestId;
+    setEvidenceStatus("connecting");
+    const url = `${API_BASE}/api/stream/${encodeURIComponent(requestId)}`;
+    try {
+        const es = new EventSource(url);
+        evidenceEventSource = es;
+        es.onopen = () => setEvidenceStatus("connected");
+        es.onerror = () => setEvidenceStatus("disconnected");
+        es.onmessage = (evt) => {
+            try {
+                const data = JSON.parse(evt.data);
+                renderEvidenceEvent(data);
+            } catch (err) {
+                // ignore parse errors
+            }
+        };
+    } catch (err) {
+        setEvidenceStatus("error");
+    }
+}
+
 function createExecutionSummaryCard(result) {
     const execution = result.execution || result;
     const summary = execution?.summary || result.summary || result.context?.summary;
@@ -712,6 +856,8 @@ function appendExecutionDetails(result) {
 async function handleRun() {
     const text = (inputEl.value || "").trim();
     if (!text) return;
+    stopEvidenceStream();
+    clearEvidence();
 
     const api = getApi();
     const runFn = api.run;
@@ -820,6 +966,9 @@ async function handleRun() {
             setStatus("success");
             logDuration();
         } else {
+            if (result && result.request_id) {
+                startEvidenceStream(result.request_id);
+            }
             // Show Plan
             const planEl = appendAgentHTML(createPlanCardWrapper(result));
             bindClarificationButtons(planEl);
@@ -958,6 +1107,20 @@ clearBtn.addEventListener("click", () => {
     chatScroll.innerHTML = '<div class="bubble">System ready.</div>';
     setStatus("idle");
 });
+
+if (evidenceClear) {
+    evidenceClear.addEventListener("click", clearEvidence);
+}
+if (artifactClose) {
+    artifactClose.addEventListener("click", closeArtifactModal);
+}
+if (artifactModal) {
+    artifactModal.addEventListener("click", (e) => {
+        if (e.target === artifactModal) {
+            closeArtifactModal();
+        }
+    });
+}
 
 setStatus(currentStatusState);
 startHealthMonitor();

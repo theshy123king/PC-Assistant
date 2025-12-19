@@ -274,6 +274,8 @@ function shutdownApp({ forceExit = false } = {}) {
     return;
   }
   app.quit();
+  // Defensive: ensure the CLI returns to input mode even if some handles linger.
+  setTimeout(() => process.exit(0), 500);
 }
 
 function createWindow() {

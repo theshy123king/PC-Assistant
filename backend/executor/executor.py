@@ -1991,6 +1991,7 @@ def handle_wait_until(step: ActionStep) -> Dict[str, Any]:
         "last_observed": last_observed,
         "reason": last_reason or "timeout",
         "polls": polls,
+        "timeout_allowed": bool(getattr(wait_action, "allow_timeout", False)),
     }
     if wait_action.require:
         raise RuntimeError(
@@ -4927,6 +4928,7 @@ def _verify_step_outcome(
     verify_mode: str = "auto",
     request_id: Optional[str] = None,
     step_index: int = 0,
+    window_provider: Optional[WindowProvider] = None,
 ) -> Dict[str, Any]:
     """
     Verification logic with bounded retries and structured evidence.
@@ -4943,6 +4945,7 @@ def _verify_step_outcome(
     action = step.action
     foreground = after_obs.get("foreground") if isinstance(after_obs, dict) else None
     text_result = None
+    window_provider = window_provider or _DefaultWindowProvider()
 
     def _retry_or_fail() -> str:
         return "retry" if attempt < max_attempts else "failed"
@@ -4955,10 +4958,34 @@ def _verify_step_outcome(
     file_actions = RISKY_FILE_ACTIONS | {"create_folder"}
     browser_actions = {"open_url", "browser_click", "browser_input", "browser_extract_text", "browser_wait_for_text", "browser_scroll"}
 
-    if action == "wait_until" and status in {"error", "failed"}:
+    if action == "wait_until":
         verifier = "wait_until"
-        reason = "verification_failed"
-        decision = "failed"
+        # message is expected to be a dict
+        met = False
+        timed_out = False
+        timeout_allowed = False
+        elapsed = None
+        condition = None
+        if isinstance(message, dict):
+            met = bool(message.get("ok"))
+            status_field = str(message.get("status", "")).lower()
+            timed_out = status_field == "timeout"
+            timeout_allowed = bool(message.get("timeout_allowed"))
+            elapsed = message.get("elapsed")
+            condition = message.get("condition")
+        expected = {"condition": condition} if condition else {}
+        actual = {"met": met, "timed_out": timed_out, "elapsed": elapsed, "timeout_allowed": timeout_allowed}
+
+        if met and not timed_out:
+            decision = "success"
+            reason = "condition_met"
+        elif timed_out and timeout_allowed:
+            decision = "success"
+            reason = "timeout_allowed"
+        else:
+            decision = "failed"
+            reason = "timeout" if timed_out else "condition_not_met"
+
         evidence = _build_evidence(
             request_id,
             step_index,
@@ -4984,7 +5011,82 @@ def _verify_step_outcome(
             "expected": expected,
             "actual": actual,
             "evidence": evidence,
-            "should_retry": False,
+            "should_retry": decision == "retry",
+        }
+
+    if action == "open_app":
+        verifier = "open_app"
+        params = step.params or {}
+        target = params.get("target") or ""
+        title_keywords = []
+        if isinstance(target, str) and target.strip():
+            title_keywords.append(target.strip())
+        extra_titles = params.get("title_keywords") or []
+        if isinstance(extra_titles, (list, tuple)):
+            title_keywords.extend([str(t) for t in extra_titles if t])
+        class_keywords = params.get("class_keywords") or []
+        if isinstance(class_keywords, str):
+            class_keywords = [class_keywords]
+        class_keywords = [str(c) for c in class_keywords if c]
+        expected = {"title_keywords": title_keywords, "class_keywords": class_keywords}
+
+        found_window: Optional[Dict[str, Any]] = None
+        timeout_s = params.get("verify_timeout") or 2.0
+        try:
+            timeout_s = float(timeout_s)
+        except Exception:
+            timeout_s = 2.0
+        timeout_s = max(0.1, min(timeout_s, 5.0))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and found_window is None:
+            snaps = _enum_top_windows()
+            matches = _filter_windows_by_keywords(snaps, title_keywords, class_keywords)
+            if matches:
+                snap = matches[0]
+                found_window = {
+                    "hwnd": snap.hwnd,
+                    "pid": snap.pid,
+                    "title": snap.title,
+                    "class": snap.class_name,
+                }
+                break
+            time.sleep(0.2)
+
+        if found_window:
+            decision = "success"
+            reason = "verified"
+            actual = {"window": found_window}
+        else:
+            decision = _retry_or_fail()
+            reason = "verification_retry" if decision == "retry" else "verification_failed"
+            actual = {"window": None}
+
+        evidence = _build_evidence(
+            request_id,
+            step_index,
+            attempt,
+            action,
+            status,
+            reason,
+            "verify",
+            before_obs,
+            after_obs,
+            foreground,
+            verifier=verifier,
+            expected=expected,
+            actual=actual,
+        )
+        return {
+            "decision": decision,
+            "reason": reason,
+            "status": status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "verifier": verifier,
+            "expected": expected,
+            "actual": actual,
+            "evidence": evidence,
+            "should_retry": decision == "retry",
         }
 
     if action in browser_actions:
@@ -6154,12 +6256,31 @@ INPUT_ACTIONS = {
     "hotkey",
     "browser_click",
     "browser_input",
-    "open_app",
     "adjust_volume",
 }
 
 RISKY_FILE_ACTIONS = {"delete_file", "move_file", "copy_file", "rename_file", "write_file"}
 RISKY_INPUT_ACTIONS = {"type_text", "key_press", "hotkey", "browser_input"}
+
+# Actions that must have the preferred/target window in foreground before dispatch.
+FOREGROUND_REQUIRED_ACTIONS = {
+    "click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "drag",
+    "scroll",
+    "type_text",
+    "key_press",
+    "hotkey",
+    "browser_click",
+    "browser_input",
+    "adjust_volume",
+}
+
+
+def _requires_foreground(action: str) -> bool:
+    return action in FOREGROUND_REQUIRED_ACTIONS
 
 
 def _stub_handler(step: ActionStep) -> Dict[str, Any]:
@@ -6452,7 +6573,8 @@ def run_steps(
                 step.params = dict(step.params or {})
                 step.params.setdefault("base_dir", work_dir)
             expected_window = None
-            if step.action in INPUT_ACTIONS:
+            needs_foreground = _requires_foreground(step.action)
+            if step.action in INPUT_ACTIONS and needs_foreground:
                 expected_window = last_focus_target or _extract_focus_hints(step)
             executed_steps += 1
             handler = TEST_MODE_HANDLERS.get(step.action) if use_stub_handlers else None
@@ -6502,7 +6624,7 @@ def run_steps(
 
             risk_info = _score_risk(step, work_dir, last_focus_target)
 
-            if not dry_run and step.action in INPUT_ACTIONS:
+            if not dry_run and step.action in INPUT_ACTIONS and needs_foreground:
                 expected = expected_window
                 if not expected:
                     evidence = _build_evidence(
@@ -6625,6 +6747,23 @@ def run_steps(
                             pass
                     overall_status = "error"
                     break
+            elif not dry_run and step.action in INPUT_ACTIONS and not needs_foreground:
+                try:
+                    foreground_snapshot = window_provider.get_foreground_window()
+                except Exception:
+                    foreground_snapshot = None
+                if context and hasattr(context, "emit_event"):
+                    try:
+                        context.emit_event(
+                            "gate",
+                            {
+                                "reason": "focus_check_skipped",
+                                "action": step.action,
+                                "foreground": foreground_snapshot,
+                            },
+                        )
+                    except Exception:
+                        pass
 
             if risk_info["level"] == RISK_BLOCK:
                 evidence = _build_evidence(
@@ -6866,6 +7005,7 @@ def run_steps(
                         verify_mode=step_feedback.get("verify_mode", "auto"),
                         request_id=request_id,
                         step_index=idx,
+                        window_provider=window_provider,
                     )
 
                     attempt_logs.append(
