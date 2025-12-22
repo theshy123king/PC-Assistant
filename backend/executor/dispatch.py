@@ -355,6 +355,193 @@ def handle_open_url(step: ActionStep, *, provider: Any) -> Any:
     return result
 
 
+def handle_browser_click(step: ActionStep, *, provider: Any) -> Any:
+    """
+    OCR-driven click helper for browser UI elements.
+    """
+    from pathlib import Path
+
+    Image = getattr(provider, "Image")
+    ACTIVE_WINDOW = getattr(provider, "ACTIVE_WINDOW")
+    MatchPolicy = getattr(provider, "MatchPolicy")
+    _extract_targets = getattr(provider, "_extract_targets")
+    _normalize_target_list = getattr(provider, "_normalize_target_list")
+    _preferred_window_hint = getattr(provider, "_preferred_window_hint")
+    _get_active_window_snapshot = getattr(provider, "_get_active_window_snapshot")
+    _coerce_bool = getattr(provider, "_coerce_bool")
+    _enforce_strict_foreground_once = getattr(provider, "_enforce_strict_foreground_once")
+    _store_active_window = getattr(provider, "_store_active_window")
+    _ensure_foreground = getattr(provider, "_ensure_foreground")
+    _capture_for_interaction = getattr(provider, "_capture_for_interaction")
+    run_ocr_with_boxes = getattr(provider, "run_ocr_with_boxes")
+    _encode_image_base64 = getattr(provider, "_encode_image_base64")
+    _icon_templates_from_params = getattr(provider, "_icon_templates_from_params")
+    _use_vlm = getattr(provider, "_use_vlm")
+    locate_target = getattr(provider, "locate_target")
+    _reject_window_match = getattr(provider, "_reject_window_match")
+    get_vlm_call = getattr(provider, "get_vlm_call")
+    _extract_center_from_locator = getattr(provider, "_extract_center_from_locator")
+    _clamp_point = getattr(provider, "_clamp_point")
+    _validate_locator_center = getattr(provider, "_validate_locator_center")
+    _execute_click_strategies = getattr(provider, "_execute_click_strategies")
+    InteractionStrategyError = getattr(provider, "InteractionStrategyError")
+    _wait_for_ocr_targets = getattr(provider, "_wait_for_ocr_targets")
+    handle_click = getattr(provider, "handle_click")
+
+    params = step.params or {}
+    targets = _extract_targets(params)
+    hint = str(params.get("strategy_hint", "")).lower()
+    params_summary = dict(params)
+    debug = {
+        "branch": "ocr_locator",
+        "strategy_hint": hint,
+        "params": params_summary,
+        "targets": targets,
+    }
+    if not targets:
+        return {"status": "error", "reason": "text param is required", "debug": debug}
+
+    button = params.get("button", "left")
+    attempts = params.get("attempts", 2)
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 2
+    attempts = max(1, min(5, attempts))
+    debug["attempts"] = attempts
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 2)
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 2)
+    preferred = _preferred_window_hint()
+    preferred = preferred or (ACTIVE_WINDOW.get(None) or {})
+    strict_fg = _coerce_bool(params.get("strict_foreground"), False)
+    if strict_fg and not preferred:
+        preferred = _get_active_window_snapshot() or {}
+    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
+    try:
+        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
+    except Exception:
+        pref_hwnd = None
+    if strict_fg and not pref_hwnd:
+        return {"status": "error", "reason": "preferred_window_unavailable", "preferred": preferred}
+
+    logs: list[str] = []
+    provider_name, provider_call = get_vlm_call()
+    for attempt in range(1, attempts + 1):
+        logs.append(f"attempt:{attempt}")
+        if strict_fg:
+            ok_fg, fg_snapshot, enforcement = _enforce_strict_foreground_once(preferred, logs=logs)
+            if not ok_fg:
+                _store_active_window(None)
+                return {
+                    "status": "error",
+                    "reason": "foreground_mismatch",
+                    "foreground": fg_snapshot,
+                    "preferred": preferred,
+                    "enforcement": enforcement,
+                }
+        else:
+            _ensure_foreground(preferred, strict_fg, logs=logs)
+
+        screenshot_path, fg_after, capture_err = _capture_for_interaction(preferred, strict_fg)
+        if capture_err:
+            return {"status": "error", "reason": capture_err, "foreground": fg_after, "preferred": preferred}
+        logs.append(f"screenshot:{screenshot_path}")
+
+        try:
+            _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            logs.append(f"ocr_boxes:{len(boxes)}")
+        except Exception as exc:  # noqa: BLE001
+            return f"error: ocr failed: {exc}"
+
+        image_b64 = _encode_image_base64(Path(screenshot_path))
+        icon_templates = _icon_templates_from_params(params)
+        use_vlm = _use_vlm(params)
+        for term in targets:
+            try:
+                locate_result = locate_target(
+                    query=term,
+                    boxes=boxes,
+                    image_path=str(screenshot_path),
+                    image_base64=image_b64 if (icon_templates or use_vlm) else None,
+                    icon_templates=icon_templates if icon_templates else None,
+                    vlm_call=provider_call if use_vlm else None,
+                    vlm_provider=provider_name,
+                    match_policy=MatchPolicy.CONTROL_ONLY,
+                )
+                _reject_window_match(locate_result, term)
+            except ValueError as exc:
+                return {"status": "error", "reason": str(exc)}
+            if locate_result.get("status") != "success":
+                continue
+            if strict_fg and locate_result.get("method") == "vlm":
+                return {"status": "error", "reason": "unverified_click_vlm_strict", "locator": locate_result}
+            center = _extract_center_from_locator(locate_result) or locate_result.get("center") or {}
+            if center:
+                try:
+                    with Image.open(screenshot_path) as img:
+                        cx, cy = _clamp_point(float(center.get("x", 0)), float(center.get("y", 0)), img.width, img.height)
+                        locate_result["center"] = {"x": cx, "y": cy}
+                        center = locate_result.get("center") or center
+                except Exception:
+                    pass
+            valid_center, center_reason = _validate_locator_center(center, locate_result)
+            if not valid_center:
+                return {"status": "error", "reason": center_reason, "locator": locate_result}
+            if strict_fg:
+                try:
+                    click_result = _execute_click_strategies(locate_result, button=button)
+                except InteractionStrategyError as exc:
+                    return {
+                        "status": "error",
+                        "reason": str(exc),
+                        "locator": locate_result,
+                        "target_ref": getattr(exc, "target_ref", None),
+                        "message": {
+                            "ok": False,
+                            "status": "error",
+                            "method": locate_result.get("method"),
+                            "pattern": None,
+                            "rebind": getattr(exc, "rebind_meta", {}),
+                            "reason": str(exc),
+                        },
+                        "log": logs,
+                    }
+            else:
+                click_step = ActionStep(action="click", params={"x": center.get("x"), "y": center.get("y"), "button": button})
+                click_result = handle_click(click_step)
+            result: Dict[str, Any] = {
+                "status": "clicked",
+                "matched_text": locate_result.get("candidate", {}).get("text"),
+                "matched_term": term,
+                "center": click_result.get("center") or center,
+                "bounds": locate_result.get("bounds"),
+                "reason": click_result.get("reason"),
+                "locator": locate_result,
+                "method": click_result.get("method") or locate_result.get("method"),
+                "message": click_result.get("message"),
+                "log": logs,
+            }
+            if click_result.get("target_ref"):
+                result["target_ref"] = click_result.get("target_ref")
+            if verify_targets:
+                verification = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
+                result["verification"] = verification
+                result["verified"] = bool(verification.get("success"))
+            return result
+
+        logs.append("no_match_found")
+
+    return {
+        "status": "error",
+        "reason": "text_not_found",
+        "targets": targets,
+        "log": logs,
+        "debug": debug,
+    }
+
+
 def handle_browser_input(step: ActionStep, *, provider: Any) -> Any:
     """
     OCR-driven field focus + typing helper for browser forms.
@@ -715,5 +902,8 @@ __all__ = [
     "handle_type",
     "handle_click",
     "handle_open_app",
+    "handle_browser_click",
+    "handle_browser_input",
+    "handle_open_url",
     "handle_wait_until",
 ]
