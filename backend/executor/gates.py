@@ -121,8 +121,37 @@ def evaluate_file_guard(
 
 
 def evaluate_risk_consent(*args: Any, **kwargs: Any) -> GateDecision:
-    """Placeholder for risk/consent evaluation."""
-    raise NotImplementedError
+    """
+    Evaluate risk/consent requirement.
+
+    Expects risk_info dict with a 'level' key and optional 'reason'.
+    consent_token indicates whether user-level consent was provided.
+    Returns a dict matching the executor's current expectations.
+    """
+    risk_info = kwargs.get("risk_info") if not args else args[0]
+    consent_token = kwargs.get("consent_token") if len(args) < 2 else args[1]
+    level = (risk_info or {}).get("level")
+    reason = (risk_info or {}).get("reason")
+
+    if level == "block":
+        return {
+            "allowed": False,
+            "reason": "blocked",
+            "message": reason or "blocked",
+        }
+
+    if level == "high" and not consent_token:
+        return {
+            "allowed": False,
+            "reason": "needs_consent",
+            "message": "consent required for high-risk action",
+        }
+
+    return {
+        "allowed": True,
+        "reason": None,
+        "message": None,
+    }
 
 
 def evaluate_focus_gate(*args: Any, **kwargs: Any) -> GateDecision:

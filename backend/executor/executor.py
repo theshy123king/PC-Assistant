@@ -91,7 +91,7 @@ from backend.executor.dispatch import (
     handle_type,
     handle_wait_until as dispatch_handle_wait_until,
 )
-from backend.executor.gates import evaluate_file_guard
+from backend.executor.gates import evaluate_file_guard, evaluate_risk_consent
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -5072,14 +5072,17 @@ def run_steps(
                     },
                 )
 
-            if risk_info["level"] == RISK_BLOCK:
+            risk_gate = evaluate_risk_consent(risk_info, consent_token)
+            if not risk_gate.get("allowed"):
+                reason = risk_gate.get("reason") or ("blocked" if risk_info.get("level") == RISK_BLOCK else "needs_consent")
+                message = risk_gate.get("message") or (risk_info.get("reason") if reason == "blocked" else "consent required for high-risk action")
                 evidence = build_evidence(
                     request_id,
                     idx,
                     0,
                     step.action,
                     "error",
-                    "blocked",
+                    reason,
                     "gate",
                     before_obs=None,
                     after_obs=None,
@@ -5091,8 +5094,8 @@ def run_steps(
                     "action": step.action,
                     "params": step.params,
                     "status": "error",
-                    "reason": "blocked",
-                    "message": risk_info["reason"],
+                    "reason": reason,
+                    "message": message,
                     "risk": risk_info,
                     "request_id": request_id,
                     "timestamp": now_iso_utc(),
@@ -5102,69 +5105,11 @@ def run_steps(
                         {
                             "attempt": 0,
                             "status": "error",
-                            "reason": "blocked",
-                            "message": risk_info["reason"],
+                            "reason": reason,
+                            "message": message,
                             "verification": {
                                 "decision": "failed",
-                                "reason": "blocked",
-                                "status": "error",
-                                "attempt": 0,
-                                "max_attempts": 0,
-                                "verifier": "risk_gate",
-                                "expected": {},
-                                "actual": {},
-                                "evidence": evidence,
-                                "should_retry": False,
-                            },
-                            "evidence": evidence,
-                        }
-                    ],
-                }
-                logs.append(entry)
-                if context:
-                    try:
-                        context.record_step_result(entry)
-                        context.add_error(entry["message"], risk_info)
-                    except Exception:
-                        pass
-                overall_status = "error"
-                break
-
-            if risk_info["level"] == RISK_HIGH and not consent_token:
-                evidence = build_evidence(
-                    request_id,
-                    idx,
-                    0,
-                    step.action,
-                    "error",
-                    "needs_consent",
-                    "gate",
-                    before_obs=None,
-                    after_obs=None,
-                    foreground=None,
-                    risk=risk_info,
-                )
-                entry = {
-                    "step_index": idx,
-                    "action": step.action,
-                    "params": step.params,
-                    "status": "error",
-                    "reason": "needs_consent",
-                    "message": "consent required for high-risk action",
-                    "risk": risk_info,
-                    "request_id": request_id,
-                    "timestamp": now_iso_utc(),
-                    "duration_ms": 0.0,
-                    "evidence": evidence,
-                    "attempts": [
-                        {
-                            "attempt": 0,
-                            "status": "error",
-                            "reason": "needs_consent",
-                            "message": "consent required for high-risk action",
-                            "verification": {
-                                "decision": "failed",
-                                "reason": "needs_consent",
+                                "reason": reason,
                                 "status": "error",
                                 "attempt": 0,
                                 "max_attempts": 0,
