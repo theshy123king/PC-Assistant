@@ -91,7 +91,7 @@ from backend.executor.dispatch import (
     handle_type,
     handle_wait_until as dispatch_handle_wait_until,
 )
-from backend.executor.gates import evaluate_file_guard, evaluate_risk_consent
+from backend.executor.gates import evaluate_file_guard, evaluate_focus_gate, evaluate_risk_consent
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -4935,76 +4935,23 @@ def run_steps(
             risk_info = _score_risk(step, work_dir, last_focus_target)
 
             if not dry_run and step.action in INPUT_ACTIONS and needs_foreground:
-                expected = expected_window
-                if not expected:
+                focus_decision = evaluate_focus_gate(
+                    needs_foreground,
+                    expected_window,
+                    window_provider,
+                    _window_matches,
+                )
+                if not focus_decision.get("allowed"):
+                    reason = focus_decision.get("reason") or "foreground_mismatch"
+                    expected = focus_decision.get("expected_window")
+                    actual_window = focus_decision.get("actual_window")
                     evidence = build_evidence(
                         request_id,
                         idx,
                         0,
                         step.action,
                         "error",
-                        "no_target_hint",
-                        "gate",
-                        before_obs=None,
-                        after_obs=None,
-                        foreground=None,
-                        focus_expected=None,
-                        focus_actual=None,
-                        risk=risk_info,
-                    )
-                    entry = {
-                        "step_index": idx,
-                        "action": step.action,
-                        "params": step.params,
-                        "status": "error",
-                        "reason": "no_target_hint",
-                        "message": "no target hint for focus safety",
-                        "request_id": request_id,
-                        "timestamp": now_iso_utc(),
-                        "duration_ms": 0.0,
-                        "expected_window": None,
-                        "actual_window": None,
-                        "evidence": evidence,
-                        "attempts": [
-                            {
-                                "attempt": 0,
-                                "status": "error",
-                                "reason": "no_target_hint",
-                                "message": "no target hint for focus safety",
-                                "verification": {
-                                    "decision": "failed",
-                                    "reason": "no_target_hint",
-                                    "status": "error",
-                                    "attempt": 0,
-                                    "max_attempts": 0,
-                                    "verifier": "focus_gate",
-                                    "expected": {},
-                                    "actual": {},
-                                    "evidence": evidence,
-                                    "should_retry": False,
-                                },
-                                "evidence": evidence,
-                            }
-                        ],
-                    }
-                    logs.append(entry)
-                    if context:
-                        try:
-                            context.record_step_result(entry)
-                            context.add_error(entry["message"])
-                        except Exception:
-                            pass
-                    overall_status = "error"
-                    break
-                actual_window = window_provider.get_foreground_window()
-                if not _window_matches(expected, actual_window):
-                    evidence = build_evidence(
-                        request_id,
-                        idx,
-                        0,
-                        step.action,
-                        "error",
-                        "foreground_mismatch",
+                        reason,
                         "gate",
                         before_obs=None,
                         after_obs=None,
@@ -5013,13 +4960,14 @@ def run_steps(
                         focus_actual=actual_window,
                         risk=risk_info,
                     )
+                    message = "no target hint for focus safety" if reason == "no_target_hint" else "foreground window mismatch"
                     entry = {
                         "step_index": idx,
                         "action": step.action,
                         "params": step.params,
                         "status": "error",
-                        "reason": "foreground_mismatch",
-                        "message": "foreground window mismatch",
+                        "reason": reason,
+                        "message": message,
                         "request_id": request_id,
                         "timestamp": now_iso_utc(),
                         "duration_ms": 0.0,
@@ -5030,17 +4978,17 @@ def run_steps(
                             {
                                 "attempt": 0,
                                 "status": "error",
-                                "reason": "foreground_mismatch",
-                                "message": "foreground window mismatch",
+                                "reason": reason,
+                                "message": message,
                                 "verification": {
                                     "decision": "failed",
-                                    "reason": "foreground_mismatch",
+                                    "reason": reason,
                                     "status": "error",
                                     "attempt": 0,
                                     "max_attempts": 0,
                                     "verifier": "focus_gate",
-                                    "expected": {"target": expected},
-                                    "actual": {"foreground": actual_window},
+                                    "expected": {"target": expected} if expected else {},
+                                    "actual": {"foreground": actual_window} if actual_window else {},
                                     "evidence": evidence,
                                     "should_retry": False,
                                 },
@@ -5052,7 +5000,10 @@ def run_steps(
                     if context:
                         try:
                             context.record_step_result(entry)
-                            context.add_error(entry["message"], {"expected_window": expected, "actual_window": actual_window})
+                            if reason == "no_target_hint":
+                                context.add_error(entry["message"])
+                            else:
+                                context.add_error(entry["message"], {"expected_window": expected, "actual_window": actual_window})
                         except Exception:
                             pass
                     overall_status = "error"

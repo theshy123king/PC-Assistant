@@ -155,5 +155,38 @@ def evaluate_risk_consent(*args: Any, **kwargs: Any) -> GateDecision:
 
 
 def evaluate_focus_gate(*args: Any, **kwargs: Any) -> GateDecision:
-    """Placeholder for focus/foreground evaluation."""
-    raise NotImplementedError
+    """
+    Evaluate focus/foreground requirements.
+
+    Returns a dict with:
+      - allowed: bool
+      - reason: str|None
+      - expected_window: dict|None
+      - actual_window: dict|None
+    """
+    needs_foreground = kwargs.get("needs_foreground") if not args else args[0]
+    expected = kwargs.get("expected_window") if len(args) < 2 else args[1]
+    window_provider = kwargs.get("window_provider") if len(args) < 3 else args[2]
+    window_matches = kwargs.get("window_matches") if len(args) < 4 else args[3]
+
+    if not needs_foreground:
+        return {"allowed": True, "reason": None, "expected_window": expected, "actual_window": None}
+
+    if not expected:
+        return {"allowed": False, "reason": "no_target_hint", "expected_window": None, "actual_window": None}
+
+    actual_window = window_provider.get_foreground_window()
+    if not window_matches(expected, actual_window):
+        return {
+            "allowed": False,
+            "reason": "foreground_mismatch",
+            "expected_window": expected,
+            "actual_window": actual_window,
+        }
+
+    return {
+        "allowed": True,
+        "reason": None,
+        "expected_window": expected,
+        "actual_window": actual_window,
+    }
