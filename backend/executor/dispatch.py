@@ -219,7 +219,151 @@ def handle_open_app(step: ActionStep, *, provider: Any) -> Any:
     return result
 
 
-__all__ = ["Dispatcher", "handle_hotkey", "handle_type", "handle_click", "handle_open_app"]
+def handle_open_url(step: ActionStep, *, provider: Any) -> Any:
+    """
+    Open an HTTP/HTTPS URL with the system default browser.
+    """
+    from urllib.parse import urlparse
+    import os
+    import shutil
+    import subprocess
+    import webbrowser
+
+    apps = getattr(provider, "apps")
+    LAST_OPEN_APP_CONTEXT = getattr(provider, "LAST_OPEN_APP_CONTEXT")
+    _summarize_browser_extract_params = getattr(provider, "_summarize_browser_extract_params")
+    _normalize_target_list = getattr(provider, "_normalize_target_list")
+    _wait_for_ocr_targets = getattr(provider, "_wait_for_ocr_targets")
+    gw = getattr(provider, "gw")
+
+    params = step.params or {}
+    _summarize_browser_extract_params(params)
+    raw_url = params.get("url") or params.get("target")
+    raw_browser = params.get("browser") or params.get("app")
+    verify_targets = _normalize_target_list(params.get("verify_text"))
+    verify_attempts = params.get("verify_attempts", 3)
+    if not raw_url or not isinstance(raw_url, str):
+        return "error: 'url' param is required"
+
+    url = raw_url.strip()
+    if not url:
+        return "error: 'url' param is required"
+
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return "error: only http/https URLs are supported"
+
+    def _aliases(name: str) -> list[str]:
+        key = name.lower().strip()
+        aliases = [key]
+        if "edge" in key:
+            aliases.extend(["edge", "msedge", "microsoft edge"])
+        if "chrome" in key or "google" in key:
+            aliases.extend(["chrome", "google chrome", "chrome.exe"])
+        return list(dict.fromkeys(aliases))
+
+    def _find_browser_path(names: list[str]) -> Optional[str]:
+        for name in names:
+            if not name:
+                continue
+            for app_key, path in apps.APP_PATHS.items():
+                if name in app_key or app_key in name:
+                    if os.path.isfile(path):
+                        return path
+            if os.path.isfile(name):
+                return name
+            which = shutil.which(name)
+            if which:
+                return which
+        return None
+
+    explicit_browser = None
+    browser_hints: list[str] = []
+    if isinstance(raw_browser, str) and raw_browser.strip():
+        explicit_browser = raw_browser.strip()
+        browser_hints.extend(_aliases(explicit_browser))
+    elif LAST_OPEN_APP_CONTEXT.get("target"):
+        browser_hints.extend(_aliases(str(LAST_OPEN_APP_CONTEXT["target"])))
+
+    browser_path = _find_browser_path(browser_hints) if browser_hints else None
+    if browser_path:
+        try:
+            subprocess.Popen(
+                [browser_path, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {
+                "status": "opened",
+                "url": url,
+                "opened": True,
+                "browser": browser_path,
+                "method": "direct_exec",
+            }
+        except Exception as exc:  # noqa: BLE001
+            if explicit_browser:
+                return f"error: failed to open url with browser '{explicit_browser}': {exc}"
+            # fall back to default browser below
+
+    if explicit_browser and not browser_path:
+        return f"error: browser '{explicit_browser}' not found"
+
+    result: Dict[str, Any] = {"status": "opened", "url": url, "opened": False, "method": None}
+
+    # If we have a direct browser path, we already returned above. If not, try to find an active browser window to use OCR.
+    try:
+        windows = gw.getAllWindows()
+    except Exception:
+        windows = []
+
+    active_browser_window = None
+    for win in windows:
+        title = (getattr(win, "title", "") or "").lower()
+        if any(term in title for term in ["edge", "chrome", "firefox", "safari", "浏览器"]):
+            active_browser_window = win
+            break
+
+    # If no active browser window, force direct launch via default handler.
+    if not active_browser_window:
+        try:
+            opened = webbrowser.open(url)
+            result.update({"opened": bool(opened), "method": "default"})
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return f"error: failed to open url: {exc}"
+
+    # Browser window is present: use OCR targeting for address bar if verify_text provided.
+    try:
+        active_browser_window.activate()
+    except Exception:
+        pass
+
+    try:
+        opened = webbrowser.open(url)
+    except Exception as exc:  # noqa: BLE001
+        return f"error: failed to open url: {exc}"
+
+    result.update({"opened": bool(opened), "method": "default_with_active_browser"})
+    if verify_targets:
+        verify = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
+        result["verification"] = verify
+        result["verified"] = bool(verify.get("success"))
+    return result
+
+
+__all__ = [
+    "Dispatcher",
+    "handle_hotkey",
+    "handle_type",
+    "handle_click",
+    "handle_open_app",
+    "handle_open_url",
+    "handle_wait_until",
+]
 
 
 def handle_wait_until(step: ActionStep, *, provider: Any) -> Dict[str, Any]:
