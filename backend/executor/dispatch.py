@@ -220,3 +220,189 @@ def handle_open_app(step: ActionStep, *, provider: Any) -> Any:
 
 
 __all__ = ["Dispatcher", "handle_hotkey", "handle_type", "handle_click", "handle_open_app"]
+
+
+def handle_wait_until(step: ActionStep, *, provider: Any) -> Dict[str, Any]:
+    from pathlib import Path
+    import time
+
+    MatchPolicy = getattr(provider, "MatchPolicy")
+    WaitUntilAction = getattr(provider, "WaitUntilAction")
+    ValidationError = getattr(provider, "ValidationError")
+    capture_screen = getattr(provider, "capture_screen")
+    find_element = getattr(provider, "find_element")
+    locate_target = getattr(provider, "locate_target")
+    run_ocr_with_boxes = getattr(provider, "run_ocr_with_boxes")
+    rank_text_candidates = getattr(provider, "rank_text_candidates")
+    _preferred_window_hint = getattr(provider, "_preferred_window_hint")
+    _reject_window_match = getattr(provider, "_reject_window_match")
+    _get_active_window_rect = getattr(provider, "_get_active_window_rect")
+    _hash_active_window_region = getattr(provider, "_hash_active_window_region")
+    CURRENT_CONTEXT = getattr(provider, "CURRENT_CONTEXT")
+
+    params = step.params or {}
+    try:
+        wait_action = WaitUntilAction.model_validate(params)
+    except ValidationError as exc:  # noqa: BLE001
+        return {
+            "status": "timeout",
+            "condition": params.get("condition"),
+            "reason": f"invalid wait_until params: {exc}",
+            "elapsed": 0.0,
+            "polls": 0,
+        }
+
+    start = time.monotonic()
+    polls = 0
+    last_observed: Any = None
+    last_reason: Optional[str] = None
+    stable_value: Optional[str] = None
+    stable_method: Optional[str] = None
+    stable_count = 0
+    last_change_ts = start
+    preferred_window = _preferred_window_hint()
+
+    def _current_ui_state() -> tuple[Optional[str], str, Optional[str]]:
+        ctx = CURRENT_CONTEXT.get(None)
+        if ctx and hasattr(ctx, "get_ui_fingerprint"):
+            try:
+                fp = ctx.get_ui_fingerprint(lite_only=True)
+            except Exception:
+                fp = None
+            if fp:
+                return str(fp), "fingerprint", None
+        rect = _get_active_window_rect()
+        if not rect:
+            return None, "hash", "no_active_window_rect"
+        digest, err = _hash_active_window_region(rect)
+        return digest, "hash", err
+
+    while True:
+        polls += 1
+        now = time.monotonic()
+        elapsed = now - start
+
+        if wait_action.condition == "window_exists":
+            res = find_element(
+                wait_action.target,
+                policy=MatchPolicy.WINDOW_FIRST,
+                preferred_hwnd=preferred_window.get("preferred_hwnd"),
+                preferred_pid=preferred_window.get("preferred_pid"),
+                preferred_title=preferred_window.get("preferred_title"),
+            )
+            last_observed = res
+            if res and res.get("kind") == "window":
+                return {
+                    "status": "success",
+                    "ok": True,
+                    "condition": wait_action.condition,
+                    "elapsed": elapsed,
+                    "matched_target": res,
+                    "polls": polls,
+                }
+        elif wait_action.condition == "element_exists":
+            screenshot_path: Optional[Path] = None
+            boxes: List[Any] = []
+            try:
+                screenshot_path = Path(capture_screen())
+                _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            except Exception as exc:  # noqa: BLE001
+                last_reason = f"ocr_failed:{exc}"
+            try:
+                locate_result = locate_target(
+                    query=wait_action.target,
+                    boxes=boxes,
+                    image_path=str(screenshot_path) if screenshot_path else None,
+                    match_policy=MatchPolicy.CONTROL_ONLY,
+                    preferred_hwnd=preferred_window.get("preferred_hwnd"),
+                    preferred_pid=preferred_window.get("preferred_pid"),
+                    preferred_title=preferred_window.get("preferred_title"),
+                )
+                _reject_window_match(locate_result, wait_action.target or "")
+                last_observed = locate_result
+                if locate_result.get("status") == "success":
+                    return {
+                        "status": "success",
+                        "ok": True,
+                        "condition": wait_action.condition,
+                        "elapsed": elapsed,
+                        "matched_target": locate_result,
+                        "polls": polls,
+                    }
+            except ValueError as exc:
+                last_reason = str(exc)
+        elif wait_action.condition == "text_exists":
+            screenshot_path = None
+            boxes: List[Any] = []
+            try:
+                screenshot_path = Path(capture_screen())
+                _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            except Exception as exc:  # noqa: BLE001
+                last_reason = f"ocr_failed:{exc}"
+            candidates = rank_text_candidates(wait_action.target or "", boxes)
+            last_observed = candidates[0] if candidates else None
+            if candidates:
+                best = candidates[0]
+                if best.get("high_enough") or best.get("medium_enough"):
+                    return {
+                        "status": "success",
+                        "ok": True,
+                        "condition": wait_action.condition,
+                        "elapsed": elapsed,
+                        "matched_target": best,
+                        "polls": polls,
+                    }
+        elif wait_action.condition == "ui_stable":
+            value, method, reason = _current_ui_state()
+            last_observed = {"value": value, "method": method, "reason": reason}
+            if reason:
+                last_reason = reason
+            if value:
+                if value == stable_value and method == stable_method:
+                    stable_count += 1
+                else:
+                    stable_value = value
+                    stable_method = method
+                    stable_count = 1
+                    last_change_ts = now
+                if stable_count >= wait_action.stable_samples or (now - last_change_ts) >= wait_action.stability_duration:
+                    return {
+                        "status": "success",
+                        "ok": True,
+                        "condition": wait_action.condition,
+                        "elapsed": elapsed,
+                        "matched_target": last_observed,
+                        "polls": polls,
+                    }
+            else:
+                stable_count = 0
+        else:
+            last_reason = f"unsupported_condition:{wait_action.condition}"
+
+        if elapsed >= wait_action.timeout:
+            break
+        time.sleep(wait_action.poll_interval)
+
+    timeout_result = {
+        "status": "timeout",
+        "ok": False,
+        "condition": wait_action.condition,
+        "elapsed": elapsed,
+        "last_observed": last_observed,
+        "reason": last_reason or "timeout",
+        "polls": polls,
+        "timeout_allowed": bool(getattr(wait_action, "allow_timeout", False)),
+    }
+    if wait_action.require:
+        raise RuntimeError(f"wait_until failed: condition '{wait_action.condition}' not met within {wait_action.timeout}s")
+    return timeout_result
+
+
+__all__ = [
+    "Dispatcher",
+    "handle_hotkey",
+    "handle_type",
+    "handle_click",
+    "handle_open_app",
+    "handle_wait_until",
+]
