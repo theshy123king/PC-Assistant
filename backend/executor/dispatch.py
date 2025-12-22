@@ -1106,6 +1106,14 @@ def handle_browser_extract_text(step: ActionStep, *, provider: Any) -> Any:
     }
 
 
+def handle_read_file(step: ActionStep, *, provider: Any) -> str:
+    files = getattr(provider, "files")
+    path = (step.params or {}).get("path")
+    if not path or not isinstance(path, str):
+        return "error: 'path' param is required"
+    return files.read_file(step.params)
+
+
 __all__ = [
     "Dispatcher",
     "handle_hotkey",
@@ -1116,5 +1124,6 @@ __all__ = [
     "handle_browser_input",
     "handle_open_url",
     "handle_browser_extract_text",
+    "handle_read_file",
     "handle_wait_until",
 ]
