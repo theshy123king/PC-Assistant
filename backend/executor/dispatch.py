@@ -1119,6 +1119,11 @@ def handle_write_file(step: ActionStep, *, provider: Any) -> str:
     return files.write_file(step.params)
 
 
+def handle_copy_file(step: ActionStep, *, provider: Any) -> Dict[str, Any]:
+    files = getattr(provider, "files")
+    return files.copy_file(step.params)
+
+
 __all__ = [
     "Dispatcher",
     "handle_hotkey",
@@ -1130,5 +1135,7 @@ __all__ = [
     "handle_open_url",
     "handle_browser_extract_text",
     "handle_read_file",
+    "handle_write_file",
+    "handle_copy_file",
     "handle_wait_until",
 ]

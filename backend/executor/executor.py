@@ -85,6 +85,7 @@ from backend.executor.dispatch import (
     handle_browser_click as dispatch_handle_browser_click,
     handle_browser_input as dispatch_handle_browser_input,
     handle_browser_extract_text as dispatch_handle_browser_extract_text,
+    handle_copy_file as dispatch_handle_copy_file,
     handle_write_file as dispatch_handle_write_file,
     handle_open_url as dispatch_handle_open_url,
     handle_type,
@@ -1843,7 +1844,7 @@ def handle_delete_file(step: ActionStep) -> Dict[str, Any]:
 
 
 def handle_copy_file(step: ActionStep) -> Dict[str, Any]:
-    return files.copy_file(step.params)
+    return dispatch_handle_copy_file(step, provider=sys.modules[__name__])
 
 
 def handle_create_folder(step: ActionStep) -> str:
