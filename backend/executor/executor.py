@@ -82,6 +82,7 @@ from backend.executor.dispatch import (
     handle_click as dispatch_handle_click,
     handle_hotkey,
     handle_open_app as dispatch_handle_open_app,
+    handle_browser_input as dispatch_handle_browser_input,
     handle_open_url as dispatch_handle_open_url,
     handle_type,
     handle_wait_until as dispatch_handle_wait_until,
@@ -2213,148 +2214,7 @@ def handle_browser_click(step: ActionStep) -> Any:
 
 
 def handle_browser_input(step: ActionStep) -> Any:
-    """
-    OCR-driven field focus + typing helper for browser forms.
-    """
-    params = step.params or {}
-    targets = _extract_targets(params)
-    if not targets:
-        return "error: 'text' param is required"
-    value = params.get("value")
-    if not isinstance(value, str):
-        return "error: 'value' param is required and must be string"
-
-    button = params.get("button", "left")
-    attempts = params.get("attempts", 2)
-    try:
-        attempts = int(attempts)
-    except Exception:
-        attempts = 2
-    attempts = max(1, min(5, attempts))
-    verify_targets = _normalize_target_list(params.get("verify_text"))
-    verify_attempts = params.get("verify_attempts", 2)
-    auto_enter = _coerce_bool(params.get("auto_enter"), True)
-    preferred = _preferred_window_hint()
-    strict_fg = _coerce_bool(params.get("strict_foreground"), False)
-    hint = str(params.get("strategy_hint", "")).lower()
-    if strict_fg and not preferred:
-        preferred = _get_active_window_snapshot() or {}
-    pref_hwnd = preferred.get("hwnd") or preferred.get("handle")
-    try:
-        pref_hwnd = int(pref_hwnd) if pref_hwnd is not None else None
-    except Exception:
-        pref_hwnd = None
-    if strict_fg and not pref_hwnd:
-        return {"status": "error", "reason": "preferred_window_unavailable", "preferred": preferred}
-
-    logs: List[str] = []
-    last_candidates: List[Dict[str, Any]] = []
-    logs.append(f"strategy_hint:{hint}")
-
-    for attempt in range(1, attempts + 1):
-        logs.append(f"attempt:{attempt}")
-        if strict_fg:
-            ok_fg, fg_snapshot, enforcement = _enforce_strict_foreground_once(preferred, logs=logs)
-            if not ok_fg:
-                _store_active_window(None)
-                return {
-                    "status": "error",
-                    "reason": "foreground_mismatch",
-                    "foreground": fg_snapshot,
-                    "preferred": preferred,
-                    "enforcement": enforcement,
-                }
-        else:
-            _ensure_foreground(preferred, strict_fg, logs=logs)
-
-        screenshot_path, fg_after, capture_err = _capture_for_interaction(preferred, strict_fg)
-        if capture_err:
-            return {"status": "error", "reason": capture_err, "foreground": fg_after, "preferred": preferred}
-        logs.append(f"screenshot:{screenshot_path}")
-
-        try:
-            _full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
-            logs.append(f"ocr_boxes:{len(boxes)}")
-        except Exception as exc:  # noqa: BLE001
-            return f"error: ocr failed: {exc}"
-
-        for term in targets:
-            ranked = rank_text_candidates(term, boxes)
-            if ranked:
-                last_candidates.extend(ranked[:3])
-            try:
-                locate_result = _locate_from_params(
-                    term, params, boxes, Path(screenshot_path), match_policy=MatchPolicy.CONTROL_ONLY
-                )
-            except ValueError as exc:
-                return {"status": "error", "reason": str(exc)}
-            if locate_result.get("status") != "success":
-                continue
-            if strict_fg and locate_result.get("method") == "vlm":
-                return {"status": "error", "reason": "unverified_click_vlm_strict", "locator": locate_result}
-            center = _extract_center_from_locator(locate_result) or locate_result.get("center") or {}
-            if center:
-                try:
-                    with Image.open(screenshot_path) as img:
-                        cx, cy = _clamp_point(float(center.get("x", 0)), float(center.get("y", 0)), img.width, img.height)
-                        locate_result["center"] = {"x": cx, "y": cy}
-                        center = locate_result.get("center") or center
-                except Exception:
-                    pass
-            valid_center, center_reason = _validate_locator_center(center, locate_result)
-            if not valid_center and center:
-                return {"status": "error", "reason": center_reason, "locator": locate_result}
-            try:
-                type_result = _type_with_strategies(value, locate_result, button=button, auto_enter=auto_enter)
-            except InteractionStrategyError as exc:
-                if strict_fg:
-                    return {
-                        "status": "error",
-                        "reason": str(exc),
-                        "locator": locate_result,
-                        "target_ref": getattr(exc, "target_ref", None),
-                        "message": {
-                            "ok": False,
-                            "status": "error",
-                            "method": locate_result.get("method"),
-                            "pattern": None,
-                            "rebind": getattr(exc, "rebind_meta", {}),
-                            "reason": str(exc),
-                        },
-                        "log": logs,
-                    }
-                else:
-                    type_result = {"status": "success", "method": "keyboard_type", "message": "fallback_no_strict"}
-            result: Dict[str, Any] = {
-                "status": "typed",
-                "matched_text": locate_result.get("candidate", {}).get("text"),
-                "matched_term": term,
-                "center": type_result.get("center") or center,
-                "bounds": locate_result.get("bounds"),
-                "click_result": None,
-                "type_result": type_result,
-                "method": type_result.get("method"),
-                "locator": locate_result,
-                "message": type_result.get("message"),
-                "log": logs,
-            }
-            if type_result.get("target_ref"):
-                result["target_ref"] = type_result.get("target_ref")
-            if verify_targets:
-                verification = _wait_for_ocr_targets(verify_targets, attempts=verify_attempts, delay=0.8)
-                result["verification"] = verification
-                result["verified"] = bool(verification.get("success"))
-            return result
-
-        logs.append("no_match_found")
-
-    return {
-        "status": "error",
-        "reason": "text_not_found",
-        "targets": targets,
-        "log": logs,
-        "candidates": last_candidates,
-    }
+    return dispatch_handle_browser_input(step, provider=sys.modules[__name__])
 
 
 def _build_vlm_read_prompt(target_desc: str, search_query: Optional[str] = None) -> str:
