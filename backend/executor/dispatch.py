@@ -1114,6 +1114,11 @@ def handle_read_file(step: ActionStep, *, provider: Any) -> str:
     return files.read_file(step.params)
 
 
+def handle_write_file(step: ActionStep, *, provider: Any) -> str:
+    files = getattr(provider, "files")
+    return files.write_file(step.params)
+
+
 __all__ = [
     "Dispatcher",
     "handle_hotkey",

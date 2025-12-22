@@ -85,6 +85,7 @@ from backend.executor.dispatch import (
     handle_browser_click as dispatch_handle_browser_click,
     handle_browser_input as dispatch_handle_browser_input,
     handle_browser_extract_text as dispatch_handle_browser_extract_text,
+    handle_write_file as dispatch_handle_write_file,
     handle_open_url as dispatch_handle_open_url,
     handle_type,
     handle_wait_until as dispatch_handle_wait_until,
@@ -1857,7 +1858,7 @@ def handle_read_file(step: ActionStep) -> str:
 
 
 def handle_write_file(step: ActionStep) -> str:
-    return files.write_file(step.params)
+    return dispatch_handle_write_file(step, provider=sys.modules[__name__])
 
 
 def handle_adjust_volume(step: ActionStep) -> str:
