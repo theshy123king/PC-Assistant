@@ -91,6 +91,7 @@ from backend.executor.dispatch import (
     handle_type,
     handle_wait_until as dispatch_handle_wait_until,
 )
+from backend.executor.gates import evaluate_file_guard
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -3852,105 +3853,6 @@ def _build_diagnostics_summary(logs: List[dict], overall_status: str) -> Optiona
     }
 
 
-def _evaluate_file_guardrails(
-    step: ActionStep,
-    work_dir: Optional[str],
-    dry_run: bool,
-    allowed_roots: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """
-    Enforce file path guardrails for mutation and read-only actions.
-    """
-    action = step.action
-    params = step.params or {}
-    roots = list(allowed_roots or ALLOWED_ROOTS)
-    if work_dir:
-        _add_allowed_root(work_dir)
-        if work_dir not in roots:
-            roots.append(os.path.abspath(work_dir))
-
-    def _decision(allow: bool, reason: str, original: Optional[str], normalized: Optional[str], rule: str) -> Dict[str, Any]:
-        return {
-            "allow": allow,
-            "reason": reason,
-            "rule": rule,
-            "original_path": original,
-            "normalized_path": normalized,
-            "allowed_roots": roots,
-        }
-
-    mutation_actions = {"write_file", "delete_file", "move_file", "copy_file", "rename_file", "create_folder"}
-    read_actions = {"read_file", "open_file", "list_files"}
-    relevant_actions = mutation_actions | read_actions
-    if action not in relevant_actions:
-        return _decision(True, "not_applicable", None, None, "skip")
-
-    # Collect source/target paths.
-    primary = params.get("path") or params.get("source")
-    destination = params.get("destination") or params.get("destination_dir") or params.get("new_name")
-
-    # Normalize primary
-    norm_primary, err_primary, had_traversal = _normalize_path_candidate(primary, work_dir)
-    if err_primary:
-        return _decision(False, err_primary if err_primary != "normalize_error" else "path_not_allowed", primary, None, err_primary)
-
-    # Wildcard already handled above.
-    if had_traversal and norm_primary and not _is_under_any_root(norm_primary, roots):
-        return _decision(False, "traversal_detected", primary, norm_primary, "traversal_detected")
-
-    if _is_forbidden_path(norm_primary, roots):
-        return _decision(False, "forbidden_path", primary, norm_primary, "forbidden_path")
-
-    # Destination normalization for move/copy/rename.
-    norm_dest = None
-    if action in {"move_file", "copy_file", "rename_file"} and destination:
-        norm_dest, err_dest, had_traversal_dest = _normalize_path_candidate(destination, work_dir)
-        if err_dest:
-            return _decision(False, err_dest if err_dest != "normalize_error" else "path_not_allowed", destination, None, err_dest)
-        if had_traversal_dest and norm_dest and not _is_under_any_root(norm_dest, roots):
-            return _decision(False, "traversal_detected", destination, norm_dest, "traversal_detected")
-        if _is_forbidden_path(norm_dest, roots):
-            return _decision(False, "forbidden_path", destination, norm_dest, "forbidden_path")
-
-    is_mutation = action in mutation_actions
-
-    # Allowed roots enforcement for mutations
-    if is_mutation:
-        if not _is_under_any_root(norm_primary, roots):
-            return _decision(False, "path_not_allowed", primary, norm_primary, "path_not_allowed")
-        if norm_dest and not _is_under_any_root(norm_dest, roots):
-            return _decision(False, "path_not_allowed", destination, norm_dest, "path_not_allowed")
-
-    else:
-        # Read-only policy: allow outside roots unless forbidden
-        if _is_forbidden_path(norm_primary, roots):
-            return _decision(False, "forbidden_path", primary, norm_primary, "forbidden_path")
-
-    # Symlink/junction escape: resolved path outside roots even if apparent path is under root.
-    if is_mutation and norm_primary and not _is_under_any_root(norm_primary, roots):
-        return _decision(False, "symlink_escape", primary, norm_primary, "symlink_escape")
-    if is_mutation and norm_dest and not _is_under_any_root(norm_dest, roots):
-        return _decision(False, "symlink_escape", destination, norm_dest, "symlink_escape")
-
-    # Overwrite guard (runtime only)
-    if not dry_run:
-        try:
-            overwrite_flag = _coerce_bool(params.get("overwrite"), False)
-        except Exception:
-            overwrite_flag = False
-        if action in {"write_file", "rename_file", "move_file", "copy_file"}:
-            target_path = norm_dest if action in {"move_file", "copy_file"} else norm_primary
-            if target_path and _is_under_any_root(target_path, roots):
-                try:
-                    if Path(target_path).exists() and not overwrite_flag:
-                        return _decision(False, "overwrite_blocked", target_path, target_path, "overwrite_blocked")
-                except Exception:
-                    # If stat fails, err on side of blocking overwrite.
-                    return _decision(False, "overwrite_blocked", target_path, target_path, "overwrite_blocked")
-
-    return _decision(True, "allow", primary, norm_primary, "allow")
-
-
 
 def _build_step_feedback_config(step: ActionStep, base_config: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -5287,7 +5189,17 @@ def run_steps(
                 break
 
             # File guardrails (mutation + read)
-            file_guard = _evaluate_file_guardrails(step, work_dir, dry_run, allowed_roots=ALLOWED_ROOTS)
+            file_guard = evaluate_file_guard(
+                step,
+                work_dir,
+                dry_run,
+                allowed_roots=ALLOWED_ROOTS,
+                add_allowed_root=_add_allowed_root,
+                normalize_path_candidate=_normalize_path_candidate,
+                is_under_any_root=_is_under_any_root,
+                is_forbidden_path=_is_forbidden_path,
+                coerce_bool=_coerce_bool,
+            )
             if not file_guard.get("allow"):
                 reason_code = file_guard.get("reason") or "path_not_allowed"
                 evidence = build_evidence(
