@@ -77,7 +77,13 @@ from backend.executor.runtime_context import (
     set_current_context,
 )
 from backend.executor.uia_rebind import rebind_element
-from backend.executor.dispatch import Dispatcher, handle_click as dispatch_handle_click, handle_hotkey, handle_type
+from backend.executor.dispatch import (
+    Dispatcher,
+    handle_click as dispatch_handle_click,
+    handle_hotkey,
+    handle_open_app as dispatch_handle_open_app,
+    handle_type,
+)
 from backend.executor.evidence_emit import build_evidence, emit_context_event
 from backend.executor.verify import _clip_text, verify_step_outcome
 from backend.executor.uia_patterns import try_focus, try_invoke, try_select, try_set_value, try_toggle
@@ -1342,24 +1348,6 @@ def _activate_wechat_bridge_window(
         "hwnd": best_win.hwnd,
         "debug": debug_info,
     }
-
-def handle_open_app(step: ActionStep) -> str:
-    result = apps.open_app(step.params)
-    global LAST_WINDOW_TITLE, LAST_OPEN_APP_CONTEXT
-    if isinstance(result, dict):
-        if result.get("window_title"):
-            LAST_WINDOW_TITLE = result.get("window_title")
-        target = (step.params or {}).get("target") or result.get("target")
-        kind = result.get("selected_kind")
-        launched_pid = result.get("pid") or result.get("process_id")
-        LAST_OPEN_APP_CONTEXT = {
-            "target": str(target).lower() if target else None,
-            "selected_kind": kind,
-            "window_title": result.get("window_title"),
-            "pid": launched_pid,
-        }
-    return result
-
 
 def handle_open_url(step: ActionStep) -> Any:
     """
@@ -5344,7 +5332,7 @@ def _invoke_replan(
 
 
 ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
-    "open_app": handle_open_app,
+    "open_app": lambda step, _prov=None: dispatch_handle_open_app(step, provider=sys.modules[__name__]),
     "open_url": handle_open_url,
     "switch_window": handle_switch_window,
     "activate_window": handle_activate_window,

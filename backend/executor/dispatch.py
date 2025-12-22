@@ -191,4 +191,32 @@ def handle_click(step: ActionStep, *, provider: Any) -> Any:
         }
 
 
-__all__ = ["Dispatcher", "handle_hotkey", "handle_type", "handle_click"]
+def handle_open_app(step: ActionStep, *, provider: Any) -> Any:
+    apps = getattr(provider, "apps")
+    result = apps.open_app(step.params)
+    last_window_attr = "LAST_WINDOW_TITLE"
+    last_context_attr = "LAST_OPEN_APP_CONTEXT"
+    if isinstance(result, dict):
+        if result.get("window_title") is not None and hasattr(provider, last_window_attr):
+            try:
+                setattr(provider, last_window_attr, result.get("window_title"))
+            except Exception:
+                pass
+        target = (step.params or {}).get("target") or result.get("target")
+        kind = result.get("selected_kind")
+        launched_pid = result.get("pid") or result.get("process_id")
+        context_payload = {
+            "target": str(target).lower() if target else None,
+            "selected_kind": kind,
+            "window_title": result.get("window_title"),
+            "pid": launched_pid,
+        }
+        if hasattr(provider, last_context_attr):
+            try:
+                setattr(provider, last_context_attr, context_payload)
+            except Exception:
+                pass
+    return result
+
+
+__all__ = ["Dispatcher", "handle_hotkey", "handle_type", "handle_click", "handle_open_app"]
