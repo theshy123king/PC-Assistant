@@ -84,6 +84,7 @@ from backend.executor.dispatch import (
     handle_open_app as dispatch_handle_open_app,
     handle_browser_click as dispatch_handle_browser_click,
     handle_browser_input as dispatch_handle_browser_input,
+    handle_browser_extract_text as dispatch_handle_browser_extract_text,
     handle_open_url as dispatch_handle_open_url,
     handle_type,
     handle_wait_until as dispatch_handle_wait_until,
@@ -2059,6 +2060,10 @@ def _wait_for_ocr_targets(targets: List[str], attempts: int = 2, delay: float = 
 
 def handle_browser_input(step: ActionStep) -> Any:
     return dispatch_handle_browser_input(step, provider=sys.modules[__name__])
+
+
+def handle_browser_extract_text(step: ActionStep) -> Any:
+    return dispatch_handle_browser_extract_text(step, provider=sys.modules[__name__])
 
 
 def _build_vlm_read_prompt(target_desc: str, search_query: Optional[str] = None) -> str:
@@ -4790,7 +4795,7 @@ ACTION_HANDLERS: Dict[str, Callable[[ActionStep], Any]] = {
     "click_text": handle_click_text,
     "browser_click": lambda step, _prov=None: dispatch_handle_browser_click(step, provider=sys.modules[__name__]),
     "browser_input": handle_browser_input,
-    "browser_extract_text": handle_browser_extract_text,
+    "browser_extract_text": lambda step, _prov=None: dispatch_handle_browser_extract_text(step, provider=sys.modules[__name__]),
     "take_over": handle_take_over,
 }
 

@@ -896,6 +896,216 @@ def handle_wait_until(step: ActionStep, *, provider: Any) -> Dict[str, Any]:
     return timeout_result
 
 
+def handle_browser_extract_text(step: ActionStep, *, provider: Any) -> Any:
+    """
+    Extract text from browser. Supports two modes:
+    1. VLM Direct Read (strategy_hint="vlm_read"): Sends screenshot to VLM to read specific content.
+    2. OCR/Locator (default): Finds a label (e.g. "Price") and extracts text near it.
+    """
+    from pathlib import Path
+
+    base64_mod = getattr(provider, "base64")
+    BytesIO = getattr(provider, "BytesIO")
+    Image = getattr(provider, "Image")
+    capture_screen = getattr(provider, "capture_screen")
+    get_vlm_call = getattr(provider, "get_vlm_call")
+    _encode_image_base64 = getattr(provider, "_encode_image_base64")
+    _summarize_browser_extract_params = getattr(provider, "_summarize_browser_extract_params")
+    _extract_targets = getattr(provider, "_extract_targets")
+    run_ocr_with_boxes = getattr(provider, "run_ocr_with_boxes")
+    rank_text_candidates = getattr(provider, "rank_text_candidates")
+    _run_region_ocr = getattr(provider, "_run_region_ocr")
+    _select_best_candidate = getattr(provider, "_select_best_candidate")
+    _clamp_point = getattr(provider, "_clamp_point")
+    mouse = getattr(provider, "mouse")
+    pyautogui = getattr(provider, "pyautogui", None)
+
+    params = step.params or {}
+    params_summary = _summarize_browser_extract_params(params)
+
+    hint = str(params.get("strategy_hint", "")).lower()
+    if "vlm_read" in hint or ("vlm" in hint and "read" in hint):
+        target_desc = None
+        target_desc_source = None
+        for key in ("visual_description", "target", "text", "query", "label"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                target_desc = value.strip()
+                target_desc_source = key
+                break
+        debug = {
+            "branch": "vlm_read",
+            "strategy_hint": hint,
+            "params": params_summary,
+            "target_desc_source": target_desc_source,
+        }
+        if not target_desc:
+            return {
+                "status": "error",
+                "reason": "visual_description/target/text required for vlm_read",
+                "debug": debug,
+            }
+
+        try:
+            screenshot_path = capture_screen()
+        except Exception as exc:
+            return {"status": "error", "reason": f"screenshot failed: {exc}", "debug": debug}
+        debug.update({"screenshot_path": str(screenshot_path), "target_desc": target_desc})
+
+        search_query = None
+        for key in ("text", "query", "label"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                search_query = value.strip()
+                break
+
+        prompt = provider._build_vlm_read_prompt(target_desc, search_query)
+        debug["prompt"] = prompt
+        if search_query:
+            debug["search_query"] = search_query
+
+        provider_name, provider_call = get_vlm_call()
+        if not provider_call:
+            debug["vlm_provider"] = provider_name
+            return {"status": "error", "reason": "No VLM provider configured (VLM_DISABLED?)", "debug": debug}
+
+        try:
+            print(f"[EXECUTOR] VLM Direct Read: {target_desc} using {provider_name}")
+            prefer_top = bool(params.get("prefer_top_line")) or ("first" in target_desc.lower()) or ("第一" in target_desc)
+            image_b64 = _encode_image_base64(Path(screenshot_path))
+            crop_info = None
+            if prefer_top and image_b64:
+                try:
+                    with Image.open(screenshot_path) as img:
+                        width, height = img.size
+                        top = int(height * 0.18)
+                        bottom = int(height * 0.55)
+                        if bottom - top > 20:
+                            cropped = img.crop((0, top, width, bottom))
+                            buf = BytesIO()
+                            cropped.save(buf, format="PNG")
+                            image_b64 = base64_mod.b64encode(buf.getvalue()).decode("ascii")
+                            crop_info = {"top": top, "bottom": bottom, "width": width, "height": height}
+                except Exception as exc:  # noqa: BLE001
+                    debug["crop_error"] = str(exc)
+
+            debug["vlm_provider"] = provider_name
+            debug["image_base64_ok"] = bool(image_b64)
+            if crop_info:
+                debug["crop"] = crop_info
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    ],
+                }
+            ]
+
+            vlm_response = provider_call(prompt, messages)
+            cleaned_text = vlm_response.strip().strip('"').strip("'").strip()
+
+            return {
+                "status": "success",
+                "matched_text": cleaned_text,
+                "matched_term": target_desc,
+                "method": "vlm_direct_read",
+                "log": [f"vlm_provider:{provider_name}", f"prompt:{target_desc}"],
+                "debug": debug,
+            }
+
+        except Exception as exc:
+            return {"status": "error", "reason": f"vlm_read failed: {exc}", "debug": debug}
+
+    targets = _extract_targets(params)
+    debug = {
+        "branch": "ocr_locator",
+        "strategy_hint": hint,
+        "params": params_summary,
+        "targets": targets,
+    }
+    if not targets:
+        return {"status": "error", "reason": "text param is required", "debug": debug}
+
+    attempts = params.get("attempts", 2)
+    try:
+        attempts = int(attempts)
+    except Exception:
+        attempts = 2
+    attempts = max(1, min(5, attempts))
+    debug["attempts"] = attempts
+
+    logs: list[str] = []
+    last_candidates: list[dict[str, Any]] = []
+    logs.append(f"strategy_hint:{hint}")
+
+    for attempt in range(1, attempts + 1):
+        logs.append(f"attempt:{attempt}")
+        try:
+            screenshot_path = capture_screen()
+            logs.append(f"screenshot:{screenshot_path}")
+        except Exception as exc:  # noqa: BLE001
+            debug["attempt"] = attempt
+            return {"status": "error", "reason": f"screenshot failed: {exc}", "debug": debug}
+
+        try:
+            full_text, boxes = run_ocr_with_boxes(str(screenshot_path))
+            logs.append(f"ocr_boxes:{len(boxes)}")
+        except Exception as exc:  # noqa: BLE001
+            debug["attempt"] = attempt
+            return {"status": "error", "reason": f"ocr failed: {exc}", "debug": debug}
+
+        best = None
+        best_term = None
+        for term in targets:
+            ranked = rank_text_candidates(term, boxes)
+            if ranked:
+                last_candidates.extend(ranked[:5])
+            if not ranked:
+                continue
+            top = ranked[0]
+            if not best or top.get("high_enough") and not best.get("high_enough"):
+                best = top
+                best_term = term
+            elif top.get("high_enough") == best.get("high_enough") and top["score"] > best["score"]:
+                best = top
+                best_term = term
+            if top.get("high_enough"):
+                break
+
+        if best and (best.get("high_enough") or best.get("medium_enough")):
+            center = best.get("center") or {}
+            bounds = best.get("bounds") or {}
+            debug["attempt"] = attempt
+            result = {
+                "status": "ok",
+                "method": "ocr_locator",
+                "matched_text": best.get("text"),
+                "matched_term": best_term,
+                "center": {"x": center.get("x"), "y": center.get("y")},
+                "bounds": bounds,
+                "full_text": full_text,
+                "log": logs,
+                "debug": debug,
+            }
+            if last_candidates:
+                result["candidates"] = last_candidates[:10]
+            return result
+
+        logs.append("no_match_found")
+
+    return {
+        "status": "error",
+        "reason": "text_not_found",
+        "targets": targets,
+        "log": logs,
+        "candidates": last_candidates,
+        "debug": debug,
+    }
+
+
 __all__ = [
     "Dispatcher",
     "handle_hotkey",
@@ -905,5 +1115,6 @@ __all__ = [
     "handle_browser_click",
     "handle_browser_input",
     "handle_open_url",
+    "handle_browser_extract_text",
     "handle_wait_until",
 ]
